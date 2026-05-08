@@ -19,9 +19,24 @@ crates/
 ├── dinero-sv2-transport    Noise NX + SV2-shaped framing
 ├── dinero-sv2-tp-sim       in-memory Template Provider simulator
 ├── dinero-tp               TP binary — binds dinerod, serves miners
-└── dinero-sv2-pool         reference pool server (two-tier target +
-                            submitblock + JD acceptance)
+├── dinero-sv2-pool         reference pool server (two-tier target,
+│                           vardiff, submitblock, JD acceptance)
+├── dinero-sv2-miner        CPU SV2 pool worker
+└── dinero-sv2-gpu-miner    GPU SV2 pool worker (Metal/OpenCL)
 ```
+
+## Binary roles
+
+| Binary | Role | Who runs it |
+|---|---|---|
+| `dinero-sv2-pool` | Reference Stratum V2 pool server. Accepts workers, assigns share targets, validates shares, and submits found blocks. | Pool operators |
+| `dinero-tp` | Template Provider. Talks to `dinerod` RPC and emits block templates to the SV2 side. | Pool operators |
+| `dinero-sv2-miner` | CPU pool worker. Connects to an SV2 pool over Noise/SV2 and submits shares. | Pool miners |
+| `dinero-sv2-gpu-miner` | GPU pool worker. Uses Metal on Apple Silicon and OpenCL on Linux/Windows. | GPU pool miners |
+
+In casual language, "SV2 pool worker" means the miner-side process:
+`dinero-sv2-miner` for CPU or `dinero-sv2-gpu-miner` for GPU. The pool
+it connects to is `dinero-sv2-pool`.
 
 ## The sovereignty loop
 
