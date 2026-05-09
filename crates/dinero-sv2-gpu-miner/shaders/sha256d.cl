@@ -114,8 +114,13 @@ inline uint swap_endian(uint x) {
  * @return 1 if hash < target, 0 otherwise
  */
 int hash_meets_target(const uint *hash, __global const uint *target) {
-    // Compare hash against target (big-endian, most significant word first)
-    for (int i = 7; i >= 0; i--) {
+    // Walk MSW → LSW. hash[0] is state[0] = H0, the top 32 bits of the
+    // SHA-256 output as a 256-bit big-endian integer; target[0] is
+    // u32_from_be_bytes(target_bytes[0..4]), the matching high word.
+    // Walking the array in the reverse direction would compare LSW
+    // first and return wrong results for any hash whose low word
+    // happens to fall below the target's low word.
+    for (int i = 0; i < 8; i++) {
         if (hash[i] < target[i]) return 1;
         if (hash[i] > target[i]) return 0;
     }

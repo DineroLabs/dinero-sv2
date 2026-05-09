@@ -160,9 +160,10 @@ impl OpenClMiner {
         let inner = &self.inner;
         let bufs = inner.buffers.lock().expect("opencl buffers mutex");
 
-        // Pack target as 8 big-endian u32 words — same layout the
-        // kernel's `hash_meets_target` walks (state[7]→state[0] BE
-        // comparison; `target[i]` is the BE u32 of target_bytes[i*4..]).
+        // Pack target as 8 big-endian u32 words: `target_words[0]` is the
+        // top 32 bits (BE u32 of target_bytes[0..4]). The kernel's
+        // `hash_meets_target` walks MSW→LSW (i = 0..8) to compare against
+        // state[0]..state[7] of the SHA-256 output.
         let target_words = pack_target_be(target);
 
         bufs.header
