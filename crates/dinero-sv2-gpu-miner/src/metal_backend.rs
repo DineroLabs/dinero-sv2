@@ -14,6 +14,8 @@ use metal::{
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::backend::{pack_target_be, DispatchOutcome, GpuBackend};
+
 const KERNEL_SRC: &str = include_str!("../shaders/sha256d.metal");
 const KERNEL_ENTRY: &str = "sha256d_mine";
 
@@ -47,12 +49,6 @@ struct DispatchBuffers {
 // Send/Sync, so we assert it here.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
-
-pub struct DispatchOutcome {
-    pub found: bool,
-    pub nonce: u32,
-    pub elapsed_ms: f64,
-}
 
 impl MetalMiner {
     pub fn init() -> Result<Self> {
@@ -93,14 +89,6 @@ impl MetalMiner {
         })
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.inner.device_name
-    }
-
-    pub fn max_threads_per_group(&self) -> u64 {
-        self.inner.max_threads_per_group
-    }
-
     /// Launch a single Metal dispatch covering `batch_size` nonces starting
     /// at `nonce_start`. Blocks until the GPU finishes, then reads back
     /// the found-nonce output. `batch_size` should be picked so that the
@@ -133,15 +121,10 @@ impl MetalMiner {
             // byte-order lexicographic `hash < share_target` check on
             // CPU, we lay out target[i] = BE u32 of share_target bytes
             // [i*4..i*4+4]. Solo miner's kernel uses the same mapping.
+            let packed = pack_target_be(target);
             let tgt_words = bufs.target.contents() as *mut u32;
-            for i in 0..8 {
-                let w = u32::from_be_bytes([
-                    target[i * 4],
-                    target[i * 4 + 1],
-                    target[i * 4 + 2],
-                    target[i * 4 + 3],
-                ]);
-                std::ptr::write(tgt_words.add(i), w);
+            for (i, w) in packed.iter().enumerate() {
+                std::ptr::write(tgt_words.add(i), *w);
             }
             std::ptr::write(bufs.nonce_start.contents() as *mut u32, nonce_start);
             std::ptr::write(bufs.result_nonce.contents() as *mut u32, 0);
@@ -183,5 +166,31 @@ impl MetalMiner {
             nonce,
             elapsed_ms: elapsed.as_secs_f64() * 1000.0,
         })
+    }
+}
+
+impl GpuBackend for MetalMiner {
+    fn name(&self) -> &'static str {
+        "metal"
+    }
+
+    fn device_name(&self) -> &str {
+        &self.inner.device_name
+    }
+
+    fn max_threads_per_group(&self) -> u64 {
+        self.inner.max_threads_per_group
+    }
+
+    fn dispatch(
+        &self,
+        header_bytes: &[u8; 128],
+        target: &[u8; 32],
+        nonce_start: u32,
+        batch_size: u32,
+    ) -> Result<DispatchOutcome> {
+        // Inherent `MetalMiner::dispatch` takes priority in method resolution,
+        // so this delegates to it rather than recursing.
+        self.dispatch(header_bytes, target, nonce_start, batch_size)
     }
 }

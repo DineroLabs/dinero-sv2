@@ -1,4 +1,4 @@
-//! Dinero Stratum V2 GPU miner (Metal backend).
+//! Dinero Stratum V2 GPU miner (Metal / OpenCL / CUDA backends).
 //!
 //! Speaks Noise NX + SV2 + Job Declaration to a pool like the LA reference
 //! pool. Unlike `dinero-sv2-miner` (CPU), this binary dispatches the nonce
@@ -8,7 +8,8 @@
 //! rather than shared so the CPU miner stays untouched. The only mining-
 //! relevant difference is `start_hashing_gpu` replacing the CPU rayon sweep.
 //!
-//! Mac-only for now. CUDA/OpenCL backends can ship as sibling binaries later.
+//! The GPU backend is selected at runtime via `--backend auto|metal|opencl|cuda`
+//! over the shared `GpuBackend` abstraction (see `backend.rs`).
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -51,19 +52,135 @@ mod metal_backend;
 #[cfg(not(target_os = "macos"))]
 mod opencl_backend;
 
-// Backend selection: Metal on Apple Silicon, OpenCL elsewhere. Both
-// modules expose the same surface (`init`, `device_name`,
-// `max_threads_per_group`, `dispatch`) so the SV2/JD layer is
-// platform-agnostic.
+#[cfg(feature = "cuda")]
+mod cuda_backend;
+
+/// Shared GPU backend abstraction (DispatchOutcome, GpuBackend, pack_target_be).
+mod backend;
+
+use backend::GpuBackend;
+
+/// Which GPU backend to use. `auto` picks the best available for the host
+/// (Metal on macOS; otherwise CUDA when present, else OpenCL). Explicit
+/// values force a backend and hard-error if it is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum BackendChoice {
+    Auto,
+    Metal,
+    Opencl,
+    Cuda,
+}
+
+/// Pure backend decision (no GPU init), so it is unit-testable. Returns the
+/// name of the backend to construct, or an actionable error.
+fn choose_backend(
+    choice: BackendChoice,
+    is_macos: bool,
+    cuda_available: bool,
+    opencl_available: bool,
+) -> std::result::Result<&'static str, String> {
+    match choice {
+        BackendChoice::Metal if is_macos => Ok("metal"),
+        BackendChoice::Metal => Err("metal backend is macOS-only".into()),
+        BackendChoice::Cuda if cuda_available => Ok("cuda"),
+        BackendChoice::Cuda => Err("CUDA backend requested but unavailable — install the \
+             NVIDIA driver + CUDA runtime, or use --backend opencl / the CPU miner \
+             dinero-sv2-miner"
+            .into()),
+        BackendChoice::Opencl if opencl_available => Ok("opencl"),
+        BackendChoice::Opencl => {
+            Err("OpenCL requested but no OpenCL GPU platform was found".into())
+        }
+        BackendChoice::Auto if is_macos => Ok("metal"),
+        BackendChoice::Auto if cuda_available => Ok("cuda"),
+        BackendChoice::Auto if opencl_available => Ok("opencl"),
+        BackendChoice::Auto => Err("no usable GPU backend found (no CUDA/OpenCL) — use the \
+             CPU miner dinero-sv2-miner"
+            .into()),
+    }
+}
+
+/// Construct the selected backend at runtime. Availability is probed by
+/// attempting `init()`; under `auto` an unavailable CUDA/OpenCL is skipped,
+/// while an explicit `--backend` that is unavailable hard-errors.
 #[cfg(target_os = "macos")]
-type GpuMiner = metal_backend::MetalMiner;
-#[cfg(target_os = "macos")]
-const BACKEND_NAME: &str = "metal";
+fn build_backend(choice: BackendChoice) -> Result<Arc<dyn GpuBackend>> {
+    // macOS exposes only Metal (OpenCL/CUDA modules are compiled out).
+    match choose_backend(choice, true, false, false).map_err(|e| anyhow::anyhow!(e))? {
+        "metal" => Ok(Arc::new(metal_backend::MetalMiner::init().context("metal init")?)),
+        other => bail!("backend {other} is not available on macOS"),
+    }
+}
 
 #[cfg(not(target_os = "macos"))]
-type GpuMiner = opencl_backend::OpenClMiner;
-#[cfg(not(target_os = "macos"))]
-const BACKEND_NAME: &str = "opencl";
+fn build_backend(choice: BackendChoice) -> Result<Arc<dyn GpuBackend>> {
+    #[cfg(feature = "cuda")]
+    let cuda = cuda_backend::CudaMiner::init().ok();
+    #[cfg(feature = "cuda")]
+    let cuda_available = cuda.is_some();
+    #[cfg(not(feature = "cuda"))]
+    let cuda_available = false;
+
+    let opencl = opencl_backend::OpenClMiner::init().ok();
+    let opencl_available = opencl.is_some();
+
+    match choose_backend(choice, false, cuda_available, opencl_available)
+        .map_err(|e| anyhow::anyhow!(e))?
+    {
+        #[cfg(feature = "cuda")]
+        "cuda" => Ok(Arc::new(cuda.expect("cuda probed available"))),
+        "opencl" => Ok(Arc::new(opencl.expect("opencl probed available"))),
+        other => bail!("backend {other} is not available on this platform"),
+    }
+}
+
+#[cfg(test)]
+mod backend_select_tests {
+    use super::{choose_backend, BackendChoice};
+
+    #[test]
+    fn auto_prefers_cuda_then_opencl_off_macos() {
+        assert_eq!(
+            choose_backend(BackendChoice::Auto, false, true, true),
+            Ok("cuda")
+        );
+        assert_eq!(
+            choose_backend(BackendChoice::Auto, false, false, true),
+            Ok("opencl")
+        );
+    }
+
+    #[test]
+    fn auto_uses_metal_on_macos() {
+        assert_eq!(
+            choose_backend(BackendChoice::Auto, true, false, false),
+            Ok("metal")
+        );
+    }
+
+    #[test]
+    fn auto_errors_when_nothing_available() {
+        assert!(choose_backend(BackendChoice::Auto, false, false, false).is_err());
+    }
+
+    #[test]
+    fn explicit_cuda_without_cuda_errors() {
+        assert!(choose_backend(BackendChoice::Cuda, false, false, true).is_err());
+    }
+
+    #[test]
+    fn explicit_metal_off_macos_errors() {
+        assert!(choose_backend(BackendChoice::Metal, false, false, true).is_err());
+    }
+
+    #[test]
+    fn explicit_opencl_ok_when_available() {
+        assert_eq!(
+            choose_backend(BackendChoice::Opencl, false, false, true),
+            Ok("opencl")
+        );
+    }
+}
 
 #[derive(Parser, Clone)]
 #[command(version, about = "Dinero SV2 GPU pool miner (Metal/OpenCL)")]
@@ -76,6 +193,10 @@ struct Args {
 
     #[arg(long)]
     payout_script_hex: String,
+
+    /// GPU backend: auto (default), metal, opencl, or cuda.
+    #[arg(long, value_enum, default_value = "auto")]
+    backend: BackendChoice,
 
     #[arg(long, default_value = "dinero-sv2-gpu-miner")]
     user_agent: String,
@@ -116,14 +237,14 @@ async fn async_main() -> Result<()> {
     let emitter = Emitter::new(args.json);
     emitter.emit_startup(&args);
 
-    let gpu = GpuMiner::init().context(concat!("gpu init"))?;
+    let gpu = build_backend(args.backend).context("gpu init")?;
     emitter.emit(
         "gpu_ready",
         &serde_json::json!({
             "device": gpu.device_name(),
             "max_threads_per_group": gpu.max_threads_per_group(),
             "batch_size": args.batch_size,
-            "backend": BACKEND_NAME,
+            "backend": gpu.name(),
         }),
     );
 
@@ -209,7 +330,7 @@ async fn run_session(
     args: &Args,
     pinned: Option<&[u8; 32]>,
     payout_script: &[u8],
-    gpu: &GpuMiner,
+    gpu: &Arc<dyn GpuBackend>,
     generation: Arc<AtomicU64>,
     measured_mhs_x100: Arc<AtomicU64>,
     emitter: &Emitter,
@@ -222,7 +343,7 @@ async fn run_session(
         &serde_json::json!({
             "pool": args.pool.to_string(),
             "server_pubkey": peer_pubkey,
-            "backend": BACKEND_NAME,
+            "backend": gpu.name(),
         }),
     );
 
@@ -551,9 +672,9 @@ struct FoundShare {
 }
 
 /// GPU mining: assemble miner-owned coinbase + header, dispatch the
-/// platform's GPU kernel in batches, report found shares via `share_tx`.
-/// Backend is Metal on macOS, OpenCL on Linux/Windows — selected via
-/// the `GpuMiner` type alias at the top of the file.
+/// selected GPU backend's kernel in batches, report found shares via
+/// `share_tx`. The backend is chosen at runtime (`--backend`) and passed
+/// in as `Arc<dyn GpuBackend>`.
 #[allow(clippy::too_many_arguments)]
 fn start_hashing_gpu(
     tmpl: NewTemplateDinero,
@@ -561,7 +682,7 @@ fn start_hashing_gpu(
     ctx: CoinbaseContext,
     payout_script: Vec<u8>,
     share_target: [u8; 32],
-    gpu: GpuMiner,
+    gpu: Arc<dyn GpuBackend>,
     batch_size: u32,
     generation: Arc<AtomicU64>,
     measured_mhs_x100: Arc<AtomicU64>,
@@ -640,7 +761,7 @@ fn start_hashing_gpu(
             "difficulty_nbits": format!("0x{:08x}", tmpl.difficulty),
             "block_target": hex::encode(block_target),
             "share_target": hex::encode(share_target),
-            "backend": BACKEND_NAME,
+            "backend": gpu.name(),
         }),
     );
 
@@ -682,7 +803,7 @@ fn start_hashing_gpu(
                 let outcome = match gpu.dispatch(&header_bytes, &share_target, nonce_start as u32, this_batch) {
                     Ok(out) => out,
                     Err(err) => {
-                        tracing::error!("gpu dispatch ({}) failed: {err}", BACKEND_NAME);
+                        tracing::error!("gpu dispatch ({}) failed: {err}", gpu.name());
                         return;
                     }
                 };
@@ -701,7 +822,7 @@ fn start_hashing_gpu(
                         dispatch_ms,
                         nonce_start as u32,
                         current_timestamp,
-                        BACKEND_NAME,
+                        gpu.name(),
                     );
                     last_emit = std::time::Instant::now();
                     total_ms_since_emit = 0.0;
@@ -820,7 +941,8 @@ impl Emitter {
                 "batch_size": args.batch_size,
                 "user_agent": args.user_agent,
                 "version": env!("CARGO_PKG_VERSION"),
-                "backend": BACKEND_NAME,
+                // Requested backend; the resolved one is reported in `gpu_ready`.
+                "backend_requested": format!("{:?}", args.backend).to_lowercase(),
             }),
         );
     }
