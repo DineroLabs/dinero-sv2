@@ -195,6 +195,38 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Expand the 4-byte compact `nbits` difficulty field of a Dinero header
+/// (offset 0x6C) into a 32-byte big-endian target.
+///
+/// `target_bytes[0]` is the most significant byte, matching the layout
+/// `hash_meets_target` walks MSW-first in the GPU kernels. A hash
+/// satisfies the target iff `hash < target` as a 256-bit big-endian
+/// integer.
+///
+/// The mantissa's high bit is **not** treated as a sign bit — inputs
+/// with that bit set yield the same target as if it were clear. Real
+/// Dinero `nbits` values from the chain never set it.
+pub fn nbits_to_target(bits: u32) -> [u8; 32] {
+    let exponent = (bits >> 24) & 0xff;
+    let mantissa = bits & 0x00ff_ffff;
+    let mut target = [0u8; 32];
+    if exponent <= 3 {
+        let shift = 8 * (3 - exponent as usize);
+        let shifted = (mantissa >> shift) & 0x00ff_ffff;
+        target[29] = ((shifted >> 16) & 0xff) as u8;
+        target[30] = ((shifted >> 8) & 0xff) as u8;
+        target[31] = (shifted & 0xff) as u8;
+    } else {
+        let offset = 32usize.saturating_sub(exponent as usize);
+        if offset + 3 <= 32 {
+            target[offset] = ((mantissa >> 16) & 0xff) as u8;
+            target[offset + 1] = ((mantissa >> 8) & 0xff) as u8;
+            target[offset + 2] = (mantissa & 0xff) as u8;
+        }
+    }
+    target
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +383,38 @@ mod tests {
             s.timestamp = ts;
             prop_assert_eq!(HeaderAssembly::bytes(&t, &s).len(), HEADER_SIZE);
         }
+    }
+
+    #[test]
+    fn nbits_difficulty_one_target() {
+        // nbits=0x1d00ffff → target with 32 leading zero bits and
+        // `00ff_ffff_0000…` in the next 24 bits (the canonical
+        // difficulty-1 vector for SHA-256d compact-encoded targets).
+        let mut expected = [0u8; 32];
+        expected[4] = 0xff;
+        expected[5] = 0xff;
+        assert_eq!(nbits_to_target(0x1d00_ffff), expected);
+    }
+
+    #[test]
+    fn nbits_small_exponent() {
+        // exponent=3, mantissa=0x123456 → target ends in 12 34 56.
+        let t = nbits_to_target(0x0312_3456);
+        assert_eq!(t[29], 0x12);
+        assert_eq!(t[30], 0x34);
+        assert_eq!(t[31], 0x56);
+        assert_eq!(&t[..29], &[0u8; 29]);
+    }
+
+    #[test]
+    fn nbits_target_is_msb_first() {
+        // For any valid nbits the most significant non-zero byte is at a
+        // lower index than the least significant non-zero byte — the
+        // direction GPU kernels and the host comparison both expect.
+        let t = nbits_to_target(0x1d00_ffff);
+        let first_nonzero = t.iter().position(|&b| b != 0).unwrap();
+        let last_nonzero = t.iter().rposition(|&b| b != 0).unwrap();
+        assert!(first_nonzero <= last_nonzero);
+        assert_eq!(first_nonzero, 4);
     }
 }

@@ -20,7 +20,7 @@ use dinero_sv2_codec::{
     encode_setup_connection, encode_submit_shares_extended,
 };
 use dinero_sv2_common::{
-    CoinbaseContext, CoinbaseOutputWire, HeaderAssembly, NewTemplateDinero,
+    nbits_to_target, CoinbaseContext, CoinbaseOutputWire, HeaderAssembly, NewTemplateDinero,
     OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero, SubmitSharesExtendedDinero,
     PROTOCOL_MINING, PROTOCOL_VERSION,
 };
@@ -999,27 +999,6 @@ fn assemble_header_bytes(
     // buf[112..116] nonce — left zero (kernel writes per-thread)
     // buf[116..128] reserved — left zero (consensus requires all zeros)
     buf
-}
-
-fn nbits_to_target(bits: u32) -> [u8; 32] {
-    let exponent = (bits >> 24) & 0xff;
-    let mantissa = bits & 0x00ff_ffff;
-    let mut target = [0u8; 32];
-    if exponent <= 3 {
-        let shift = 8 * (3 - exponent as usize);
-        let shifted = (mantissa >> shift) & 0x00ff_ffff;
-        target[29] = ((shifted >> 16) & 0xff) as u8;
-        target[30] = ((shifted >> 8) & 0xff) as u8;
-        target[31] = (shifted & 0xff) as u8;
-    } else {
-        let offset = 32usize.saturating_sub(exponent as usize);
-        if offset + 3 <= 32 {
-            target[offset] = ((mantissa >> 16) & 0xff) as u8;
-            target[offset + 1] = ((mantissa >> 8) & 0xff) as u8;
-            target[offset + 2] = (mantissa & 0xff) as u8;
-        }
-    }
-    target
 }
 
 struct Emitter {

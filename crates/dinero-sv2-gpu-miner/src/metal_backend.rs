@@ -116,11 +116,10 @@ impl MetalMiner {
                 128,
             );
             // Kernel's state[0..7] are raw SHA-256 output words, where
-            // state[0] = BE interpretation of raw bytes 0-3. For the
-            // kernel's `hash_meets_target` (iterating i=7..0) to match a
-            // byte-order lexicographic `hash < share_target` check on
-            // CPU, we lay out target[i] = BE u32 of share_target bytes
-            // [i*4..i*4+4]. Solo miner's kernel uses the same mapping.
+            // state[0] = BE interpretation of raw bytes 0-3. The
+            // kernel's `hash_meets_target` walks state[0]→state[7]
+            // MSW-first, matching a byte-order lexicographic
+            // `hash < share_target` check on CPU.
             let packed = pack_target_be(target);
             let tgt_words = bufs.target.contents() as *mut u32;
             for (i, w) in packed.iter().enumerate() {
