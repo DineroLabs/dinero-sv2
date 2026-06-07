@@ -134,6 +134,55 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn GpuBackend>> {
     }
 }
 
+/// GPU backends compiled into THIS binary, from build cfg. This is the
+/// per-platform truth the dinero-qt selector reads via `--print-backends`.
+fn compiled_backends() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        v.push("metal");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        v.push("opencl");
+        #[cfg(feature = "cuda")]
+        {
+            v.push("cuda");
+        }
+    }
+    v
+}
+
+/// Capability report: which backends are compiled in, which `init()` right now,
+/// and the reason for any that don't. Serialized by `--print-backends` and read
+/// by the dinero-qt selector to enable/grey-out backend choices.
+fn backend_report() -> serde_json::Value {
+    let compiled = compiled_backends();
+    let mut available: Vec<&'static str> = Vec::new();
+    let mut unavailable = serde_json::Map::new();
+    {
+        let mut probe = |name: &'static str, res: Result<()>| match res {
+            Ok(()) => available.push(name),
+            Err(e) => {
+                unavailable.insert(name.to_string(), serde_json::Value::from(e.to_string()));
+            }
+        };
+        #[cfg(target_os = "macos")]
+        probe("metal", metal_backend::MetalMiner::init().map(|_| ()));
+        #[cfg(not(target_os = "macos"))]
+        {
+            probe("opencl", opencl_backend::OpenClMiner::init().map(|_| ()));
+            #[cfg(feature = "cuda")]
+            probe("cuda", cuda_backend::CudaMiner::init().map(|_| ()));
+        }
+    }
+    serde_json::json!({
+        "compiled": compiled,
+        "available": available,
+        "unavailable": serde_json::Value::Object(unavailable),
+    })
+}
+
 #[cfg(test)]
 mod backend_select_tests {
     use super::{choose_backend, BackendChoice};
@@ -182,6 +231,45 @@ mod backend_select_tests {
     }
 }
 
+#[cfg(test)]
+mod print_backends_tests {
+    use super::{backend_report, compiled_backends};
+
+    #[test]
+    fn report_has_three_keys_and_compiled_nonempty() {
+        let r = backend_report();
+        assert!(r.get("compiled").and_then(|v| v.as_array()).is_some());
+        assert!(r.get("available").and_then(|v| v.as_array()).is_some());
+        assert!(r.get("unavailable").and_then(|v| v.as_object()).is_some());
+        assert!(!r["compiled"].as_array().unwrap().is_empty());
+        // Every compiled backend is exactly one of available / unavailable.
+        for b in r["compiled"].as_array().unwrap() {
+            let name = b.as_str().unwrap();
+            let avail = r["available"].as_array().unwrap().iter().any(|x| x == b);
+            let unavail = r["unavailable"].as_object().unwrap().contains_key(name);
+            assert!(
+                avail ^ unavail,
+                "{name} must be exactly one of available/unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_reflects_platform_cfg() {
+        let c = compiled_backends();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(c, vec!["metal"]);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(c.contains(&"opencl"), "opencl always compiled off-macOS");
+            assert_eq!(c.contains(&"cuda"), cfg!(feature = "cuda"));
+        }
+        assert!(!c.is_empty());
+    }
+}
+
 #[derive(Parser, Clone)]
 #[command(version, about = "Dinero SV2 GPU pool miner (Metal/OpenCL)")]
 struct Args {
@@ -218,6 +306,17 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Early-exit capability probe: print the backend report and exit before
+    // clap requires --pool/--payout-script-hex (a raw-argv pre-scan keeps the
+    // mining args strongly typed). The dinero-qt selector calls this to learn
+    // which backends are compiled + available, and greys out the rest.
+    if std::env::args().skip(1).any(|a| a == "--print-backends") {
+        println!(
+            "{}",
+            serde_json::to_string(&backend_report()).expect("serialize backend report")
+        );
+        return Ok(());
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
