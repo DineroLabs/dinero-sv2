@@ -1,50 +1,243 @@
-//! CUDA compute-backend for SV2 GPU mining on NVIDIA — SCAFFOLD ONLY.
+//! CUDA compute-backend for SV2 GPU mining on NVIDIA hardware.
 //!
-//! The kernel (`shaders/sha256d.cu`, a faithful carry-over of the tested
-//! dinero-qt/dinero-v8 kernel) is embedded and ready. The cudarc + NVRTC
-//! runtime integration is intentionally deferred to a Linux/NVIDIA host where
-//! `cargo build --features cuda` can actually compile and run it — CUDA does
-//! not exist on Apple Silicon, so writing the cudarc body here could not be
-//! compiled and would be unverifiable guesswork.
+//! Same shape as `opencl_backend::OpenClMiner`: one `CudaMiner` owns a device,
+//! NVRTC-compiled kernel module, and reused device-side buffers (header,
+//! target, result array + count) behind a Mutex; cheap to clone since the
+//! inner state is `Arc`-shared. Each `dispatch()` enqueues `batch_size`
+//! threads (one nonce per thread) against the embedded sha256d kernel and
+//! returns the lowest winning nonce, or "no match".
 //!
-//! Until that host work lands (Task 4: cudarc context + NVRTC compile +
-//! result-array buffers `result_nonces[capacity]` / `result_count` mirroring
-//! the kernel's contract), `init()` returns an actionable error. The effect:
-//! `--backend cuda` reports CUDA as unavailable, and `--backend auto` silently
-//! falls back to OpenCL — exactly the runtime contract in the spec.
+//! The kernel source (`shaders/sha256d.cu`) is the proven dinero-v8 kernel.
+//! It is NVRTC-compiled at `init()` against the active device's compute
+//! capability, mirroring the Metal/OpenCL pattern of embedding source via
+//! `include_str!`. No build-time `nvcc` invocation is required and the
+//! cudarc dynamic-loading variant means no CUDA toolkit at build time
+//! either — only the NVIDIA driver + NVRTC runtime when `--backend cuda`
+//! actually launches.
+//!
+//! ## Kernel I/O — result-array, NOT single-winner
+//!
+//! The CUDA kernel uses a **result array** (`result_nonces[capacity]`,
+//! `result_count`) with `atomicAdd`-into-the-array, while OpenCL/Metal use
+//! the older single-winner (`result_nonce` + `result_found`) shape. At low
+//! share difficulty a 16M-nonce batch can produce many satisfying hashes,
+//! and the single-winner shape silently dropped every winner past the first.
+//! Here we report every winner up to `RESULT_CAPACITY` and surface overflow
+//! to the host (count > capacity). This `dispatch()` returns the **lowest**
+//! winning nonce to satisfy the shared `DispatchOutcome` shape — that keeps
+//! the host's nonce cursor advancing by the smallest possible amount before
+//! the next batch, consistent with how OpenCL/Metal behave today.
+//!
+//! Tested target: NVIDIA GeForce RTX 4060 (sm_89, Ada Lovelace), CUDA 12.2.
 
-#![cfg(feature = "cuda")]
-// The whole struct is a deliberate stub until the cudarc body lands; on macOS
-// the (non-macOS) build_backend CUDA arm is compiled out, so nothing
-// constructs it. Suppress the resulting dead-code noise.
-#![allow(dead_code)]
+#![cfg(all(feature = "cuda", not(target_os = "macos")))]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use crate::backend::{DispatchOutcome, GpuBackend};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::nvrtc::compile_ptx;
 
-/// Embedded CUDA-C kernel — NVRTC-compiled at `init()` once the cudarc body
-/// is implemented (Task 4, on the NVIDIA host).
+use crate::backend::{pack_target_be, DispatchOutcome, GpuBackend};
+
 const KERNEL_SRC: &str = include_str!("../shaders/sha256d.cu");
-const KERNEL_ENTRY: &str = "sha256d_mine";
+const KERNEL_NAME: &str = "sha256d_mine";
+const MODULE_NAME: &str = "dinero_sha256d";
 
+/// Block size for the kernel launch. SHA-256d is register-bound, so 256
+/// threads/block hits the sweet spot on Ada/Ampere (matches the dinero-v8
+/// host launch config). The kernel returns early past `batch_size` so a
+/// grid rounded up to a whole block never hashes outside the requested range.
+const THREADS_PER_BLOCK: u32 = 256;
+
+/// Capacity of the per-dispatch result_nonces array. A 16M-nonce batch at
+/// share difficulty 1 (every hash satisfies) would overflow far below 256,
+/// so this is overkill for realistic shares; the kernel still reports
+/// `result_count > capacity` so an operator sees the overflow in logs.
+const RESULT_CAPACITY: u32 = 256;
+
+#[derive(Clone)]
 pub struct CudaMiner {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    device: Arc<CudaDevice>,
+    function: CudaFunction,
     device_name: String,
+    max_threads_per_group: u64,
+    // Reused per dispatch; mutex serialises since each dispatch writes
+    // inputs, launches, and reads outputs. One miner thread is the steady
+    // state in `start_hashing_gpu`.
+    buffers: Mutex<DispatchBuffers>,
+}
+
+struct DispatchBuffers {
+    header: CudaSlice<u8>,         // 128 bytes — kernel reinterprets as 32 LE u32 words
+    target: CudaSlice<u32>,        //   8 × u32 BE words
+    result_nonces: CudaSlice<u32>, //   RESULT_CAPACITY × u32 (each = winning nonce)
+    result_count: CudaSlice<u32>,  //   1 × u32 (total satisfying nonces, may exceed capacity)
 }
 
 impl CudaMiner {
-    /// Scaffold: always errors. The real implementation (cudarc Driver API +
-    /// NVRTC compile of `KERNEL_SRC` + first-GPU select) lands on the NVIDIA
-    /// host. The error is actionable so operators understand the state.
     pub fn init() -> Result<Self> {
-        anyhow::bail!(
-            "CUDA backend is scaffolded but not yet wired to cudarc/NVRTC in \
-             this build (kernel embedded: {} bytes, entry `{}`). Build \
-             --features cuda on a Linux/NVIDIA host once cuda_backend.rs is \
-             implemented, or use --backend opencl / the CPU miner.",
-            KERNEL_SRC.len(),
-            KERNEL_ENTRY,
-        )
+        // GPU 0. Multi-GPU fan-out is a follow-up — would partition the nonce
+        // range across one CudaMiner per device sharing the SV2 session.
+        let device = CudaDevice::new(0).context(
+            "no CUDA device available — install the NVIDIA driver + CUDA runtime, \
+             or use --backend opencl / the CPU miner dinero-sv2-miner",
+        )?;
+
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "unknown CUDA device".to_string());
+
+        // NVRTC-compile the embedded kernel at startup. The driver caches PTX
+        // across processes so subsequent runs only recompile if the source
+        // changes (it doesn't, after a release build embeds the .cu).
+        let ptx = compile_ptx(KERNEL_SRC).context("nvrtc compile sha256d.cu")?;
+        device
+            .load_ptx(ptx, MODULE_NAME, &[KERNEL_NAME])
+            .context("cuda load_ptx(sha256d)")?;
+        let function = device
+            .get_func(MODULE_NAME, KERNEL_NAME)
+            .context("cuda get_func(sha256d_mine)")?;
+
+        // Reported in the gpu_ready event. sm_89 (Ada) reports 1024; older
+        // architectures report less. The launch itself uses THREADS_PER_BLOCK
+        // (256) regardless — this is just for the event/log.
+        let max_threads_per_group: u64 = 1024;
+
+        let header = device.alloc_zeros::<u8>(128).context("alloc header")?;
+        let target = device.alloc_zeros::<u32>(8).context("alloc target")?;
+        let result_nonces = device
+            .alloc_zeros::<u32>(RESULT_CAPACITY as usize)
+            .context("alloc result_nonces")?;
+        let result_count = device.alloc_zeros::<u32>(1).context("alloc result_count")?;
+
+        Ok(CudaMiner {
+            inner: Arc::new(Inner {
+                device,
+                function,
+                device_name,
+                max_threads_per_group,
+                buffers: Mutex::new(DispatchBuffers {
+                    header,
+                    target,
+                    result_nonces,
+                    result_count,
+                }),
+            }),
+        })
+    }
+
+    pub fn dispatch(
+        &self,
+        header_bytes: &[u8; 128],
+        target: &[u8; 32],
+        nonce_start: u32,
+        batch_size: u32,
+    ) -> Result<DispatchOutcome> {
+        let inner = &self.inner;
+        let mut guard = inner.buffers.lock().expect("cuda buffers mutex");
+        // Reborrow to a plain &mut so disjoint-field borrows split — the
+        // launch tuple holds shared borrows on header/target alongside
+        // exclusive borrows on result_*, which the borrow-checker only
+        // accepts on a direct reference, not through MutexGuard.
+        let bufs: &mut DispatchBuffers = &mut *guard;
+
+        // Target packs to 8 BE u32 words. Kernel's hash_meets_target walks
+        // [7]→[0] (MSW first) against the SHA-256 BE state — same convention
+        // as Metal/OpenCL (`backend::pack_target_be` is the single source).
+        let target_words = pack_target_be(target);
+
+        inner
+            .device
+            .htod_sync_copy_into(header_bytes, &mut bufs.header)
+            .context("upload header")?;
+        inner
+            .device
+            .htod_sync_copy_into(&target_words, &mut bufs.target)
+            .context("upload target")?;
+        inner
+            .device
+            .htod_sync_copy_into(&[0u32; 1], &mut bufs.result_count)
+            .context("reset result_count")?;
+        // result_nonces is overwritten only at the slots the kernel uses
+        // (driven by atomicAdd into result_count), and the host reads at
+        // most `count` of them — stale values past count are never observed.
+
+        let grid = batch_size.div_ceil(THREADS_PER_BLOCK);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let t0 = Instant::now();
+        // SAFETY: kernel signature matches the args tuple — see the
+        // `sha256d_mine` parameter list in shaders/sha256d.cu. Inputs are
+        // shared-borrowed, outputs are exclusive-borrowed.
+        unsafe {
+            inner.function.clone().launch(
+                cfg,
+                (
+                    &bufs.header,
+                    &bufs.target,
+                    nonce_start,
+                    batch_size,
+                    &mut bufs.result_nonces,
+                    &mut bufs.result_count,
+                    RESULT_CAPACITY,
+                ),
+            )
+        }
+        .context("launch sha256d_mine")?;
+
+        inner.device.synchronize().context("cuda sync after launch")?;
+        let elapsed = t0.elapsed();
+
+        let count_vec = inner
+            .device
+            .dtoh_sync_copy(&bufs.result_count)
+            .context("read result_count")?;
+        let total_count = count_vec[0];
+        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+
+        if total_count == 0 {
+            return Ok(DispatchOutcome {
+                found: false,
+                nonce: 0,
+                elapsed_ms,
+            });
+        }
+
+        // total_count may exceed RESULT_CAPACITY when the share is so loose
+        // it produces more winners than the array can hold. The host can
+        // still pick a winner from the first `capacity` slots; the overflow
+        // is logged so an operator notices misconfigured share difficulty.
+        let visible = total_count.min(RESULT_CAPACITY) as usize;
+        if total_count > RESULT_CAPACITY {
+            tracing::warn!(
+                total = total_count,
+                capacity = RESULT_CAPACITY,
+                "CUDA dispatch produced more winners than result_nonces capacity; \
+                 share target may be too loose"
+            );
+        }
+
+        let nonces = inner
+            .device
+            .dtoh_sync_copy(&bufs.result_nonces)
+            .context("read result_nonces")?;
+        let lowest = nonces[..visible].iter().copied().min().unwrap_or(0);
+
+        Ok(DispatchOutcome {
+            found: true,
+            nonce: lowest,
+            elapsed_ms,
+        })
     }
 }
 
@@ -54,21 +247,22 @@ impl GpuBackend for CudaMiner {
     }
 
     fn device_name(&self) -> &str {
-        &self.device_name
+        &self.inner.device_name
     }
 
     fn max_threads_per_group(&self) -> u64 {
-        // Unreachable: `CudaMiner` is never constructed until `init()` is real.
-        unreachable!("CUDA backend not implemented")
+        self.inner.max_threads_per_group
     }
 
     fn dispatch(
         &self,
-        _header_bytes: &[u8; 128],
-        _target: &[u8; 32],
-        _nonce_start: u32,
-        _batch_size: u32,
+        header_bytes: &[u8; 128],
+        target: &[u8; 32],
+        nonce_start: u32,
+        batch_size: u32,
     ) -> Result<DispatchOutcome> {
-        unreachable!("CUDA backend not implemented")
+        // Inherent `CudaMiner::dispatch` takes priority in method resolution
+        // (so this delegates to it rather than recursing).
+        self.dispatch(header_bytes, target, nonce_start, batch_size)
     }
 }

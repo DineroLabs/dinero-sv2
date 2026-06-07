@@ -29,20 +29,28 @@ sha2       = { workspace = true }
 
 [features]
 default = []
-# Native NVIDIA CUDA backend (cudarc + NVRTC). SCAFFOLD ONLY at this stage:
-# the kernel (shaders/sha256d.cu) is embedded and `cuda_backend.rs` is stubbed,
-# but the real cudarc integration + the `dep:cudarc` it needs are added on a
-# Linux/NVIDIA host (CUDA does not exist on Apple Silicon, so it cannot be
-# compiled or run here). Default builds/tests require no CUDA toolkit.
-cuda = []
+# Native NVIDIA CUDA backend (cudarc + NVRTC). Opt-in via `--features cuda`
+# (NOT default-on). Default workspace builds/tests require no CUDA toolkit
+# and no NVIDIA driver. With `cuda`, cudarc dynamic-loads the driver +
+# NVRTC at runtime, so the binary still builds on hosts without CUDA — the
+# driver/NVRTC only need to be present when `--backend cuda` actually runs.
+# Implemented in src/cuda_backend.rs (gated to non-macOS).
+cuda = ["dep:cudarc"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.27"
 objc  = "0.2"
 core-graphics-types = "0.1"
 
-# Linux + Windows GPU backend. `ocl` 0.19 wraps OpenCL 1.2; works on
-# AMD ROCm, NVIDIA, Intel, and Mesa. Tested target: AMD Radeon Pro WX
-# 2100 on the Dell Tower (mining rig from `dinero-solo-miner`).
+# Linux + Windows GPU backends.
+#
+# `ocl` 0.19 wraps OpenCL 1.2; works on AMD ROCm, NVIDIA, Intel, and Mesa.
+# Tested OpenCL target: AMD Radeon Pro WX 2100 on the Dell Tower.
+#
+# `cudarc` 0.13: CUDA Driver API + NVRTC bindings with the dynamic-loading
+# variant so the binary does NOT link against the CUDA toolkit at build time.
+# The driver + NVRTC only need to be present when `--backend cuda` runs.
+# Tested target: NVIDIA GeForce RTX 4060 (sm_89, Ada Lovelace), CUDA 12.2.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-ocl = "0.19"
+ocl    = "0.19"
+cudarc = { version = "0.13", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-12020"], optional = true }
