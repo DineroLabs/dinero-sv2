@@ -148,7 +148,7 @@ impl CudaMiner {
         let bufs: &mut DispatchBuffers = &mut *guard;
 
         // Target packs to 8 BE u32 words. Kernel's hash_meets_target walks
-        // [7]→[0] (MSW first) against the SHA-256 BE state — same convention
+        // [0]→[7] (MSW first) against the SHA-256 BE state — same convention
         // as Metal/OpenCL (`backend::pack_target_be` is the single source).
         let target_words = pack_target_be(target);
 

@@ -29,7 +29,7 @@ pub trait GpuBackend: Send + Sync {
 }
 
 /// Pack a 32-byte target into 8 big-endian u32 words — the exact layout the
-/// kernels' `hash_meets_target` walks (state[7]→state[0] BE comparison).
+/// kernels' `hash_meets_target` walks (state[0]→state[7] MSW-first).
 pub fn pack_target_be(target: &[u8; 32]) -> [u32; 8] {
     let mut words = [0u32; 8];
     for i in 0..8 {
