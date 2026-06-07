@@ -27,6 +27,15 @@ tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
 sha2       = { workspace = true }
 
+[features]
+default = []
+# Native NVIDIA CUDA backend (cudarc + NVRTC). SCAFFOLD ONLY at this stage:
+# the kernel (shaders/sha256d.cu) is embedded and `cuda_backend.rs` is stubbed,
+# but the real cudarc integration + the `dep:cudarc` it needs are added on a
+# Linux/NVIDIA host (CUDA does not exist on Apple Silicon, so it cannot be
+# compiled or run here). Default builds/tests require no CUDA toolkit.
+cuda = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.27"
 objc  = "0.2"

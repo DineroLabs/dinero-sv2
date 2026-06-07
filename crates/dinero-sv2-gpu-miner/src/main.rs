@@ -52,6 +52,9 @@ mod metal_backend;
 #[cfg(not(target_os = "macos"))]
 mod opencl_backend;
 
+#[cfg(feature = "cuda")]
+mod cuda_backend;
+
 /// Shared GPU backend abstraction (DispatchOutcome, GpuBackend, pack_target_be).
 mod backend;
 
