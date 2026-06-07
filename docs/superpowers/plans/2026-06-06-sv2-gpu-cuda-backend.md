@@ -12,6 +12,23 @@
 
 ---
 
+## Status (2026-06-06)
+
+**Landed inline on macOS (branch `feat/sv2-gpu-cuda-backend`), committed + verified:**
+- **Task 1** (`499f60b`) — shared `GpuBackend`/`DispatchOutcome` + `pack_target_be`; Metal/OpenCL refactored onto it; packing + sha256d-reference unit tests gate.
+- **Task 2** (`e8c535d`) — runtime `--backend auto|metal|opencl|cuda`; pure `choose_backend` (6 unit tests). Device-verified: Metal inits the M4 Max; `cuda`/`opencl` give actionable errors on macOS.
+- **Task 3** (`4da4e14`) — `shaders/sha256d.cu` carried over **verbatim** from the tested dinero-v8 kernel (result-array contract); empty `cuda` Cargo feature + stubbed `cuda_backend.rs` (kernel embedded via `include_str!`, honest error path). Default **and** `--features cuda` builds/tests green on macOS; workspace default build is CUDA-free.
+
+**Deferred to a Linux/NVIDIA host (CUDA cannot compile or run on Apple Silicon):**
+- **Task 4 (real body)** — replace the `cuda_backend.rs` stub with the cudarc Driver-API + NVRTC implementation; add `dep:cudarc` to the `cuda` feature; wire the result-array buffers (`result_nonces[capacity]` / `result_count` / `result_capacity` + `batch_size`) to the kernel's contract; the non-macOS CUDA arm of `build_backend` is already scaffolded.
+- **Task 5** — kernel parity + real pool smoke.
+
+> **Caveat for Task 5 (found during Task 2):** this crate is **bin-only** (no `lib` target), so a `tests/` integration test cannot reach internal items like `backend::sha256d_reference`. The parity test must live as an in-crate `#[cfg(test)]` unit test (e.g. in `cuda_backend.rs`, gated `cfg(all(test, feature = "cuda"))`), **not** as `tests/cuda_parity.rs`. `sha256d_reference` is already `#[cfg(test)]`.
+
+> **Kernel I/O note:** the carried-over CUDA kernel uses the result-**array** shape (`result_nonces`/`result_count`/`result_capacity`, with a `batch_size` arg), a deliberate improvement over the OpenCL/Metal single-winner (`result_nonce`/`result_found`) shape — it avoids dropping multiple winners in a low-difficulty batch. Task 4's `CudaMiner::dispatch` therefore does **not** byte-mirror `OpenClMiner`'s buffers; it allocates the array buffers and returns the lowest winning nonce to satisfy the shared `DispatchOutcome`.
+
+---
+
 ## File Structure
 
 | File | Responsibility |
