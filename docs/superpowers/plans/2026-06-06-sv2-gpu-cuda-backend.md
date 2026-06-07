@@ -14,10 +14,14 @@
 
 ## Status (2026-06-06)
 
-**Landed inline on macOS (branch `feat/sv2-gpu-cuda-backend`), committed + verified:**
-- **Task 1** (`499f60b`) — shared `GpuBackend`/`DispatchOutcome` + `pack_target_be`; Metal/OpenCL refactored onto it; packing + sha256d-reference unit tests gate.
+**Landed inline (branch `feat/sv2-gpu-cuda-backend`), committed; macOS-side verified:**
+- **Task 1** (`499f60b`) — shared `GpuBackend`/`DispatchOutcome` + `pack_target_be`; Metal/OpenCL refactored onto it; packing + sha256d-reference unit tests gate (packer neuter-checked).
 - **Task 2** (`e8c535d`) — runtime `--backend auto|metal|opencl|cuda`; pure `choose_backend` (6 unit tests). Device-verified: Metal inits the M4 Max; `cuda`/`opencl` give actionable errors on macOS.
 - **Task 3** (`4da4e14`) — `shaders/sha256d.cu` carried over **verbatim** from the tested dinero-v8 kernel (result-array contract); empty `cuda` Cargo feature + stubbed `cuda_backend.rs` (kernel embedded via `include_str!`, honest error path). Default **and** `--features cuda` builds/tests green on macOS; workspace default build is CUDA-free.
+
+**Unverified here — pre-merge gate, independent of the CUDA work:** the OpenCL/non-macOS code is `cfg(not(target_os = "macos"))`, so this Mac never compiled it. Task 1's OpenCL refactor (removed local `DispatchOutcome`, `pack_target_be` swap, removed inherent accessors, `impl GpuBackend`) and Task 2's non-macOS `build_backend` arm — i.e. the **Linux default build (OpenCL, no `cuda` feature)** — were written but compiled only by inspection. The pattern is symmetric to the verified Metal path (same shared trait, same inherent-priority `self.dispatch()` delegation, which the Metal compile proves), but **before merge: run `cargo build` + `cargo test` (default features) on Linux** to gate the OpenCL path. This is required regardless of, and separate from, the CUDA/NVIDIA host work below.
+
+**`--json` schema note:** Task 2 renamed the `startup` event's `backend` field to `backend_requested` (the resolved backend is still reported in `gpu_ready.backend`). Any current `--json` consumer — and Sub-project B's QProcess parser — should expect that.
 
 **Deferred to a Linux/NVIDIA host (CUDA cannot compile or run on Apple Silicon):**
 - **Task 4 (real body)** — replace the `cuda_backend.rs` stub with the cudarc Driver-API + NVRTC implementation; add `dep:cudarc` to the `cuda` feature; wire the result-array buffers (`result_nonces[capacity]` / `result_count` / `result_capacity` + `batch_size`) to the kernel's contract; the non-macOS CUDA arm of `build_backend` is already scaffolded.
