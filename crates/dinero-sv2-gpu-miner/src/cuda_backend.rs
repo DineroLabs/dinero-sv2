@@ -266,3 +266,107 @@ impl GpuBackend for CudaMiner {
         self.dispatch(header_bytes, target, nonce_start, batch_size)
     }
 }
+
+// Kernel parity test — must reach an actual NVIDIA GPU + CUDA driver to run,
+// so it is `#[ignore]` by default. Run on the NVIDIA host with:
+//   cargo test --release -p dinero-sv2-gpu-miner --features cuda \
+//     -- --ignored cuda_parity
+//
+// Lives in-crate (NOT under `tests/`) because this crate is `[[bin]]`-only —
+// an integration test cannot reach `backend::pack_target_be` etc.
+#[cfg(test)]
+mod cuda_parity_tests {
+    use super::*;
+
+    /// CPU double-SHA256 of the full 128-byte BlockHeader v1 form with a
+    /// 32-bit nonce inserted at byte offset 112 — exactly what the kernel
+    /// hashes per thread. Returns the SHA-256d hash as 32 big-endian bytes.
+    fn sha256d_128_with_nonce(template128: &[u8; 128], nonce: u32) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut buf = *template128;
+        buf[112..116].copy_from_slice(&nonce.to_le_bytes());
+        let first = Sha256::digest(&buf[..]);
+        let second = Sha256::digest(first);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&second);
+        out
+    }
+
+    /// Big-endian compare of a 32-byte hash against a 32-byte target.
+    /// hash[0] is the MSB; `true` iff hash <= target.
+    fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+        for i in 0..32 {
+            if hash[i] < target[i] {
+                return true;
+            }
+            if hash[i] > target[i] {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + CUDA driver"]
+    fn cuda_parity_lowest_nonce_matches_cpu_reference() {
+        // Deterministic header (all zeros at most positions; nonce-only fuzz).
+        // A tiny batch keeps the CPU sweep cheap; the loose 8-leading-zero-byte
+        // target produces a handful of winners under SHA-256d, so we exercise
+        // both the "found" path and the "lowest of many" tie-break.
+        let mut header = [0u8; 128];
+        // Differentiate the header so a CPU collision against another test's
+        // header is implausible. Set a few non-zero bytes outside the nonce
+        // window (76..80 is the legacy nonce slot; 112..116 is the v1 slot).
+        for (i, b) in header.iter_mut().enumerate().take(72) {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+
+        let mut target = [0xffu8; 32];
+        // Loose target: 8 leading zero bits in BE → ~1 in 256 nonces wins.
+        target[0] = 0x00;
+
+        let nonce_start: u32 = 0;
+        let batch_size: u32 = 4096; // ~16 winners expected on average.
+
+        let miner = CudaMiner::init().expect("CudaMiner init (requires CUDA)");
+        let outcome = miner
+            .dispatch(&header, &target, nonce_start, batch_size)
+            .expect("cuda dispatch");
+
+        // CPU sweep the same range to compute the expected lowest winner.
+        let cpu_lowest = (nonce_start..nonce_start + batch_size)
+            .find(|n| {
+                let h = sha256d_128_with_nonce(&header, *n);
+                hash_meets_target(&h, &target)
+            });
+
+        match (outcome.found, cpu_lowest) {
+            (false, None) => { /* both agree: no winner in range */ }
+            (true, Some(expected)) => {
+                assert_eq!(
+                    outcome.nonce, expected,
+                    "CUDA returned nonce {:#x}, CPU lowest winner was {:#x}",
+                    outcome.nonce, expected
+                );
+                // Re-verify CUDA's claimed nonce satisfies the target via CPU
+                // sha256d — guards against a kernel bug producing a "winner"
+                // that doesn't actually beat the target.
+                let hash = sha256d_128_with_nonce(&header, outcome.nonce);
+                assert!(
+                    hash_meets_target(&hash, &target),
+                    "CUDA returned nonce {:#x} but CPU hash {:?} does not meet target",
+                    outcome.nonce,
+                    hash
+                );
+            }
+            (true, None) => panic!(
+                "CUDA reports found nonce {:#x} but CPU finds no winner in range",
+                outcome.nonce
+            ),
+            (false, Some(n)) => panic!(
+                "CUDA reports no winner but CPU found one at nonce {:#x}",
+                n
+            ),
+        }
+    }
+}
