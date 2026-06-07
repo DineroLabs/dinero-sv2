@@ -17,6 +17,8 @@ pub struct DispatchOutcome {
 pub trait GpuBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn device_name(&self) -> &str;
+    /// Max threads per workgroup/threadgroup — reported in the `gpu_ready` event.
+    fn max_threads_per_group(&self) -> u64;
     fn dispatch(
         &self,
         header_bytes: &[u8; 128],
@@ -42,7 +44,8 @@ pub fn pack_target_be(target: &[u8; 32]) -> [u32; 8] {
 }
 
 /// CPU double-SHA256 reference for an 80-byte header — the ground truth every
-/// GPU backend must match. Used by the CUDA parity test (Task 5).
+/// GPU backend must match. Test-only (used by the packing/parity unit tests).
+#[cfg(test)]
 pub fn sha256d_reference(header80: &[u8; 80]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let first = Sha256::digest(&header80[..]);
@@ -55,6 +58,16 @@ pub fn sha256d_reference(header80: &[u8; 80]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::pack_target_be;
+
+    #[test]
+    fn sha256d_reference_known_vector() {
+        // sha256d(80 zero bytes) — precomputed with Python hashlib.
+        let got = super::sha256d_reference(&[0u8; 80]);
+        assert_eq!(
+            hex::encode(got),
+            "4be7570e8f70eb093640c8468274ba759745a7aa2b7d25ab1e0421b259845014"
+        );
+    }
 
     #[test]
     fn packs_target_big_endian_words() {

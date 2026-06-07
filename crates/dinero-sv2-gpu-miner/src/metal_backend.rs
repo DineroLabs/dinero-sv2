@@ -89,14 +89,6 @@ impl MetalMiner {
         })
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.inner.device_name
-    }
-
-    pub fn max_threads_per_group(&self) -> u64 {
-        self.inner.max_threads_per_group
-    }
-
     /// Launch a single Metal dispatch covering `batch_size` nonces starting
     /// at `nonce_start`. Blocks until the GPU finishes, then reads back
     /// the found-nonce output. `batch_size` should be picked so that the
@@ -184,6 +176,10 @@ impl GpuBackend for MetalMiner {
 
     fn device_name(&self) -> &str {
         &self.inner.device_name
+    }
+
+    fn max_threads_per_group(&self) -> u64 {
+        self.inner.max_threads_per_group
     }
 
     fn dispatch(

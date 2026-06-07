@@ -150,14 +150,6 @@ impl OpenClMiner {
         })
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.inner.device_name
-    }
-
-    pub fn max_threads_per_group(&self) -> u64 {
-        self.inner.max_workgroup
-    }
-
     pub fn dispatch(
         &self,
         header_bytes: &[u8; 128],
@@ -231,6 +223,10 @@ impl GpuBackend for OpenClMiner {
 
     fn device_name(&self) -> &str {
         &self.inner.device_name
+    }
+
+    fn max_threads_per_group(&self) -> u64 {
+        self.inner.max_workgroup
     }
 
     fn dispatch(
