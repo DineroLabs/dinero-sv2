@@ -51,6 +51,9 @@ mod metal_backend;
 #[cfg(not(target_os = "macos"))]
 mod opencl_backend;
 
+/// Shared GPU backend abstraction (DispatchOutcome, GpuBackend, pack_target_be).
+mod backend;
+
 // Backend selection: Metal on Apple Silicon, OpenCL elsewhere. Both
 // modules expose the same surface (`init`, `device_name`,
 // `max_threads_per_group`, `dispatch`) so the SV2/JD layer is
