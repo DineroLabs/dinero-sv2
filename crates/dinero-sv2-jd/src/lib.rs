@@ -35,6 +35,7 @@ pub mod filter_commitment;
 pub mod merkle;
 pub mod messages;
 pub mod utreexo;
+pub mod witness_commitment;
 
 pub use codec::{
     decode_new_template_jd, decode_utreexo_accumulator_state, encode_new_template_jd,

@@ -39,7 +39,12 @@ use dinero_sv2_jd::{
     assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
     encode_utreexo_accumulator_state,
     filter_commitment::{is_dnrf_script, requires_filter_commitment},
-    leaf_hash_for_height, CoinbaseOutput, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+    leaf_hash_for_height,
+    witness_commitment::{
+        build_dnrw_script, is_dnrw_script, requires_witness_commitment, witness_merkle_root,
+        wtxid_from_tx_bytes,
+    },
+    CoinbaseOutput, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
 };
 use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
@@ -977,6 +982,42 @@ async fn handle_extended_share(
         ledger.reject(miner_key);
         send_share_error(session, channel_id, ext.sequence_number, "missing-dnrf").await?;
         return Ok(());
+    }
+
+    // 1c. Past the witness-commitment mandatory height, the coinbase
+    //     MUST contain the DNRW commitment with the exact value for
+    //     this block's witness merkle root (pool blocks always carry
+    //     the segwit reserved witness, so dinerod enforces it).
+    //     Because the coinbase wtxid is zeros by convention, the
+    //     expected script depends only on the template's mempool
+    //     wtxids — the pool can compute it exactly and compare bytes.
+    //     Without this, dinerod rejects the found block at ConnectTip
+    //     (missing-witness-commitment / bad-witness-commitment).
+    if requires_witness_commitment(pt.height as u64) {
+        let wtxids: Vec<[u8; 32]> = pt
+            .mempool_txs
+            .iter()
+            .map(|t| wtxid_from_tx_bytes(&t.data))
+            .collect();
+        let expected_dnrw = build_dnrw_script(&witness_merkle_root(&wtxids));
+        if !ext
+            .coinbase_outputs
+            .iter()
+            .any(|o| o.script_pubkey == expected_dnrw)
+        {
+            warn!(
+                height = pt.height,
+                outputs = ext.coinbase_outputs.len(),
+                has_dnrw_shape = ext
+                    .coinbase_outputs
+                    .iter()
+                    .any(|o| is_dnrw_script(&o.script_pubkey)),
+                "extended share: missing or wrong DNRW witness commitment in miner outputs"
+            );
+            ledger.reject(miner_key);
+            send_share_error(session, channel_id, ext.sequence_number, "missing-dnrw").await?;
+            return Ok(());
+        }
     }
 
     // 2. Reassemble the stripped coinbase using pool's prefix/suffix
