@@ -46,7 +46,22 @@ impl WindowJournal {
         let reader = BufReader::new(File::open(path)?);
         let mut out = Vec::new();
         for (i, line) in reader.lines().enumerate() {
-            let line = line?;
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => {
+                    // A read/UTF-8 decode error usually means the file is
+                    // truncated or corrupted from this point on (e.g. a
+                    // crash mid-write). Stop reading further and return
+                    // what was successfully parsed so far, rather than
+                    // failing the whole load and aborting pool startup.
+                    warn!(
+                        line = i,
+                        error = %e,
+                        "journal unreadable from this line onward — stopping load, keeping entries read so far"
+                    );
+                    break;
+                }
+            };
             if line.trim().is_empty() { continue; }
             match serde_json::from_str::<WindowEntry>(&line) {
                 Ok(e) => out.push(e),
@@ -93,6 +108,35 @@ mod tests {
         std::fs::write(&path, raw).unwrap();
         let loaded = WindowJournal::load(&path).unwrap();
         assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1].weight, 6);
+    }
+
+    #[test]
+    fn journal_load_stops_at_non_utf8_corruption_but_keeps_prior_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        let mut j = WindowJournal::open(&path).unwrap();
+        j.append(&WindowEntry { payout_script: vec![0x51], weight: 5, unix_ts: 1 }).unwrap();
+        j.append(&WindowEntry { payout_script: vec![0x52], weight: 6, unix_ts: 2 }).unwrap();
+        drop(j);
+        // Inject raw non-UTF-8 bytes (simulating truncation/corruption
+        // mid-write) between valid lines, followed by another valid line
+        // that must NOT be recovered since we stop at the first bad line.
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(b"\xff\xfe{bad\n");
+        raw.extend_from_slice(
+            serde_json::to_string(&WindowEntry { payout_script: vec![0x53], weight: 7, unix_ts: 3 })
+                .unwrap()
+                .as_bytes(),
+        );
+        raw.push(b'\n');
+        std::fs::write(&path, raw).unwrap();
+
+        // load() must not error — it should return the entries read
+        // before the corruption, and log loudly rather than aborting.
+        let loaded = WindowJournal::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].weight, 5);
         assert_eq!(loaded[1].weight, 6);
     }
 

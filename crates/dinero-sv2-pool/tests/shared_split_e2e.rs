@@ -1,6 +1,17 @@
 //! Regtest E2E: two shared-mode miners split a found block's coinbase.
 //!
-//! ## What this test asserts
+//! Two `#[ignore]` tests share one scenario
+//! (`run_shared_split_scenario`), differing only in how many blocks are
+//! mined before the pool builds its shared block:
+//!
+//! - `shared_block_coinbase_pays_window_contributors` mines 25 blocks
+//!   (just past Utreexo v2 activation).
+//! - `shared_block_at_dnrw_mandatory_height_includes_witness_commitment`
+//!   mines up to DNRW's mandatory witness-commitment height (10_670) so
+//!   the shared coinbase's DNRW commitment is checked against a real
+//!   daemon's mandatory-commitment gate, not just below it.
+//!
+//! ## What the shared scenario asserts
 //!
 //! 1. Two miners connect over the real SV2 wire (Noise NX handshake,
 //!    `SetupConnection`, `OpenStandardMiningChannel`), then opt into
@@ -23,7 +34,12 @@
 //!    - the DNRF filter commitment is present (height ≥ 1),
 //!    - the sum of all coinbase output values equals the block reward.
 //!
-//! Run: `DINEROD_BIN=/path/to/dinerod cargo test -p dinero-sv2-pool
+//!    The DNRW-mandatory-height test additionally asserts the coinbase
+//!    contains the DNRW witness-commitment output (script prefix
+//!    `6a25444e5257 01`).
+//!
+//! Run (both tests; the DNRW one takes several minutes — see its doc
+//! comment): `DINEROD_BIN=/path/to/dinerod cargo test -p dinero-sv2-pool
 //! --test shared_split_e2e -- --ignored --nocapture`
 //!
 //! ## Harness notes
@@ -69,6 +85,7 @@ use dinero_sv2_common::{
     HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannel, SetRewardMode, SetupConnection,
     SubmitSharesDinero, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
+use dinero_sv2_jd::witness_commitment::WITNESS_COMMITMENT_MANDATORY_HEIGHT;
 use dinero_sv2_pool::{
     mapper,
     rpc::{Auth, RpcClient},
@@ -101,7 +118,11 @@ struct RegtestDaemon {
 }
 
 impl RegtestDaemon {
-    fn spawn() -> Result<Self> {
+    /// `port` distinguishes concurrently-running `--ignored` tests in
+    /// this file (and the datadir path folds in the port too) so two
+    /// scenarios can run in the same `cargo test -- --ignored` process
+    /// without colliding on a bind address or on-disk state.
+    fn spawn(port: u16) -> Result<Self> {
         let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/src/dinero/build/dinerod")
@@ -115,7 +136,7 @@ impl RegtestDaemon {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let datadir = PathBuf::from(format!(
-            "/tmp/dinero-sv2-shared-split-e2e-{}-{nanos}",
+            "/tmp/dinero-sv2-shared-split-e2e-{port}-{}-{nanos}",
             std::process::id()
         ));
         if datadir.exists() {
@@ -123,7 +144,6 @@ impl RegtestDaemon {
         }
         std::fs::create_dir_all(&datadir).context("mkdir datadir")?;
 
-        let port: u16 = 29_979;
         let rpc_url = format!("http://127.0.0.1:{port}");
 
         let child = Command::new(&binary)
@@ -183,6 +203,7 @@ struct PoolProcess {
 impl PoolProcess {
     #[allow(clippy::too_many_arguments)]
     fn spawn(
+        bind: SocketAddr,
         rpc_url: &str,
         cookie_path: &Path,
         payout_address: &str,
@@ -191,7 +212,6 @@ impl PoolProcess {
         stderr_log: PathBuf,
     ) -> Result<Self> {
         let binary = env!("CARGO_BIN_EXE_dinero-sv2-pool");
-        let bind: SocketAddr = "127.0.0.1:29980".parse()?;
         let stderr_file =
             std::fs::File::create(&stderr_log).context("creating pool stderr log")?;
 
@@ -652,19 +672,73 @@ fn parse_coinbase_only_block_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8
 }
 
 // ---------------------------------------------------------------------------
-// The test itself
+// Shared scenario: spawn daemon + pool, mine `setup_blocks`, run the
+// two-miner PPLNS split, submit the winning block, and hand back
+// everything the caller needs to assert on. Both `#[ignore]` tests below
+// share this — the only difference between "just past Utreexo v2
+// activation" and "past DNRW's mandatory witness-commitment height" is
+// `setup_blocks` plus a distinct daemon/pool port pair (so both can run
+// concurrently in one `cargo test -- --ignored` invocation without
+// colliding).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-#[ignore = "spawns regtest dinerod + dinero-sv2-pool; run with --ignored"]
-async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
+const SHARES_A: usize = 6;
+const SHARES_B: usize = 2;
+
+/// What the two `#[ignore]` tests below assert on beyond what
+/// `run_shared_split_scenario` itself already checks (split ratio, fee,
+/// DNRF, reward sum — all internal to the function since they don't
+/// depend on `setup_blocks`).
+struct SharedSplitOutcome {
+    height: u64,
+    outputs: Vec<(u64, Vec<u8>)>,
+}
+
+/// Mine `total_blocks` regtest blocks to `address` in batches of at most
+/// 1000 per `generatetoaddress` RPC call. Returns wall time spent mining.
+async fn mine_blocks(rpc: &RpcClient, address: &str, total_blocks: u32) -> Result<Duration> {
+    let start = Instant::now();
+    let mut remaining = total_blocks;
+    while remaining > 0 {
+        let batch = remaining.min(1000);
+        let _ = rpc
+            .call_raw("generatetoaddress", serde_json::json!([batch, address]))
+            .await
+            .context("generatetoaddress (setup batch)")?;
+        remaining -= batch;
+    }
+    Ok(start.elapsed())
+}
+
+/// Run the full two-miner shared-split scenario against a freshly spawned
+/// regtest `dinerod` + `dinero-sv2-pool`, mining `setup_blocks` blocks
+/// before the pool ever touches the chain (so the shared block the pool
+/// builds lands at height `setup_blocks + 1`). `daemon_port`/`pool_port`
+/// must be disjoint from any other concurrently-running instance of this
+/// scenario (see `RegtestDaemon::spawn`'s doc comment).
+async fn run_shared_split_scenario(
+    setup_blocks: u32,
+    daemon_port: u16,
+    pool_port: u16,
+    label: &str,
+) -> Result<SharedSplitOutcome> {
     let started = Instant::now();
 
-    let daemon = RegtestDaemon::spawn().context("spawn regtest dinerod")?;
+    let daemon = RegtestDaemon::spawn(daemon_port).context("spawn regtest dinerod")?;
     daemon.wait_for_cookie().context("wait for cookie")?;
     let rpc = RpcClient::new(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
+    )?;
+    // A dedicated client with a much longer per-request timeout, used
+    // only for the batched `generatetoaddress` setup-mining calls below:
+    // a single 1000-block batch on a non-trivial chain regularly takes
+    // 30-40s (measured), well past the 15s budget `rpc`'s default
+    // timeout gives the pool's own steady-state calls.
+    let mining_rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(180),
     )?;
 
     // Wallet + payout address for the pool's own getblocktemplate calls.
@@ -678,14 +752,13 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("createhd did not return first_address: {create}"))?
         .to_string();
 
-    // Mine well past the regtest Utreexo maturity-leaf v2 activation
-    // height (20) so the shared block we're about to build exercises
-    // v2 leaves, not the legacy v1 path.
-    const SETUP_BLOCKS: u32 = 25;
-    let _ = rpc
-        .call_raw("generatetoaddress", serde_json::json!([SETUP_BLOCKS, address.clone()]))
+    let mine_setup_elapsed = mine_blocks(&mining_rpc, &address, setup_blocks)
         .await
-        .context("generatetoaddress (setup)")?;
+        .context("mining setup blocks")?;
+    eprintln!(
+        "{label}: mined {setup_blocks} setup blocks in {:.1}s",
+        mine_setup_elapsed.as_secs_f64()
+    );
 
     // Snapshot the reward + the pool's fee script from a throwaway GBT
     // call before the pool starts touching the mempool/template cycle
@@ -712,7 +785,7 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing height in getblocktemplate"))?;
 
     let tmpdir = std::env::temp_dir().join(format!(
-        "dinero-sv2-shared-split-e2e-pool-{}-{}",
+        "dinero-sv2-shared-split-e2e-pool-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -724,7 +797,9 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
     let key_path = tmpdir.join("pool.key");
     let stderr_log = tmpdir.join("pool.stderr.log");
 
+    let pool_bind: SocketAddr = format!("127.0.0.1:{pool_port}").parse()?;
     let pool = PoolProcess::spawn(
+        pool_bind,
         &daemon.rpc_url,
         &daemon.cookie_path,
         &address,
@@ -750,8 +825,6 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
     // A contributes 3x B's share count → strictly more PPLNS weight
     // (every accepted share carries identical weight here, since both
     // channels share the same, loosest-possible target).
-    const SHARES_A: usize = 6;
-    const SHARES_B: usize = 2;
     miner_a
         .accumulate_shares(SHARES_A)
         .await
@@ -904,10 +977,9 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
     );
 
     // DNRF filter commitment MUST be present (DNRF activates at height
-    // 1 on regtest, well below our mined height). DNRW is NOT asserted
-    // either way — it's only mandatory from height 10_670, and our low
-    // test height legitimately has none (the builder already gates on
-    // height).
+    // 1 on regtest, well below our mined height). DNRW mandatory-ness is
+    // height-gated (see `WITNESS_COMMITMENT_MANDATORY_HEIGHT`) — the
+    // caller decides whether to assert on it based on `setup_blocks`.
     const DNRF_MAGIC: [u8; 6] = [0x6a, 0x25, 0x44, 0x4e, 0x52, 0x46];
     assert!(
         outputs.iter().any(|(_, s)| s.starts_with(&DNRF_MAGIC)),
@@ -918,10 +990,93 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
     let total: u64 = outputs.iter().map(|(v, _)| *v).sum();
     assert_eq!(total, expected_reward_una, "coinbase output sum != block reward");
 
+    let scenario_elapsed = started.elapsed();
     eprintln!(
-        "shared_block_coinbase_pays_window_contributors: PASS in {:.1}s — block {block_hash} \
-         height={height} A={value_a} B={value_b} fee={fee_value} total={total} reward={expected_reward_una}",
-        started.elapsed().as_secs_f64()
+        "{label}: PASS in {:.1}s (of which {:.1}s mining {setup_blocks} setup blocks) — \
+         block {block_hash} height={height} A={value_a} B={value_b} fee={fee_value} \
+         total={total} reward={expected_reward_una}",
+        scenario_elapsed.as_secs_f64(),
+        mine_setup_elapsed.as_secs_f64(),
+    );
+
+    Ok(SharedSplitOutcome { height, outputs })
+}
+
+// ---------------------------------------------------------------------------
+// The tests themselves
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "spawns regtest dinerod + dinero-sv2-pool; run with --ignored"]
+async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
+    // Mine well past the regtest Utreexo maturity-leaf v2 activation
+    // height (20) so the shared block we're about to build exercises v2
+    // leaves, not the legacy v1 path. Far below DNRW's mandatory height
+    // (10_670, see the sibling test below), so DNRW is NOT asserted
+    // either way here — the builder already gates on height.
+    const SETUP_BLOCKS: u32 = 25;
+    let outcome = run_shared_split_scenario(
+        SETUP_BLOCKS,
+        29_979,
+        29_980,
+        "shared_block_coinbase_pays_window_contributors",
+    )
+    .await?;
+    assert_eq!(outcome.height, u64::from(SETUP_BLOCKS) + 1, "found block is not the expected next height");
+    Ok(())
+}
+
+/// Regtest `dinerod` hardcodes `WITNESS_COMMITMENT_MANDATORY_HEIGHT =
+/// 10670` in `consensus/block_validation.cpp` with NO chain-gating —
+/// unlike the Utreexo maturity-leaf activation height used by the
+/// sibling test above, there is no lower regtest-specific override
+/// anywhere in `dinero-v8` (confirmed by reading `block_validation.cpp`
+/// directly: the constant is a bare `constexpr` inside `FullRulesActive`,
+/// not looked up per-chain). So the only way to exercise "our shared
+/// coinbase's DNRW witness commitment survives a real daemon's
+/// mandatory-commitment check" is to actually mine up to that height.
+///
+/// Timed on this machine: batched `generatetoaddress(1000, ...)` calls
+/// cost ~24s for the first 1000 blocks, then level off around ~35-40s
+/// per subsequent 1000 once the chain/wallet state stabilizes — i.e.
+/// ~10_669 setup blocks costs several minutes of wall time, nowhere near
+/// the ~90s this repo's other regtest E2E tests budget for. There is no
+/// faster path to a real consensus check at this height, so this is
+/// implemented as-is with a generous `#[ignore]` and this doc comment
+/// instead of skipped.
+#[tokio::test]
+#[ignore = "spawns regtest dinerod + dinero-sv2-pool; mines ~10_669 regtest blocks to reach \
+            DNRW's mandatory witness-commitment height (10_670) — takes several minutes, see \
+            doc comment. Run with --ignored --nocapture to see progress."]
+async fn shared_block_at_dnrw_mandatory_height_includes_witness_commitment() -> Result<()> {
+    let setup_blocks: u32 = (WITNESS_COMMITMENT_MANDATORY_HEIGHT - 1)
+        .try_into()
+        .expect("WITNESS_COMMITMENT_MANDATORY_HEIGHT fits in u32");
+    let outcome = run_shared_split_scenario(
+        setup_blocks,
+        29_981,
+        29_982,
+        "shared_block_at_dnrw_mandatory_height_includes_witness_commitment",
+    )
+    .await?;
+    assert_eq!(
+        outcome.height, WITNESS_COMMITMENT_MANDATORY_HEIGHT,
+        "found block is not at DNRW's mandatory-commitment height"
+    );
+
+    // The whole point of this test: at a DNRW-mandatory height, the
+    // shared coinbase MUST carry the DNRW witness-commitment output
+    // (script prefix 0x6a 0x25 0x44 0x4e 0x52 0x57 0x01 — OP_RETURN,
+    // 37-byte push, "DNRW" magic, version 1) in addition to every
+    // assertion already made inside `run_shared_split_scenario` (split
+    // ratio, fee, DNRF, reward sum).
+    const DNRW_MAGIC_AND_VERSION: [u8; 7] = [0x6a, 0x25, 0x44, 0x4e, 0x52, 0x57, 0x01];
+    assert!(
+        outcome.outputs.iter().any(|(_, s)| s.starts_with(&DNRW_MAGIC_AND_VERSION)),
+        "coinbase at DNRW-mandatory height {} is missing the DNRW witness commitment output; \
+         outputs: {:?}",
+        outcome.height,
+        outcome.outputs.iter().map(|(v, s)| format!("{}:{}", hex::encode(s), v)).collect::<Vec<_>>()
     );
 
     Ok(())

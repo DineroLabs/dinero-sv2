@@ -286,7 +286,13 @@ async fn main() -> Result<()> {
     // journal itself for ongoing appends. Losing the journal only costs
     // unpaid share *credit* — never funds (see journal.rs).
     let window = Arc::new(Mutex::new(PplnsWindow::restore(
-        WindowJournal::load(&args.pplns_journal)?,
+        WindowJournal::load(&args.pplns_journal).unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                "PPLNS journal unreadable — starting with an empty window"
+            );
+            Vec::new()
+        }),
         14_400,
     )));
     let journal = Arc::new(Mutex::new(
