@@ -10,4 +10,5 @@ pub mod block;
 pub mod journal;
 pub mod mapper;
 pub mod rpc;
+pub mod split;
 pub mod target;
