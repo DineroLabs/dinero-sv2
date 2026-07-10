@@ -35,6 +35,7 @@ pub mod filter_commitment;
 pub mod merkle;
 pub mod messages;
 pub mod utreexo;
+pub mod witness_commitment;
 
 pub use codec::{
     decode_new_template_jd, decode_utreexo_accumulator_state, encode_new_template_jd,
@@ -44,7 +45,8 @@ pub use coinbase::{assemble_stripped_coinbase, CoinbaseOutput, CoinbaseOutputs};
 pub use merkle::{compute_root, MerkleError, MerklePath};
 pub use messages::NewTemplateDineroJD;
 pub use utreexo::{
-    commitment, leaf_hash, node_hash, tree_height_for_position, tree_start_position,
-    DeletionTarget, UtreexoAccumulatorState, UtreexoError, LEAF_DOMAIN_TAG, NODE_DOMAIN_TAG,
-    ZERO_HASH,
+    commitment, leaf_hash, leaf_hash_for_height, leaf_hash_v2, node_hash,
+    tree_height_for_position, tree_start_position, DeletionTarget, UtreexoAccumulatorState,
+    UtreexoError, LEAF_DOMAIN_TAG, LEAF_DOMAIN_TAG_V2, NODE_DOMAIN_TAG,
+    UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET, ZERO_HASH,
 };

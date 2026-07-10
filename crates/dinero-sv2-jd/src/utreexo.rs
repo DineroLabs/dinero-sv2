@@ -28,11 +28,25 @@
 
 use sha2::{Digest, Sha256};
 
-/// Domain tag for UTXO leaf hashes. 19 bytes.
+/// Domain tag for v1 UTXO leaf hashes. 19 bytes.
 pub const LEAF_DOMAIN_TAG: &[u8] = b"DINERO-UTXO-LEAF-v1";
+
+/// Domain tag for v2 (maturity-bound) UTXO leaf hashes. 19 bytes.
+pub const LEAF_DOMAIN_TAG_V2: &[u8] = b"DINERO-UTXO-LEAF-v2";
 
 /// Domain tag for Utreexo internal node hashes. 22 bytes.
 pub const NODE_DOMAIN_TAG: &[u8] = b"DINERO-UTREEXO-NODE-v1";
+
+/// Utreexo maturity-leaf hard fork: mainnet activation height.
+///
+/// Outputs **created** at or above this height hash with the v2 leaf
+/// preimage (authenticates `created_height` + `is_coinbase`); outputs
+/// created below it keep v1 forever. Mirrors
+/// `UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET` in dinerod's
+/// `include/consensus/utreexo_maturity_leaf_activation.h` (testnet
+/// activates at 0, regtest at 20 — pass those to
+/// [`leaf_hash_for_height`] when driving a non-mainnet daemon).
+pub const UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET: u32 = 60_000;
 
 /// Single-SHA256 hash (not `sha256d`; this is Utreexo-specific — every
 /// Utreexo-world hash uses single-round SHA256 with a domain tag).
@@ -64,6 +78,61 @@ pub fn leaf_hash(txid: &[u8; 32], vout: u32, amount: u64, script_pubkey: &[u8]) 
     write_compact_size(&mut buf, script_pubkey.len() as u64);
     buf.extend_from_slice(script_pubkey);
     sha256(&buf)
+}
+
+/// Compute the **v2 (maturity-bound)** Utreexo leaf hash for a single
+/// UTXO.
+///
+/// Matches `HashUTXOV2(txid, vout, amount, scriptPubKey, created_height,
+/// is_coinbase)` in dinerod's `src/consensus/utreexo_accumulator.cpp`
+/// (commit `92e71dd5e`, the maturity-leaf hard fork).
+///
+/// Preimage = `"DINERO-UTXO-LEAF-v2" || txid (32) || vout (u32 LE) ||
+/// amount (u64 LE) || CompactSize(script.len()) || script ||
+/// created_height (u32 LE) || flags (u8, bit0 = is_coinbase)`.
+/// Hash = single SHA256.
+pub fn leaf_hash_v2(
+    txid: &[u8; 32],
+    vout: u32,
+    amount: u64,
+    script_pubkey: &[u8],
+    created_height: u32,
+    is_coinbase: bool,
+) -> [u8; 32] {
+    let mut buf =
+        Vec::with_capacity(LEAF_DOMAIN_TAG_V2.len() + 32 + 4 + 8 + 9 + script_pubkey.len() + 5);
+    buf.extend_from_slice(LEAF_DOMAIN_TAG_V2);
+    buf.extend_from_slice(txid);
+    buf.extend_from_slice(&vout.to_le_bytes());
+    buf.extend_from_slice(&amount.to_le_bytes());
+    write_compact_size(&mut buf, script_pubkey.len() as u64);
+    buf.extend_from_slice(script_pubkey);
+    buf.extend_from_slice(&created_height.to_le_bytes());
+    buf.push(if is_coinbase { 0x01 } else { 0x00 });
+    sha256(&buf)
+}
+
+/// Version-dispatching leaf hash: v2 when the output's `created_height`
+/// is at/above `activation_height`, v1 below it.
+///
+/// Matches `HashUTXOForCreationHeight` in dinerod's
+/// `src/consensus/utreexo_accumulator.cpp`. Pass
+/// [`UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET`] as `activation_height` on
+/// mainnet.
+pub fn leaf_hash_for_height(
+    txid: &[u8; 32],
+    vout: u32,
+    amount: u64,
+    script_pubkey: &[u8],
+    created_height: u32,
+    is_coinbase: bool,
+    activation_height: u32,
+) -> [u8; 32] {
+    if created_height >= activation_height {
+        leaf_hash_v2(txid, vout, amount, script_pubkey, created_height, is_coinbase)
+    } else {
+        leaf_hash(txid, vout, amount, script_pubkey)
+    }
 }
 
 /// Compute the Utreexo **internal node hash** from two child hashes.
@@ -905,6 +974,51 @@ mod tests {
         let untagged = sha256(&untagged_preimage);
 
         assert_ne!(tagged, untagged);
+    }
+
+    /// v2 preimage layout, checked against an independently-built
+    /// reference (mirrors `HashUTXOV2` in dinerod commit `92e71dd5e`):
+    /// v1 fields, then `created_height` (u32 LE), then a flags byte.
+    #[test]
+    fn leaf_hash_v2_matches_reference_preimage() {
+        let txid = [0xAB; 32];
+        let spk = [0x51u8];
+        let hash = leaf_hash_v2(&txid, 3, 50_000_000, &spk, 61_403, true);
+
+        let mut reference = Vec::new();
+        reference.extend_from_slice(b"DINERO-UTXO-LEAF-v2");
+        reference.extend_from_slice(&txid);
+        reference.extend_from_slice(&3u32.to_le_bytes());
+        reference.extend_from_slice(&50_000_000u64.to_le_bytes());
+        reference.push(0x01); // varint script len
+        reference.push(0x51);
+        reference.extend_from_slice(&61_403u32.to_le_bytes());
+        reference.push(0x01); // flags: is_coinbase
+        assert_eq!(&hash[..], &sha256(&reference)[..]);
+
+        // Non-coinbase flips only the flags byte.
+        let non_cb = leaf_hash_v2(&txid, 3, 50_000_000, &spk, 61_403, false);
+        *reference.last_mut().unwrap() = 0x00;
+        assert_eq!(&non_cb[..], &sha256(&reference)[..]);
+        assert_ne!(hash, non_cb);
+    }
+
+    /// The maturity-leaf fork gates on the output's creation height:
+    /// v1 below activation, v2 at/above it. A stack still hashing v1
+    /// past activation produces roots dinerod rejects with
+    /// `bad-utreexo-root` (the 2026-07-09 SJ pool outage).
+    #[test]
+    fn leaf_hash_for_height_switches_at_activation() {
+        let txid = [0xCD; 32];
+        let spk = [0x51u8, 0x52];
+        let act = UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET;
+
+        let below = leaf_hash_for_height(&txid, 0, 42, &spk, act - 1, true, act);
+        assert_eq!(below, leaf_hash(&txid, 0, 42, &spk));
+
+        let at = leaf_hash_for_height(&txid, 0, 42, &spk, act, true, act);
+        assert_eq!(at, leaf_hash_v2(&txid, 0, 42, &spk, act, true));
+        assert_ne!(at, below);
     }
 
     #[test]

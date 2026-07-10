@@ -29,7 +29,9 @@ use dinero_sv2_jd::{
     block_filter::{gcs_build, gcs_filter_hash},
     commitment as utreexo_commitment, compute_root, decode_utreexo_accumulator_state,
     filter_commitment::{build_dnrf_script, requires_filter_commitment},
-    leaf_hash, CoinbaseOutput, UtreexoAccumulatorState,
+    leaf_hash_for_height,
+    witness_commitment::{build_dnrw_script_coinbase_only, requires_witness_commitment},
+    CoinbaseOutput, UtreexoAccumulatorState, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
 };
 use dinero_sv2_transport::{
     Frame, NoiseReader, NoiseSession, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
@@ -804,6 +806,26 @@ fn start_hashing_gpu(
         value_una: ctx.coinbase_value_una,
         script_pubkey: payout_script.clone(),
     }];
+    if requires_witness_commitment(ctx.height as u64) {
+        if ctx.merkle_path.is_empty() {
+            // Coinbase-only block: the witness merkle root is the
+            // constant zero hash, so the DNRW commitment is computable
+            // without knowing any wtxids.
+            miner_outputs.push(CoinbaseOutput {
+                value_una: 0,
+                script_pubkey: build_dnrw_script_coinbase_only(),
+            });
+        } else {
+            // Mempool txs are in the template; their wtxids aren't in
+            // CoinbaseContext, so a correct DNRW can't be built here.
+            // Shares still count, but a block-target solution would be
+            // rejected by dinerod (missing-witness-commitment).
+            tracing::warn!(
+                height = ctx.height,
+                "non-empty merkle_path: cannot build DNRW commitment; block solutions will not connect"
+            );
+        }
+    }
     if requires_filter_commitment(ctx.height as u64) {
         miner_outputs.push(CoinbaseOutput {
             value_una: 0,
@@ -814,7 +836,15 @@ fn start_hashing_gpu(
         assemble_stripped_coinbase(&ctx.coinbase_prefix, &miner_outputs, &ctx.coinbase_suffix);
     let mut post_state = pre_block_state.clone();
     for (i, out) in miner_outputs.iter().enumerate() {
-        let leaf = leaf_hash(&coinbase_txid, i as u32, out.value_una, &out.script_pubkey);
+        let leaf = leaf_hash_for_height(
+            &coinbase_txid,
+            i as u32,
+            out.value_una,
+            &out.script_pubkey,
+            ctx.height,
+            true,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        );
         if let Err(err) = post_state.add_leaf(leaf) {
             tracing::error!("post-state add_leaf failed: {err}");
             return;
