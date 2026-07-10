@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::warn;
 
-use crate::accounting::{PplnsWindow, WindowEntry};
+use crate::accounting::WindowEntry;
 
 pub struct WindowJournal {
     path: PathBuf,
@@ -56,11 +56,11 @@ impl WindowJournal {
         Ok(out)
     }
 
-    pub fn compact(&mut self, live: &PplnsWindow) -> Result<()> {
+    pub fn compact(&mut self, entries: &[WindowEntry]) -> Result<()> {
         let tmp = self.path.with_extension("jsonl.tmp");
         {
             let mut w = BufWriter::new(File::create(&tmp)?);
-            for e in live.entries() {
+            for e in entries {
                 serde_json::to_writer(&mut w, e)?;
                 w.write_all(b"\n")?;
             }
@@ -77,6 +77,7 @@ impl WindowJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounting::PplnsWindow;
 
     #[test]
     fn journal_round_trip_and_corrupt_line_skip() {
@@ -105,7 +106,31 @@ mod tests {
         }
         let mut w = PplnsWindow::new(14_400);
         w.record(vec![0x51], 1, 9);
-        j.compact(&w).unwrap();
+        let entries: Vec<WindowEntry> = w.entries().cloned().collect();
+        j.compact(&entries).unwrap();
         assert_eq!(WindowJournal::load(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compact_writes_exactly_the_snapshot_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        let mut j = WindowJournal::open(&path).unwrap();
+        for i in 0..5 {
+            j.append(&WindowEntry { payout_script: vec![0x51], weight: 1, unix_ts: i }).unwrap();
+        }
+        // Snapshot only two entries — compact must write exactly these,
+        // regardless of what was previously appended to the journal.
+        let entries = vec![
+            WindowEntry { payout_script: vec![0x52], weight: 7, unix_ts: 100 },
+            WindowEntry { payout_script: vec![0x53], weight: 8, unix_ts: 101 },
+        ];
+        j.compact(&entries).unwrap();
+        let loaded = WindowJournal::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].payout_script, vec![0x52]);
+        assert_eq!(loaded[0].weight, 7);
+        assert_eq!(loaded[1].payout_script, vec![0x53]);
+        assert_eq!(loaded[1].weight, 8);
     }
 }

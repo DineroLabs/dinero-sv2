@@ -417,25 +417,31 @@ async fn main() -> Result<()> {
                 // solo mining and the pool itself are unaffected.
                 let shared = match mapper::extract_fee_script(&pt.coinbase_full_hex) {
                     Ok(fee_script) => {
-                        let split_outputs = {
+                        // Snapshot the weights and release the window lock
+                        // immediately — compute_split/merge_duplicate_outputs
+                        // don't need it, and holding it here would block
+                        // shared-share crediting (which also takes this
+                        // lock) for the duration of split computation.
+                        let weights = {
                             let w = pplns_window.lock().unwrap();
-                            let weights = w.weights();
-                            let params = split::SplitParams {
-                                reward_una: pt.coinbase_value_una,
-                                fee_bps: shared_fee_bps,
-                                fee_script: &fee_script,
-                                max_outputs: shared_max_outputs,
-                                dust_una: shared_dust_una,
-                                // No finder yet at template time — use the
-                                // fee script so an empty-window template
-                                // still validates (sums correctly). The
-                                // finder-specific split only matters at
-                                // block-submit time, which this template
-                                // doesn't need to know about.
-                                finder_script: &fee_script,
-                            };
-                            split::merge_duplicate_outputs(split::compute_split(&weights, &params))
+                            w.weights()
                         };
+                        let params = split::SplitParams {
+                            reward_una: pt.coinbase_value_una,
+                            fee_bps: shared_fee_bps,
+                            fee_script: &fee_script,
+                            max_outputs: shared_max_outputs,
+                            dust_una: shared_dust_una,
+                            // No finder yet at template time — use the
+                            // fee script so an empty-window template
+                            // still validates (sums correctly). The
+                            // finder-specific split only matters at
+                            // block-submit time, which this template
+                            // doesn't need to know about.
+                            finder_script: &fee_script,
+                        };
+                        let split_outputs =
+                            split::merge_duplicate_outputs(split::compute_split(&weights, &params));
                         match shared_template::build_shared_template(&pt, split_outputs) {
                             Ok(st) => Some(Arc::new(st)),
                             Err(e) => {
@@ -1204,9 +1210,14 @@ async fn handle_shared_share(
     }
     {
         // Separate lock scope from `window` above: `journal.compact`
-        // takes its own fresh `window` lock internally, so holding the
-        // first guard across this block would deadlock (std::sync::Mutex
-        // is not reentrant).
+        // used to take its own fresh `window` lock internally, so holding
+        // the first guard across this block would deadlock (std::sync::
+        // Mutex is not reentrant). It now takes a snapshot of entries
+        // instead (see below), so the window lock is only ever held
+        // briefly to clone the snapshot — never across the compact I/O
+        // (serialize + flush + rename of up to 50k entries), which would
+        // otherwise stall the template producer's own window lock and
+        // block SOLO job production.
         let mut j = journal.lock().expect("pplns journal mutex");
         if let Err(e) = j.append(&WindowEntry {
             payout_script: payout_script.to_vec(),
@@ -1216,8 +1227,11 @@ async fn handle_shared_share(
             warn!(error = %e, "pplns journal append failed — window credit still live in memory");
         }
         if j.should_compact() {
-            let w = window.lock().expect("pplns window mutex");
-            if let Err(e) = j.compact(&w) {
+            let entries: Vec<WindowEntry> = {
+                let w = window.lock().expect("pplns window mutex");
+                w.entries().cloned().collect()
+            };
+            if let Err(e) = j.compact(&entries) {
                 warn!(error = %e, "pplns journal compact failed");
             }
         }
