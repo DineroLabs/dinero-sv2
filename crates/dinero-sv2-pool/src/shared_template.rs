@@ -15,7 +15,7 @@ use dinero_sv2_jd::{
 };
 
 use crate::block::wrap_stripped_with_segwit_witness;
-use crate::mapper::PoolTemplate;
+use crate::mapper::{MempoolTx, PoolTemplate};
 
 /// Pool-assembled template for a shared (non-JD) miner: the pool
 /// builds the whole coinbase itself, so the header roots it emits are
@@ -234,5 +234,55 @@ mod tests {
         }];
         let err = build_shared_template(&pt, outputs).unwrap_err();
         assert!(err.to_string().contains("utreexo pre-block"));
+    }
+
+    #[test]
+    fn rejects_nonempty_mempool() {
+        let mut pt = crate::mapper::tests::fixture_pool_template();
+        // Fixture has empty mempool_txs; push a dummy one to trigger rejection.
+        pt.mempool_txs.push(MempoolTx {
+            data: vec![0x01, 0x02, 0x03], // minimal dummy tx bytes
+            txid_raw: [0x42u8; 32],
+            inputs: vec![],
+            outputs: vec![],
+        });
+
+        let outputs = vec![CoinbaseOutput {
+            value_una: pt.coinbase_value_una,
+            script_pubkey: vec![0x51, 0x20, 0x01],
+        }];
+        let err = build_shared_template(&pt, outputs).unwrap_err();
+        assert!(err.to_string().contains("coinbase-only"));
+    }
+
+    #[test]
+    fn below_activation_heights_skip_commitments() {
+        let mut pt = crate::mapper::tests::fixture_pool_template();
+        // Height 2: below DNRW mandatory (10_670) but at/above DNRF activation (1).
+        pt.height = 2;
+        assert!(requires_filter_commitment(pt.height as u64)); // DNRF should be present
+        assert!(!requires_witness_commitment(pt.height as u64)); // DNRW should be absent
+
+        let outputs = vec![
+            CoinbaseOutput {
+                value_una: pt.coinbase_value_una - 200_000_000,
+                script_pubkey: vec![0x51, 0x20, 0x01],
+            },
+            CoinbaseOutput {
+                value_una: 200_000_000,
+                script_pubkey: vec![0x51, 0x20, 0x09],
+            },
+        ];
+        let st = build_shared_template(&pt, outputs.clone()).unwrap();
+
+        // Should have 2 value outputs + DNRF only (no DNRW).
+        assert_eq!(st.outputs.len(), 3);
+        assert_eq!(st.outputs[0], outputs[0]);
+        assert_eq!(st.outputs[1], outputs[1]);
+        // DNRF: starts with 0x6a 0x25 0x44 0x4e 0x52 0x46 ("DNRF" magic).
+        assert!(st.outputs[2].script_pubkey.starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x46]));
+        // Verify no script starts with DNRW prefix (0x6a 0x25 0x44 0x4e 0x52 0x57).
+        assert!(!st.outputs.iter()
+            .any(|o| o.script_pubkey.starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x57])));
     }
 }
