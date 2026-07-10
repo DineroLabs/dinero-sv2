@@ -13,13 +13,13 @@
 //! no persistent share ledger. See crate docs in
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
-use dinero_sv2_pool::{accounting, block, mapper, rpc, target};
+use dinero_sv2_pool::{accounting, block, journal, mapper, rpc, shared_template, split, target};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -29,11 +29,13 @@ use dinero_sv2_codec::{
     encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
     encode_set_new_prev_hash, encode_set_target, encode_setup_connection_error,
     encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
+    sv2::{decode_set_reward_mode, encode_window_status},
 };
 use dinero_sv2_common::{
     CoinbaseContext, HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannelError,
     OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnectionError, SetupConnectionSuccess,
-    SubmitSharesDinero, SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
+    SubmitSharesDinero, SubmitSharesError, SubmitSharesSuccess, WindowStatus, PROTOCOL_MINING,
+    PROTOCOL_VERSION,
 };
 use dinero_sv2_jd::{
     assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
@@ -50,18 +52,40 @@ use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
     MSG_OPEN_STANDARD_MINING_CHANNEL, MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
     MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR,
-    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SET_TARGET, MSG_SUBMIT_SHARES_ERROR,
-    MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
-    MSG_UTREEXO_STATE,
+    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SET_REWARD_MODE, MSG_SET_TARGET,
+    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD,
+    MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE, MSG_WINDOW_STATUS,
 };
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::accounting::{Ledger, MinerKey};
+use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry};
+use crate::journal::WindowJournal;
 use crate::mapper::PoolTemplate;
 use crate::rpc::{Auth, RpcClient, SubmitBlockResult};
+use crate::shared_template::SharedTemplate;
 use crate::target::{hash_meets_target, leading_zero_bits_target, target_for_hashrate};
+
+/// Bundle of the daemon-sourced solo template and (if it could be
+/// built this refresh) the pool-owned shared-mode variant. Sent as a
+/// single atomic unit over the watch channel so a connection never
+/// observes a `shared` template paired with a stale/mismatched `pt`
+/// (or vice versa) — see amendments for Task 6.
+struct TemplateBundle {
+    pt: PoolTemplate,
+    shared: Option<Arc<SharedTemplate>>,
+}
+
+/// Hash a shared-mode miner's payout script into the ledger's
+/// fixed-size `MinerKey`, so the existing `[u8; 32]`-keyed `Ledger`
+/// works for shared miners without a refactor (amendment 6).
+fn miner_key_for_payout_script(payout_script: &[u8]) -> MinerKey {
+    let mut hasher = Sha256::new();
+    hasher.update(payout_script);
+    hasher.finalize().into()
+}
 
 /// Per-channel vardiff config. `None` = vardiff off (use fallback target
 /// from `--share-leading-bits` for everyone, legacy behaviour).
@@ -151,6 +175,23 @@ struct Args {
     /// Print the pool's static public key (hex) and exit.
     #[arg(long)]
     print_pubkey: bool,
+
+    /// PPLNS operator fee in basis points (200 = 2%).
+    #[arg(long, default_value_t = 200)]
+    shared_fee_bps: u32,
+
+    /// Max contributor outputs per shared block (fee output excluded).
+    #[arg(long, default_value_t = 20)]
+    shared_max_outputs: usize,
+
+    /// Minimum contributor output value in una; smaller slices carry
+    /// forward (stay credited in the window, just not paid this block).
+    #[arg(long, default_value_t = 10_000)]
+    shared_dust_una: u64,
+
+    /// PPLNS window journal path.
+    #[arg(long, default_value = "/var/lib/dinero-sv2/pplns-journal.jsonl")]
+    pplns_journal: PathBuf,
 }
 
 #[tokio::main]
@@ -221,7 +262,19 @@ async fn main() -> Result<()> {
     // future SetTarget routing can disambiguate miners on the wire.
     let next_channel_id = Arc::new(AtomicU32::new(2));
 
-    let (tx, rx) = watch::channel::<Option<PoolTemplate>>(None);
+    // PPLNS shared-mode state: a rolling window of recent share credits
+    // (14_400s target span) restored from the on-disk journal, plus the
+    // journal itself for ongoing appends. Losing the journal only costs
+    // unpaid share *credit* — never funds (see journal.rs).
+    let window = Arc::new(Mutex::new(PplnsWindow::restore(
+        WindowJournal::load(&args.pplns_journal)?,
+        14_400,
+    )));
+    let journal = Arc::new(Mutex::new(
+        WindowJournal::open(&args.pplns_journal).context("opening PPLNS journal")?,
+    ));
+
+    let (tx, rx) = watch::channel::<Option<Arc<TemplateBundle>>>(None);
 
     // Template producer task.
     {
@@ -233,6 +286,12 @@ async fn main() -> Result<()> {
         } else {
             Some(Duration::from_secs(args.refresh_same_tip_secs))
         };
+        // Renamed (not `window`) to avoid shadowing the `refresh_same_tip`
+        // match arm's `window: Duration` binding a few lines below.
+        let pplns_window = window.clone();
+        let shared_fee_bps = args.shared_fee_bps;
+        let shared_max_outputs = args.shared_max_outputs;
+        let shared_dust_una = args.shared_dust_una;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(poll);
             let mut last_tip: Option<String> = None;
@@ -347,7 +406,50 @@ async fn main() -> Result<()> {
                     utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
                     "new template"
                 );
-                let _ = tx.send(Some(pt.clone()));
+                // Build the shared-mode variant on top of the same
+                // template. Fee script is derived from the daemon's own
+                // coinbase (the pool's --payout-address output) rather
+                // than a new flag — cached per template since the
+                // coinbase changes every refresh. Any failure here (no
+                // non-OP_RETURN output found, or the split builder
+                // erroring) just leaves `shared = None`: shared miners
+                // get no new job until the next successful refresh, but
+                // solo mining and the pool itself are unaffected.
+                let shared = match mapper::extract_fee_script(&pt.coinbase_full_hex) {
+                    Ok(fee_script) => {
+                        let split_outputs = {
+                            let w = pplns_window.lock().unwrap();
+                            let weights = w.weights();
+                            let params = split::SplitParams {
+                                reward_una: pt.coinbase_value_una,
+                                fee_bps: shared_fee_bps,
+                                fee_script: &fee_script,
+                                max_outputs: shared_max_outputs,
+                                dust_una: shared_dust_una,
+                                // No finder yet at template time — use the
+                                // fee script so an empty-window template
+                                // still validates (sums correctly). The
+                                // finder-specific split only matters at
+                                // block-submit time, which this template
+                                // doesn't need to know about.
+                                finder_script: &fee_script,
+                            };
+                            split::merge_duplicate_outputs(split::compute_split(&weights, &params))
+                        };
+                        match shared_template::build_shared_template(&pt, split_outputs) {
+                            Ok(st) => Some(Arc::new(st)),
+                            Err(e) => {
+                                warn!(error = %e, "build_shared_template failed — shared miners get no job this refresh");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "extract_fee_script failed — shared miners get no job this refresh");
+                        None
+                    }
+                };
+                let _ = tx.send(Some(Arc::new(TemplateBundle { pt: pt.clone(), shared })));
                 last_tip = Some(tip);
                 last_template_at = Some(std::time::Instant::now());
                 last_nbits = Some(pt.wire.difficulty);
@@ -365,6 +467,8 @@ async fn main() -> Result<()> {
         let keys = static_keys.clone();
         let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
         let vardiff_copy = vardiff;
+        let window = window.clone();
+        let journal = journal.clone();
         tokio::spawn(async move {
             info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
@@ -385,6 +489,8 @@ async fn main() -> Result<()> {
                 rpc,
                 ledger,
                 channel_id,
+                window,
+                journal,
             )
             .await
             {
@@ -406,15 +512,18 @@ fn default_pool_key_path() -> PathBuf {
     PathBuf::from(format!("{home}/.dinero/dinero-sv2-pool.key"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_miner(
     mut session: NoiseSession<TcpStream>,
-    mut rx: watch::Receiver<Option<PoolTemplate>>,
+    mut rx: watch::Receiver<Option<Arc<TemplateBundle>>>,
     share_target_fallback: [u8; 32],
     vardiff: Option<VardiffConfig>,
     miner_key: MinerKey,
     rpc: Arc<RpcClient>,
     ledger: Arc<Ledger>,
     channel_id: u32,
+    window: Arc<Mutex<PplnsWindow>>,
+    journal: Arc<Mutex<WindowJournal>>,
 ) -> Result<()> {
     // ---- Phase A: SetupConnection ----
     let f = session
@@ -570,13 +679,19 @@ async fn serve_miner(
     );
 
     // ---- Phase C: normal operation ----
-    let mut current: Option<PoolTemplate> = None;
+    let mut current: Option<Arc<TemplateBundle>> = None;
     let mut last_sequence_number: u32 = 0;
+    // None = solo (default, backward compatible); Some(payout_script) =
+    // shared mode, set by an explicit SetRewardMode{mode:1, ...} frame.
+    let mut reward_mode: Option<Vec<u8>> = None;
 
     let initial = rx.borrow_and_update().clone();
-    if let Some(pt) = initial {
-        push_job(&mut session, channel_id, &pt).await?;
-        current = Some(pt);
+    if let Some(bundle) = initial {
+        // A brand-new connection is always solo until it explicitly
+        // opts into shared mode, so the initial push is unconditionally
+        // `push_job` — matches the pre-Task-6 behaviour exactly.
+        push_job(&mut session, channel_id, &bundle.pt).await?;
+        current = Some(bundle);
     }
 
     // Vardiff measurement: count accepted shares since the last
@@ -603,10 +718,23 @@ async fn serve_miner(
                 if changed.is_err() {
                     return Ok(());
                 }
-                let maybe_t = rx.borrow_and_update().clone();
-                if let Some(pt) = maybe_t {
-                    push_job(&mut session, channel_id, &pt).await?;
-                    current = Some(pt);
+                let maybe_bundle = rx.borrow_and_update().clone();
+                if let Some(bundle) = maybe_bundle {
+                    match &reward_mode {
+                        None => {
+                            push_job(&mut session, channel_id, &bundle.pt).await?;
+                        }
+                        Some(payout_script) => {
+                            // If the shared build failed this refresh
+                            // (logged in the producer), skip the push —
+                            // the miner keeps its last job until the
+                            // next successful refresh. Never crash.
+                            if let Some(st) = bundle.shared.as_ref() {
+                                push_shared_job(&mut session, channel_id, st, &window, payout_script).await?;
+                            }
+                        }
+                    }
+                    current = Some(bundle);
                 }
             }
 
@@ -685,26 +813,78 @@ async fn serve_miner(
                 };
                 let Frame { msg_type: mtype, payload, .. } = f;
                 match mtype {
+                    MSG_SET_REWARD_MODE => {
+                        match decode_set_reward_mode(&payload) {
+                            Ok(m) if m.mode == 1 => {
+                                // Shape check: 34-byte taproot script (0x51 0x20 …).
+                                if m.payout_script.len() == 34
+                                    && m.payout_script[0] == 0x51 && m.payout_script[1] == 0x20 {
+                                    info!(
+                                        channel_id,
+                                        payout = %hex::encode(&m.payout_script),
+                                        "miner switched to SHARED mode"
+                                    );
+                                    reward_mode = Some(m.payout_script.clone());
+                                    // Push the current shared job immediately so the
+                                    // miner doesn't idle until the next refresh.
+                                    if let Some(bundle) = current.as_ref() {
+                                        if let Some(st) = bundle.shared.as_ref() {
+                                            push_shared_job(&mut session, channel_id, st, &window, &m.payout_script).await?;
+                                        }
+                                    }
+                                } else {
+                                    send_share_error(&mut session, channel_id, 0, "bad-payout-script").await?;
+                                }
+                            }
+                            Ok(_) => { reward_mode = None; } // explicit solo
+                            Err(e) => {
+                                warn!(error = %e, "bad SetRewardMode payload");
+                                send_share_error(&mut session, channel_id, 0, "bad-payload").await?;
+                            }
+                        }
+                    }
                     MSG_SUBMIT_SHARES_STANDARD => {
-                        handle_share(
-                            &mut session,
-                            &payload,
-                            current.as_ref(),
-                            share_target,
-                            channel_id,
-                            &mut last_sequence_number,
-                            &mut accepted_in_window,
-                            miner_key,
-                            rpc.as_ref(),
-                            ledger.as_ref(),
-                        )
-                        .await?;
+                        match &reward_mode {
+                            None => {
+                                handle_share(
+                                    &mut session,
+                                    &payload,
+                                    current.as_ref().map(|b| &b.pt),
+                                    share_target,
+                                    channel_id,
+                                    &mut last_sequence_number,
+                                    &mut accepted_in_window,
+                                    miner_key,
+                                    rpc.as_ref(),
+                                    ledger.as_ref(),
+                                )
+                                .await?;
+                            }
+                            Some(payout_script) => {
+                                let payout_script = payout_script.clone();
+                                handle_shared_share(
+                                    &mut session,
+                                    &payload,
+                                    current.as_ref(),
+                                    share_target,
+                                    channel_id,
+                                    &mut last_sequence_number,
+                                    &mut accepted_in_window,
+                                    &payout_script,
+                                    rpc.as_ref(),
+                                    ledger.as_ref(),
+                                    &window,
+                                    &journal,
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     MSG_SUBMIT_SHARES_EXTENDED => {
                         handle_extended_share(
                             &mut session,
                             &payload,
-                            current.as_ref(),
+                            current.as_ref().map(|b| &b.pt),
                             share_target,
                             channel_id,
                             &mut last_sequence_number,
@@ -775,6 +955,48 @@ async fn push_job(
         template_id = pt.wire.template_id,
         utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
         "pushed SNPH + (utreexo + ctx) + job"
+    );
+    Ok(())
+}
+
+/// Shared-mode counterpart of `push_job`: the pool already owns the
+/// whole coinbase (built in the producer loop via
+/// `shared_template::build_shared_template`), so there's no
+/// `MSG_UTREEXO_STATE` / `MSG_COINBASE_CONTEXT` to send — those are
+/// JD-only, for miners that assemble their own coinbase. Followed by
+/// `MSG_WINDOW_STATUS` so the miner can see its live PPLNS standing.
+async fn push_shared_job(
+    session: &mut NoiseSession<TcpStream>,
+    channel_id: u32,
+    st: &SharedTemplate,
+    window: &Arc<Mutex<PplnsWindow>>,
+    payout_script: &[u8],
+) -> Result<()> {
+    let snph = SetNewPrevHash {
+        channel_id,
+        prev_hash: st.wire.prev_block_hash,
+        min_ntime: st.wire.timestamp,
+        nbits: st.wire.difficulty,
+    };
+    session
+        .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
+        .await?;
+    session
+        .write_frame(MSG_NEW_MINING_JOB, &encode_new_template(&st.wire))
+        .await?;
+    let (bps, shares) = {
+        let w = window.lock().expect("pplns window mutex");
+        (w.miner_bps(payout_script), w.len() as u64)
+    };
+    let ws = WindowStatus { channel_id, window_bps: bps, window_shares: shares };
+    session
+        .write_frame(MSG_WINDOW_STATUS, &encode_window_status(&ws)?)
+        .await?;
+    debug!(
+        template_id = st.wire.template_id,
+        window_bps = bps,
+        window_shares = shares,
+        "pushed shared SNPH + job + window status"
     );
     Ok(())
 }
@@ -902,6 +1124,152 @@ async fn try_submit_block(
     let block_hex =
         block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
     rpc.submit_block(&block_hex).await
+}
+
+// =====================================================================
+// Task 6: shared-mode (PPLNS) standard-share handling. Validates
+// against the pool-owned `SharedTemplate` instead of the daemon
+// template, credits the PPLNS window + journal on acceptance, and on
+// block-worthy shares submits the pool-assembled shared coinbase.
+// =====================================================================
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_shared_share(
+    session: &mut NoiseSession<TcpStream>,
+    payload: &[u8],
+    current: Option<&Arc<TemplateBundle>>,
+    share_target: [u8; 32],
+    channel_id: u32,
+    last_sequence_number: &mut u32,
+    accepted_in_window: &mut u64,
+    payout_script: &[u8],
+    rpc: &RpcClient,
+    ledger: &Ledger,
+    window: &Arc<Mutex<PplnsWindow>>,
+    journal: &Arc<Mutex<WindowJournal>>,
+) -> Result<()> {
+    let miner_key = miner_key_for_payout_script(payout_script);
+
+    let share = match decode_submit_shares(payload) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "bad shared share shape");
+            ledger.reject(miner_key);
+            send_share_error(session, channel_id, *last_sequence_number, "invalid-payload").await?;
+            return Ok(());
+        }
+    };
+    *last_sequence_number = share.sequence_number;
+
+    let Some(bundle) = current else {
+        warn!("shared share received before any template");
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, share.sequence_number, "no-template").await?;
+        return Ok(());
+    };
+    let Some(st) = bundle.shared.as_ref() else {
+        warn!("shared share received but no shared template built this refresh");
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, share.sequence_number, "no-shared-template").await?;
+        return Ok(());
+    };
+
+    let hash = HeaderAssembly::hash(&st.wire, &share);
+    let meets_share = hash_meets_target(&hash, &share_target);
+    // The shared template's nbits/difficulty is inherited verbatim from
+    // the daemon template (`build_shared_template` only replaces
+    // merkle_root/utreexo_root), so the daemon-derived block_target on
+    // `bundle.pt` still applies here.
+    let meets_block = hash_meets_target(&hash, &bundle.pt.block_target);
+
+    if !meets_share {
+        debug!(hash = %hex::encode(hash), "shared share below share-target");
+        send_share_error(session, channel_id, share.sequence_number, "under-target").await?;
+        return Ok(());
+    }
+
+    ledger.credit_share(miner_key);
+    *accepted_in_window += 1;
+
+    // Credit the PPLNS window + journal (amendment 5: SystemTime::now()
+    // is fine in the pool binary).
+    let weight = share_weight(&share_target);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    {
+        let mut w = window.lock().expect("pplns window mutex");
+        w.record(payout_script.to_vec(), weight, ts);
+    }
+    {
+        // Separate lock scope from `window` above: `journal.compact`
+        // takes its own fresh `window` lock internally, so holding the
+        // first guard across this block would deadlock (std::sync::Mutex
+        // is not reentrant).
+        let mut j = journal.lock().expect("pplns journal mutex");
+        if let Err(e) = j.append(&WindowEntry {
+            payout_script: payout_script.to_vec(),
+            weight,
+            unix_ts: ts,
+        }) {
+            warn!(error = %e, "pplns journal append failed — window credit still live in memory");
+        }
+        if j.should_compact() {
+            let w = window.lock().expect("pplns window mutex");
+            if let Err(e) = j.compact(&w) {
+                warn!(error = %e, "pplns journal compact failed");
+            }
+        }
+    }
+
+    info!(
+        hash = %hex::encode(hash),
+        template_id = st.wire.template_id,
+        nonce = share.nonce,
+        payout = %hex::encode(payout_script),
+        "accepted shared share"
+    );
+    session
+        .write_frame(
+            MSG_SUBMIT_SHARES_SUCCESS,
+            &encode_submit_shares_success(&SubmitSharesSuccess {
+                channel_id,
+                last_sequence_number: share.sequence_number,
+                new_submits_accepted_count: 1,
+                new_shares_sum: 1,
+            }),
+        )
+        .await?;
+
+    if meets_block {
+        match try_submit_block(&st.wire, &share, &st.coinbase_full_hex, &[], rpc).await {
+            Ok(SubmitBlockResult::Accepted) => {
+                info!(
+                    template_id = st.wire.template_id,
+                    hash = %hex::encode(hash),
+                    contributors = st.outputs.len(),
+                    outputs = ?st.outputs.iter()
+                        .map(|o| format!("{}:{}", hex::encode(&o.script_pubkey), o.value_una))
+                        .collect::<Vec<_>>(),
+                    "★ SHARED block ACCEPTED — split across contributors"
+                );
+                ledger.credit_block(miner_key);
+            }
+            Ok(SubmitBlockResult::Rejected(reason)) => {
+                warn!(
+                    reason,
+                    hash = %hex::encode(hash),
+                    "dinerod rejected our shared block"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "submitblock RPC failed (shared)");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // =====================================================================

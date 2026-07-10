@@ -214,6 +214,47 @@ mod tests {
     }
 
     #[test]
+    fn refresh_selection_builds_template_from_merged_window_split() {
+        // Simulates the real template-refresh path: a PPLNS window with
+        // entries for two contributors, run through compute_split, then
+        // merge_duplicate_outputs (amendment 2), then handed to
+        // build_shared_template — exactly what the pool's producer loop
+        // does on each new template.
+        use crate::accounting::PplnsWindow;
+        use crate::split::{self, SplitParams};
+
+        let pt = crate::mapper::tests::fixture_pool_template();
+        let mut window = PplnsWindow::new(14_400);
+        let a = vec![0x51, 0x20, 0xAA];
+        let b = vec![0x51, 0x20, 0xBB];
+        window.record(a.clone(), 300, 1_000);
+        window.record(b.clone(), 100, 1_001);
+
+        let weights = window.weights();
+        let fee_script = vec![0x51, 0x20, 0xFE];
+        let params = SplitParams {
+            reward_una: pt.coinbase_value_una,
+            fee_bps: 200,
+            fee_script: &fee_script,
+            max_outputs: 20,
+            dust_una: 10_000,
+            finder_script: &fee_script,
+        };
+        let merged = split::merge_duplicate_outputs(split::compute_split(&weights, &params));
+
+        let st = build_shared_template(&pt, merged.clone()).unwrap();
+
+        // The template's leading value outputs (before DNRW/DNRF) must
+        // equal the merged compute_split result exactly.
+        let value_outputs = &st.outputs[..merged.len()];
+        assert_eq!(value_outputs, merged.as_slice());
+        // Sanity: both contributors and the fee script are present.
+        assert!(merged.iter().any(|o| o.script_pubkey == a));
+        assert!(merged.iter().any(|o| o.script_pubkey == b));
+        assert!(merged.iter().any(|o| o.script_pubkey == fee_script));
+    }
+
+    #[test]
     fn rejects_split_sum_mismatching_coinbase_value() {
         let pt = crate::mapper::tests::fixture_pool_template();
         let outputs = vec![CoinbaseOutput {

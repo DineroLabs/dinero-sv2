@@ -77,6 +77,27 @@ pub fn compute_split(weights: &HashMap<Vec<u8>, u128>, p: &SplitParams) -> Vec<C
     outs
 }
 
+/// Merge outputs that share the same `script_pubkey`, summing their
+/// values and keeping first-occurrence order. `compute_split` never
+/// guarantees distinct scripts across its outputs — most notably at
+/// template-refresh time, where the caller passes `finder_script ==
+/// fee_script` (no finder is known yet) and an empty/all-dusted window
+/// makes both the "finder takes the pot" output and the fee output land
+/// on the identical script. Coinbase serialization forbids duplicate-
+/// script outputs from being treated as independent by callers that key
+/// off script identity (e.g. `PplnsWindow::miner_bps`), so callers must
+/// merge before handing the list to `build_shared_template`.
+pub fn merge_duplicate_outputs(outputs: Vec<CoinbaseOutput>) -> Vec<CoinbaseOutput> {
+    let mut merged: Vec<CoinbaseOutput> = Vec::with_capacity(outputs.len());
+    for o in outputs {
+        match merged.iter_mut().find(|e| e.script_pubkey == o.script_pubkey) {
+            Some(existing) => existing.value_una += o.value_una,
+            None => merged.push(o),
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +281,60 @@ mod tests {
         assert_eq!(outs.len(), 1);
         assert_eq!(outs[0].script_pubkey, s(1));
         assert_eq!(outs[0].value_una, 1_000);
+    }
+
+    #[test]
+    fn merge_duplicate_outputs_sums_values_keeps_first_occurrence_order() {
+        // Empty-window template-time shape: finder_script == fee_script,
+        // so compute_split emits two outputs with the identical script
+        // (finder's pot share + the fee slice) that must collapse into
+        // one before build_shared_template sees them.
+        let outs = vec![
+            CoinbaseOutput { value_una: 9_800_000_000, script_pubkey: s(9) },
+            CoinbaseOutput { value_una: 200_000_000, script_pubkey: s(9) },
+        ];
+        let merged = merge_duplicate_outputs(outs);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].script_pubkey, s(9));
+        assert_eq!(merged[0].value_una, 10_000_000_000);
+    }
+
+    #[test]
+    fn merge_duplicate_outputs_preserves_order_and_non_dupes() {
+        let outs = vec![
+            CoinbaseOutput { value_una: 100, script_pubkey: s(1) },
+            CoinbaseOutput { value_una: 50, script_pubkey: s(2) },
+            CoinbaseOutput { value_una: 25, script_pubkey: s(1) },
+        ];
+        let merged = merge_duplicate_outputs(outs);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].script_pubkey, s(1));
+        assert_eq!(merged[0].value_una, 125);
+        assert_eq!(merged[1].script_pubkey, s(2));
+        assert_eq!(merged[1].value_una, 50);
+    }
+
+    #[test]
+    fn empty_window_split_output_merges_to_single_output_via_compute_split() {
+        // Exercises the real amendment-2 scenario end to end: at
+        // template time there's no finder yet, so finder_script is set
+        // to fee_script. With an empty window, compute_split's "finder
+        // takes the pot" fallback and its separate fee slice land on
+        // the SAME script and must merge to one output.
+        let w: HashMap<Vec<u8>, u128> = HashMap::new();
+        let p = SplitParams {
+            reward_una: 10_000_000_000,
+            fee_bps: 200,
+            fee_script: &s(9),
+            max_outputs: 20,
+            dust_una: 10_000,
+            finder_script: &s(9),
+        };
+        let outs = compute_split(&w, &p);
+        assert_eq!(outs.len(), 2, "compute_split emits two same-script outputs pre-merge");
+        let merged = merge_duplicate_outputs(outs);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].script_pubkey, s(9));
+        assert_eq!(merged[0].value_una, 10_000_000_000);
     }
 }
