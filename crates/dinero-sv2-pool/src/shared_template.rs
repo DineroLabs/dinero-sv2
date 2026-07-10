@@ -11,7 +11,7 @@ use dinero_sv2_jd::{
     filter_commitment::{build_dnrf_script, requires_filter_commitment},
     leaf_hash_for_height,
     witness_commitment::{build_dnrw_script_coinbase_only, requires_witness_commitment},
-    CoinbaseOutput, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+    CoinbaseOutput,
 };
 
 use crate::block::wrap_stripped_with_segwit_witness;
@@ -45,9 +45,21 @@ pub struct SharedTemplate {
 /// `compute_split` no longer guarantees a fee output or forbids
 /// zero-value entries from being absent, so the only invariant this
 /// function enforces on the caller's list is the value sum.
+///
+/// `utreexo_maturity_leaf_height` is the network's Utreexo
+/// maturity-leaf hard-fork activation height (dinerod's
+/// `UTREEXO_MATURITY_LEAF_HEIGHT_{MAINNET,TESTNET,REGTEST}` —
+/// mainnet=60_000, testnet=0, regtest=20). Callers MUST pass the value
+/// matching the daemon they're actually submitting to: hashing coinbase
+/// leaves with the wrong activation height produces a `utreexo_root`
+/// the daemon's `ConnectTip`/`AcceptBlockFromRPC` recomputation won't
+/// match, and `submitblock` rejects with `bad-utreexo-root` (see
+/// `tests/leaf_v2_probe.rs` for the mainnet incident this class of bug
+/// caused).
 pub fn build_shared_template(
     pt: &PoolTemplate,
     split_outputs: Vec<CoinbaseOutput>,
+    utreexo_maturity_leaf_height: u32,
 ) -> Result<SharedTemplate> {
     let value_sum: u64 = split_outputs.iter().map(|o| o.value_una).sum();
     if value_sum != pt.coinbase_value_una {
@@ -126,7 +138,7 @@ pub fn build_shared_template(
                 &o.script_pubkey,
                 pt.height,
                 true,
-                UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+                utreexo_maturity_leaf_height,
             ))
             .context("shared template add_leaf")?;
     }
@@ -157,6 +169,7 @@ pub fn build_shared_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dinero_sv2_jd::UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET;
 
     #[test]
     fn shared_template_coinbase_and_roots_are_consistent() {
@@ -176,7 +189,7 @@ mod tests {
                 script_pubkey: vec![0x51, 0x20, 0x09],
             },
         ];
-        let st = build_shared_template(&pt, outputs.clone()).unwrap();
+        let st = build_shared_template(&pt, outputs.clone(), UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
 
         // Value invariant:
         let cb = hex::decode(&st.coinbase_full_hex).unwrap();
@@ -242,7 +255,7 @@ mod tests {
         };
         let merged = split::merge_duplicate_outputs(split::compute_split(&weights, &params));
 
-        let st = build_shared_template(&pt, merged.clone()).unwrap();
+        let st = build_shared_template(&pt, merged.clone(), UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
 
         // The template's leading value outputs (before DNRW/DNRF) must
         // equal the merged compute_split result exactly.
@@ -261,7 +274,7 @@ mod tests {
             value_una: pt.coinbase_value_una - 1,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs).unwrap_err();
+        let err = build_shared_template(&pt, outputs, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
         assert!(err.to_string().contains("split sum"));
     }
 
@@ -273,7 +286,7 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs).unwrap_err();
+        let err = build_shared_template(&pt, outputs, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
         assert!(err.to_string().contains("utreexo pre-block"));
     }
 
@@ -292,7 +305,7 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs).unwrap_err();
+        let err = build_shared_template(&pt, outputs, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
         assert!(err.to_string().contains("coinbase-only"));
     }
 
@@ -314,7 +327,7 @@ mod tests {
                 script_pubkey: vec![0x51, 0x20, 0x09],
             },
         ];
-        let st = build_shared_template(&pt, outputs.clone()).unwrap();
+        let st = build_shared_template(&pt, outputs.clone(), UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
 
         // Should have 2 value outputs + DNRF only (no DNRW).
         assert_eq!(st.outputs.len(), 3);

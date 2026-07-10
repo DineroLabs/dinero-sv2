@@ -192,6 +192,18 @@ struct Args {
     /// PPLNS window journal path.
     #[arg(long, default_value = "/var/lib/dinero-sv2/pplns-journal.jsonl")]
     pplns_journal: PathBuf,
+
+    /// Utreexo maturity-leaf hard-fork activation height for the
+    /// network this pool's dinerod is running. Coinbase leaves created
+    /// at/above this height hash with the v2 (maturity-bound) preimage;
+    /// below it, v1. Mirrors dinerod's
+    /// `UTREEXO_MATURITY_LEAF_HEIGHT_{MAINNET,TESTNET,REGTEST}`
+    /// (mainnet=60_000 [default], testnet=0, regtest=20). Getting this
+    /// wrong makes every pool-recomputed `utreexo_root` past the real
+    /// activation height diverge from the daemon's, and `submitblock`
+    /// rejects with `bad-utreexo-root`.
+    #[arg(long, default_value_t = UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)]
+    utreexo_maturity_leaf_height: u32,
 }
 
 #[tokio::main]
@@ -292,6 +304,7 @@ async fn main() -> Result<()> {
         let shared_fee_bps = args.shared_fee_bps;
         let shared_max_outputs = args.shared_max_outputs;
         let shared_dust_una = args.shared_dust_una;
+        let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(poll);
             let mut last_tip: Option<String> = None;
@@ -357,7 +370,15 @@ async fn main() -> Result<()> {
                 // only template (the pool stays alive).
                 if !pt.mempool_txs.is_empty() {
                     if let Some(pre_block) = pt.utreexo_pre_block.as_ref().cloned() {
-                        match apply_mempool_to_pre_coinbase(&rpc, &pre_block, &pt.mempool_txs, pt.height).await {
+                        match apply_mempool_to_pre_coinbase(
+                            &rpc,
+                            &pre_block,
+                            &pt.mempool_txs,
+                            pt.height,
+                            utreexo_maturity_leaf_height,
+                        )
+                        .await
+                        {
                             Ok(post) => {
                                 debug!(
                                     pre_leaves = pre_block.num_leaves,
@@ -389,10 +410,24 @@ async fn main() -> Result<()> {
                     }
                 }
                 let nbits_changed = last_nbits != Some(pt.wire.difficulty);
-                if !tip_changed && !nbits_changed {
-                    // Same tip, same nbits — daemon hasn't drifted yet. Skip
-                    // pushing a new job to avoid spamming miners with
-                    // identical NewMiningJob frames.
+                if !tip_changed && !nbits_changed && !stale_same_tip {
+                    // Same tip, same nbits, and the staleness timer hasn't
+                    // elapsed either — nothing material changed and no
+                    // scheduled refresh is due. Skip pushing a new job to
+                    // avoid spamming miners with identical NewMiningJob
+                    // frames.
+                    //
+                    // Deliberately NOT skipping when `stale_same_tip` is
+                    // what got us here (tip/nbits unchanged, but
+                    // `--refresh-same-tip-secs` elapsed): that's the ONLY
+                    // scheduled point where a live PPLNS window snapshot
+                    // (weights change on every accepted shared share, with
+                    // no tip/nbits signal at all) gets baked into a fresh
+                    // `shared` coinbase below. Skipping unconditionally
+                    // here would freeze shared-mode payouts at whatever
+                    // weights existed at the last tip change, since a
+                    // solo-only `!tip_changed && !nbits_changed` gate has
+                    // no way to know shared mode even exists.
                     last_template_at = Some(std::time::Instant::now());
                     continue;
                 }
@@ -442,7 +477,11 @@ async fn main() -> Result<()> {
                         };
                         let split_outputs =
                             split::merge_duplicate_outputs(split::compute_split(&weights, &params));
-                        match shared_template::build_shared_template(&pt, split_outputs) {
+                        match shared_template::build_shared_template(
+                            &pt,
+                            split_outputs,
+                            utreexo_maturity_leaf_height,
+                        ) {
                             Ok(st) => Some(Arc::new(st)),
                             Err(e) => {
                                 warn!(error = %e, "build_shared_template failed — shared miners get no job this refresh");
@@ -475,6 +514,7 @@ async fn main() -> Result<()> {
         let vardiff_copy = vardiff;
         let window = window.clone();
         let journal = journal.clone();
+        let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         tokio::spawn(async move {
             info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
@@ -497,6 +537,7 @@ async fn main() -> Result<()> {
                 channel_id,
                 window,
                 journal,
+                utreexo_maturity_leaf_height,
             )
             .await
             {
@@ -530,6 +571,7 @@ async fn serve_miner(
     channel_id: u32,
     window: Arc<Mutex<PplnsWindow>>,
     journal: Arc<Mutex<WindowJournal>>,
+    utreexo_maturity_leaf_height: u32,
 ) -> Result<()> {
     // ---- Phase A: SetupConnection ----
     let f = session
@@ -898,6 +940,7 @@ async fn serve_miner(
                             miner_key,
                             rpc.as_ref(),
                             ledger.as_ref(),
+                            utreexo_maturity_leaf_height,
                         )
                         .await?;
                     }
@@ -1302,6 +1345,7 @@ async fn handle_extended_share(
     miner_key: MinerKey,
     rpc: &RpcClient,
     ledger: &Ledger,
+    utreexo_maturity_leaf_height: u32,
 ) -> Result<()> {
     let ext = match decode_submit_shares_extended(payload) {
         Ok(s) => s,
@@ -1430,7 +1474,7 @@ async fn handle_extended_share(
             &out.script_pubkey,
             pt.height,
             true,
-            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+            utreexo_maturity_leaf_height,
         );
         if let Err(e) = post_state.add_leaf(leaf) {
             warn!(error = %e, "utreexo add_leaf failed");
@@ -1591,6 +1635,7 @@ async fn apply_mempool_to_pre_coinbase(
     pre_block: &dinero_sv2_jd::UtreexoAccumulatorState,
     mempool_txs: &[mapper::MempoolTx],
     block_height: u32,
+    utreexo_maturity_leaf_height: u32,
 ) -> Result<dinero_sv2_jd::UtreexoAccumulatorState> {
     use dinero_sv2_jd::DeletionTarget;
 
@@ -1694,7 +1739,7 @@ async fn apply_mempool_to_pre_coinbase(
                 spk,
                 block_height,
                 false,
-                UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+                utreexo_maturity_leaf_height,
             );
             state.add_leaf(leaf).context("utreexo add_leaf")?;
         }
