@@ -70,6 +70,14 @@ pub const MSG_UTREEXO_STATE: u8 = 0x21;
 /// miner's actual hashrate (~1 share / 5 s).
 pub const MSG_SET_TARGET: u8 = 0x22;
 
+/// Miner → pool (Dinero extension): declare reward mode for this
+/// channel. mode 0 = solo (default when never sent), 1 = shared.
+/// Carries the payout script the PPLNS ledger credits.
+pub const MSG_SET_REWARD_MODE: u8 = 0x23;
+/// Pool → miner (Dinero extension): the miner's current PPLNS window
+/// standing, for UI display.
+pub const MSG_WINDOW_STATUS: u8 = 0x24;
+
 /// Mining (Dinero extension): `CoinbaseContext` — coinbase prefix +
 /// suffix + merkle path + height + value. Sent between
 /// [`MSG_UTREEXO_STATE`] and [`MSG_NEW_MINING_JOB`] on JD-capable

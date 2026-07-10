@@ -9,9 +9,9 @@
 
 use dinero_sv2_common::{
     CoinbaseContext, CoinbaseOutputWire, OpenStandardMiningChannel, OpenStandardMiningChannelError,
-    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SetupConnection,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetRewardMode, SetTarget, SetupConnection,
     SetupConnectionError, SetupConnectionSuccess, SubmitSharesError, SubmitSharesExtendedDinero,
-    SubmitSharesSuccess,
+    SubmitSharesSuccess, WindowStatus,
 };
 
 /// Variable-field caps (Phase 5).
@@ -520,6 +520,78 @@ pub fn decode_submit_shares_error(buf: &[u8]) -> Result<SubmitSharesError, Sv2Co
     })
 }
 
+// ------------------------------ SetRewardMode / WindowStatus (Dinero extensions) ------------------------------
+
+/// Encode a [`SetRewardMode`] message.
+pub fn encode_set_reward_mode(msg: &SetRewardMode) -> Result<Vec<u8>, Sv2CodecError> {
+    let mut buf = Vec::with_capacity(4 + 1 + 2 + msg.payout_script.len());
+    buf.extend_from_slice(&msg.channel_id.to_le_bytes());
+    buf.push(msg.mode);
+    let len = u16::try_from(msg.payout_script.len())
+        .map_err(|_| Sv2CodecError::TooLarge {
+            field: "payout_script",
+            got: msg.payout_script.len(),
+            cap: u16::MAX as usize,
+        })?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&msg.payout_script);
+    Ok(buf)
+}
+
+/// Decode a [`SetRewardMode`] message.
+pub fn decode_set_reward_mode(buf: &[u8]) -> Result<SetRewardMode, Sv2CodecError> {
+    if buf.len() < 7 {
+        return Err(Sv2CodecError::Short {
+            at: 0,
+            need: 7 - buf.len(),
+        });
+    }
+    let channel_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let mode = buf[4];
+    let len = u16::from_le_bytes(buf[5..7].try_into().unwrap()) as usize;
+    if buf.len() != 7 + len {
+        return Err(Sv2CodecError::Short {
+            at: 7,
+            need: (7 + len).saturating_sub(buf.len()),
+        });
+    }
+    Ok(SetRewardMode {
+        channel_id,
+        mode,
+        payout_script: buf[7..7 + len].to_vec(),
+    })
+}
+
+/// Encode a [`WindowStatus`] message.
+pub fn encode_window_status(msg: &WindowStatus) -> Result<Vec<u8>, Sv2CodecError> {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(&msg.channel_id.to_le_bytes());
+    buf.extend_from_slice(&msg.window_bps.to_le_bytes());
+    buf.extend_from_slice(&msg.window_shares.to_le_bytes());
+    Ok(buf)
+}
+
+/// Decode a [`WindowStatus`] message.
+pub fn decode_window_status(buf: &[u8]) -> Result<WindowStatus, Sv2CodecError> {
+    if buf.len() != 16 {
+        if buf.len() < 16 {
+            return Err(Sv2CodecError::Short {
+                at: 0,
+                need: 16 - buf.len(),
+            });
+        } else {
+            return Err(Sv2CodecError::Trailing {
+                extra: buf.len() - 16,
+            });
+        }
+    }
+    Ok(WindowStatus {
+        channel_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        window_bps: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        window_shares: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+    })
+}
+
 // ------------------------------ helpers ------------------------------
 
 fn write_str0_255(buf: &mut Vec<u8>, s: &[u8]) -> Result<(), Sv2CodecError> {
@@ -847,6 +919,31 @@ mod tests {
         };
         let bytes = encode_submit_shares_error(&m).unwrap();
         assert_eq!(m, decode_submit_shares_error(&bytes).unwrap());
+    }
+
+    #[test]
+    fn set_reward_mode_roundtrip() {
+        let msg = SetRewardMode {
+            channel_id: 7,
+            mode: 1,
+            payout_script: vec![0x51, 0x20, 0xAB],
+        };
+        let buf = encode_set_reward_mode(&msg).unwrap();
+        assert_eq!(decode_set_reward_mode(&buf).unwrap(), msg);
+    }
+
+    #[test]
+    fn set_reward_mode_rejects_truncated() {
+        let msg = SetRewardMode { channel_id: 1, mode: 0, payout_script: vec![0x51] };
+        let buf = encode_set_reward_mode(&msg).unwrap();
+        assert!(decode_set_reward_mode(&buf[..buf.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn window_status_roundtrip() {
+        let msg = WindowStatus { channel_id: 9, window_bps: 314, window_shares: 4096 };
+        let buf = encode_window_status(&msg).unwrap();
+        assert_eq!(decode_window_status(&buf).unwrap(), msg);
     }
 
     proptest! {
