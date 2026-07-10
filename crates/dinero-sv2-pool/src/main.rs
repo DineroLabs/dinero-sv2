@@ -76,6 +76,13 @@ use crate::target::{hash_meets_target, leading_zero_bits_target, target_for_hash
 struct TemplateBundle {
     pt: PoolTemplate,
     shared: Option<Arc<SharedTemplate>>,
+    /// Whether the *solo* template materially changed this refresh
+    /// (new tip or new nbits). `false` on a bundle republished solely
+    /// because `--refresh-same-tip-secs` elapsed (a `stale_same_tip`
+    /// tick) — those exist to keep the SHARED template's PPLNS weights
+    /// and curtime fresh, not to reissue identical solo work. See the
+    /// producer loop and `serve_miner`'s `rx.changed` arm.
+    solo_changed: bool,
 }
 
 /// Hash a shared-mode miner's payout script into the ledger's
@@ -410,27 +417,25 @@ async fn main() -> Result<()> {
                     }
                 }
                 let nbits_changed = last_nbits != Some(pt.wire.difficulty);
-                if !tip_changed && !nbits_changed && !stale_same_tip {
-                    // Same tip, same nbits, and the staleness timer hasn't
-                    // elapsed either — nothing material changed and no
-                    // scheduled refresh is due. Skip pushing a new job to
-                    // avoid spamming miners with identical NewMiningJob
-                    // frames.
-                    //
-                    // Deliberately NOT skipping when `stale_same_tip` is
-                    // what got us here (tip/nbits unchanged, but
-                    // `--refresh-same-tip-secs` elapsed): that's the ONLY
-                    // scheduled point where a live PPLNS window snapshot
-                    // (weights change on every accepted shared share, with
-                    // no tip/nbits signal at all) gets baked into a fresh
-                    // `shared` coinbase below. Skipping unconditionally
-                    // here would freeze shared-mode payouts at whatever
-                    // weights existed at the last tip change, since a
-                    // solo-only `!tip_changed && !nbits_changed` gate has
-                    // no way to know shared mode even exists.
-                    last_template_at = Some(std::time::Instant::now());
-                    continue;
-                }
+                // Whether SOLO miners need a fresh push_job: only on an
+                // actual tip or nbits change — matches pre-Task-7
+                // behaviour exactly. Deliberately NOT set on
+                // `stale_same_tip` alone: reaching this point already
+                // implies `tip_changed || stale_same_tip` (see the gate
+                // above), so a bundle is always built and published from
+                // here on. That's required because `stale_same_tip` is
+                // the ONLY scheduled point where a live PPLNS window
+                // snapshot (weights change on every accepted shared
+                // share, with no tip/nbits signal at all) gets baked
+                // into a fresh `shared` coinbase below — freezing that
+                // would stall shared-mode payouts. But solo miners have
+                // no reason to be re-pushed an identical job on that
+                // tick (spurious SetNewPrevHash + "new tip" UI churn on
+                // idle chains), so `solo_changed` lets `serve_miner`
+                // skip the solo push (and skip rebasing `current` onto
+                // this bundle) while still refreshing shared jobs every
+                // window.
+                let solo_changed = tip_changed || nbits_changed;
                 info!(
                     template_id = pt.wire.template_id,
                     tip = %tip,
@@ -494,7 +499,11 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
-                let _ = tx.send(Some(Arc::new(TemplateBundle { pt: pt.clone(), shared })));
+                let _ = tx.send(Some(Arc::new(TemplateBundle {
+                    pt: pt.clone(),
+                    shared,
+                    solo_changed,
+                })));
                 last_tip = Some(tip);
                 last_template_at = Some(std::time::Instant::now());
                 last_nbits = Some(pt.wire.difficulty);
@@ -770,7 +779,20 @@ async fn serve_miner(
                 if let Some(bundle) = maybe_bundle {
                     match &reward_mode {
                         None => {
-                            push_job(&mut session, channel_id, &bundle.pt).await?;
+                            // Skip both the push AND the `current` swap
+                            // when the solo template didn't materially
+                            // change this refresh (a `stale_same_tip`
+                            // tick that only exists to refresh SHARED
+                            // weights — see `TemplateBundle::solo_changed`).
+                            // Rebasing `current` here without pushing a
+                            // job would desync share validation from
+                            // what the miner is actually hashing (still
+                            // the old merkle_root/mempool set), silently
+                            // failing valid — even block-worthy — shares.
+                            if bundle.solo_changed {
+                                push_job(&mut session, channel_id, &bundle.pt).await?;
+                                current = Some(bundle);
+                            }
                         }
                         Some(payout_script) => {
                             // If the shared build failed this refresh
@@ -780,9 +802,9 @@ async fn serve_miner(
                             if let Some(st) = bundle.shared.as_ref() {
                                 push_shared_job(&mut session, channel_id, st, &window, payout_script).await?;
                             }
+                            current = Some(bundle);
                         }
                     }
-                    current = Some(bundle);
                 }
             }
 

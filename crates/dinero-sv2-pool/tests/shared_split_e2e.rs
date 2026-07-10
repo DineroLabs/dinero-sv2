@@ -873,6 +873,23 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
          (A={value_a} una, B={value_b} una)"
     );
 
+    // Stronger than "strictly more": A:B share counts are SHARES_A:
+    // SHARES_B == 3:1, and every accepted share carries identical
+    // weight here (see the module doc comment), so the split should
+    // land A at ~3x B, not just "some amount more". Integer math means
+    // compute_split's remainder-handling can fold a few una into the
+    // fee/finder output (see its doc comment above), so allow a 1%
+    // band around the ideal 3:1 ratio rather than requiring an exact
+    // match.
+    let expected_a = 3 * value_b;
+    let tolerance = expected_a / 100;
+    let diff = value_a.abs_diff(expected_a);
+    assert!(
+        diff <= tolerance,
+        "miner A's payout should be ~3x miner B's (share ratio {SHARES_A}:{SHARES_B}); \
+         A={value_a} una, B={value_b} una, expected≈{expected_a} una (±{tolerance} una / 1%)"
+    );
+
     // Fee output: 200 bps of the block reward, plus a small (< a few
     // una) rounding remainder the split absorbs into the fee slice —
     // see split::compute_split's remainder-handling doc comment.
