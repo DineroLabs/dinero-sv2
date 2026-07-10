@@ -10,5 +10,6 @@ pub mod block;
 pub mod journal;
 pub mod mapper;
 pub mod rpc;
+pub mod shared_template;
 pub mod split;
 pub mod target;

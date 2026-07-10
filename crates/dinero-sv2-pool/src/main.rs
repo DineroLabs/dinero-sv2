@@ -1128,7 +1128,7 @@ async fn handle_extended_share(
         //   stripped-coinbase bytes with segwit marker+flag inserted
         //   after version, and the pool-retained witness bytes inserted
         //   before the locktime. Then the mempool tx bytes follow.
-        let full_coinbase = wrap_stripped_with_segwit_witness(
+        let full_coinbase = block::wrap_stripped_with_segwit_witness(
             &coinbase_stripped,
             &pt.coinbase_witness_bytes,
             &pt.coinbase_suffix,
@@ -1171,34 +1171,6 @@ async fn send_share_error(
         .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
         .await?;
     Ok(())
-}
-
-/// Wrap a stripped (non-segwit) coinbase with the retained segwit
-/// marker/flag + witness bytes so the result is the broadcast form
-/// dinerod expects in `submitblock`.
-///
-/// Inputs:
-/// - `stripped`: version || vin || vout || locktime
-/// - `witness_bytes`: the per-input witness stacks exactly as the
-///   daemon emitted them for the original template
-/// - `suffix`: just the 4-byte locktime (must match `stripped`'s tail)
-fn wrap_stripped_with_segwit_witness(
-    stripped: &[u8],
-    witness_bytes: &[u8],
-    suffix: &[u8],
-) -> Vec<u8> {
-    // stripped = version(4) || vin+vout || locktime(4)
-    // broadcast = version(4) || 00 01 || vin+vout || witness || locktime(4)
-    let locktime_len = suffix.len(); // typically 4
-    assert!(stripped.len() >= 4 + locktime_len);
-    let mid_end = stripped.len() - locktime_len;
-    let mut out = Vec::with_capacity(stripped.len() + 2 + witness_bytes.len());
-    out.extend_from_slice(&stripped[..4]); // version
-    out.extend_from_slice(&[0x00, 0x01]); // segwit marker + flag
-    out.extend_from_slice(&stripped[4..mid_end]); // vin + vout
-    out.extend_from_slice(witness_bytes); // witness stacks
-    out.extend_from_slice(&stripped[mid_end..]); // locktime
-    out
 }
 
 /// Count leading zero bits in a 32-byte big-endian target. Used to

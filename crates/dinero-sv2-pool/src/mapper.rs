@@ -483,9 +483,24 @@ fn hex_reverse_32(s: &str) -> Result<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Build a [`PoolTemplate`] the way `shared_template`'s tests need
+    /// it: real `coinbase_prefix`/`coinbase_suffix`/`coinbase_value_una`
+    /// from the fixture JSON, plus a populated `utreexo_pre_block` (the
+    /// plain `fixture()` JSON has no `getutreexoroots` equivalent, so
+    /// `map_template` always leaves that field `None`).
+    pub(crate) fn fixture_pool_template() -> PoolTemplate {
+        let mut pt = map_template(&fixture(), 42).unwrap();
+        let mut state = UtreexoAccumulatorState::empty();
+        for i in 0..4u8 {
+            state.add_leaf([i; 32]).unwrap();
+        }
+        pt.utreexo_pre_block = Some(state);
+        pt
+    }
 
     fn fixture() -> Value {
         json!({
