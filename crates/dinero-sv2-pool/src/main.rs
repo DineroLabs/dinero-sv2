@@ -120,7 +120,12 @@ struct Args {
     /// hashrate (miner reports 0 in OpenStandardMiningChannel and never
     /// produces a share). With vardiff active, each channel's effective
     /// target is sized off the miner's reported / observed hashrate.
-    #[arg(long, default_value_t = 8)]
+    ///
+    /// Capped at 96: `accounting::share_weight` only distinguishes
+    /// difficulty for targets `>= 2^128` (fewer than 128 leading zero
+    /// bits); staying at or below 96 keeps a wide safety margin so
+    /// share weights never collapse into `u128::MAX` saturation.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(0..=96))]
     share_leading_bits: u32,
 
     /// Vardiff target: aim for ~1 accepted share per N seconds per
