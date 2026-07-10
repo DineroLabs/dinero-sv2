@@ -26,7 +26,8 @@ use dinero_sv2_jd::{
     block_filter::{gcs_build, gcs_filter_hash},
     commitment as utreexo_commitment, compute_root, decode_utreexo_accumulator_state,
     filter_commitment::{build_dnrf_script, requires_filter_commitment},
-    leaf_hash, CoinbaseOutput, UtreexoAccumulatorState,
+    leaf_hash_for_height, CoinbaseOutput, UtreexoAccumulatorState,
+    UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
 };
 use dinero_sv2_transport::{
     Frame, NoiseReader, NoiseSession, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
@@ -543,7 +544,15 @@ fn start_hashing(
         assemble_stripped_coinbase(&ctx.coinbase_prefix, &miner_outputs, &ctx.coinbase_suffix);
     let mut post_state = pre_block_state.clone();
     for (i, out) in miner_outputs.iter().enumerate() {
-        let leaf = leaf_hash(&coinbase_txid, i as u32, out.value_una, &out.script_pubkey);
+        let leaf = leaf_hash_for_height(
+            &coinbase_txid,
+            i as u32,
+            out.value_una,
+            &out.script_pubkey,
+            ctx.height,
+            true,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        );
         if let Err(err) = post_state.add_leaf(leaf) {
             tracing::error!("post-state add_leaf failed: {err}");
             return;

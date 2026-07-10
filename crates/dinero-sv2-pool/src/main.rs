@@ -39,7 +39,7 @@ use dinero_sv2_jd::{
     assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
     encode_utreexo_accumulator_state,
     filter_commitment::{is_dnrf_script, requires_filter_commitment},
-    leaf_hash, CoinbaseOutput,
+    leaf_hash_for_height, CoinbaseOutput, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
 };
 use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
@@ -288,7 +288,7 @@ async fn main() -> Result<()> {
                 // only template (the pool stays alive).
                 if !pt.mempool_txs.is_empty() {
                     if let Some(pre_block) = pt.utreexo_pre_block.as_ref().cloned() {
-                        match apply_mempool_to_pre_coinbase(&rpc, &pre_block, &pt.mempool_txs).await {
+                        match apply_mempool_to_pre_coinbase(&rpc, &pre_block, &pt.mempool_txs, pt.height).await {
                             Ok(post) => {
                                 debug!(
                                     pre_leaves = pre_block.num_leaves,
@@ -995,7 +995,15 @@ async fn handle_extended_share(
     // 3. Compute Utreexo leaf hashes for each output and apply.
     let mut post_state = pre_block_state.clone();
     for (i, out) in miner_outputs.iter().enumerate() {
-        let leaf = leaf_hash(&coinbase_txid, i as u32, out.value_una, &out.script_pubkey);
+        let leaf = leaf_hash_for_height(
+            &coinbase_txid,
+            i as u32,
+            out.value_una,
+            &out.script_pubkey,
+            pt.height,
+            true,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        );
         if let Err(e) = post_state.add_leaf(leaf) {
             warn!(error = %e, "utreexo add_leaf failed");
             ledger.reject(miner_key);
@@ -1182,8 +1190,9 @@ async fn apply_mempool_to_pre_coinbase(
     rpc: &rpc::RpcClient,
     pre_block: &dinero_sv2_jd::UtreexoAccumulatorState,
     mempool_txs: &[mapper::MempoolTx],
+    block_height: u32,
 ) -> Result<dinero_sv2_jd::UtreexoAccumulatorState> {
-    use dinero_sv2_jd::{leaf_hash, DeletionTarget};
+    use dinero_sv2_jd::DeletionTarget;
 
     // Collect all inputs across all mempool txs. Daemon RPC takes
     // display-order txid hex.
@@ -1278,7 +1287,15 @@ async fn apply_mempool_to_pre_coinbase(
         .context("utreexo apply_deletions")?;
     for tx in mempool_txs {
         for (vout, (value_una, spk)) in tx.outputs.iter().enumerate() {
-            let leaf = leaf_hash(&tx.txid_raw, vout as u32, *value_una, spk);
+            let leaf = leaf_hash_for_height(
+                &tx.txid_raw,
+                vout as u32,
+                *value_una,
+                spk,
+                block_height,
+                false,
+                UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+            );
             state.add_leaf(leaf).context("utreexo add_leaf")?;
         }
     }

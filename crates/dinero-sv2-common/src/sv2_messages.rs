@@ -178,7 +178,9 @@ pub struct CoinbaseContext {
 ///
 /// 1. Assemble coinbase = `prefix || varint(|outputs|) || serialize(outputs) || suffix`
 /// 2. `coinbase_txid = sha256d(coinbase_bytes)`
-/// 3. For each output i: `leaf_i = leaf_hash(coinbase_txid, i, value, script)`
+/// 3. For each output i: `leaf_i = leaf_hash_for_height(coinbase_txid,
+///    i, value, script, block_height, is_coinbase=true, activation)` —
+///    v2 (maturity) leaves at/after the mainnet-60000 hard fork, v1 below
 /// 4. `new_state = pre_block_state.add_leaves(&leaves)`, `utreexo_root =
 ///    commitment(&new_state)`
 /// 5. `merkle_root = compute_root(coinbase_txid, &merkle_path)`
