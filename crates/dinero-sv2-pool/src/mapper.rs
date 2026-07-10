@@ -154,6 +154,23 @@ pub fn split_coinbase_segwit(hex_data: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8
     Ok((prefix, suffix, witness_bytes))
 }
 
+/// Extract the pool's own fee/payout script from a template's daemon-
+/// built coinbase: the first non-OP_RETURN output (`script[0] != 0x6a`).
+/// This is the pool's `--payout-address` output that dinerod places in
+/// the coinbase for every `getblocktemplate` call, so shared-mode's
+/// operator fee destination is derived here rather than via a separate
+/// CLI flag — one source of truth for "where does the pool's own money
+/// go".
+pub fn extract_fee_script(coinbase_full_hex: &str) -> Result<Vec<u8>> {
+    let bytes = hex::decode(coinbase_full_hex).context("coinbase hex decode")?;
+    let (_, outputs) = parse_segwit_tx_inputs_outputs(&bytes)?;
+    outputs
+        .into_iter()
+        .find(|(_, spk)| spk.first() != Some(&0x6a))
+        .map(|(_, spk)| spk)
+        .ok_or_else(|| anyhow!("no non-OP_RETURN output found in coinbase"))
+}
+
 /// Read a Bitcoin CompactSize varint at `off`. Returns `(value, bytes_consumed)`.
 fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
     if off >= buf.len() {
@@ -483,9 +500,24 @@ fn hex_reverse_32(s: &str) -> Result<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Build a [`PoolTemplate`] the way `shared_template`'s tests need
+    /// it: real `coinbase_prefix`/`coinbase_suffix`/`coinbase_value_una`
+    /// from the fixture JSON, plus a populated `utreexo_pre_block` (the
+    /// plain `fixture()` JSON has no `getutreexoroots` equivalent, so
+    /// `map_template` always leaves that field `None`).
+    pub(crate) fn fixture_pool_template() -> PoolTemplate {
+        let mut pt = map_template(&fixture(), 42).unwrap();
+        let mut state = UtreexoAccumulatorState::empty();
+        for i in 0..4u8 {
+            state.add_leaf([i; 32]).unwrap();
+        }
+        pt.utreexo_pre_block = Some(state);
+        pt
+    }
 
     fn fixture() -> Value {
         json!({
@@ -538,6 +570,46 @@ mod tests {
             hex::encode(pt.block_target),
             "000000806f000000000000000000000000000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn extract_fee_script_finds_first_non_op_return_output() {
+        let pt = map_template(&fixture(), 42).unwrap();
+        let script = extract_fee_script(&pt.coinbase_full_hex).unwrap();
+        // Fixture's sole output: 0x51 0x20 <32-byte taproot payload>.
+        let expected = hex::decode(
+            "5120d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
+        )
+        .unwrap();
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn extract_fee_script_skips_leading_op_return() {
+        // A coinbase whose first output is OP_RETURN (0x6a...) and whose
+        // second output is the real payout script; extraction must skip
+        // the OP_RETURN and return the payout script.
+        let hex_data = concat!(
+            "01000000", // version
+            "01",       // in_count
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "ffffffff", // prevout idx
+            "03", "023c14", // scriptSig
+            "ffffffff", // sequence
+            "02",       // out_count
+            "0000000000000000", // value = 0 (OP_RETURN output)
+            "04", "6a020000", // OP_RETURN push
+            "00e40b5402000000", // value = 10000000000
+            "22", "5120",
+            "d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
+            "00000000" // locktime
+        );
+        let script = extract_fee_script(hex_data).unwrap();
+        let expected = hex::decode(
+            "5120d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
+        )
+        .unwrap();
+        assert_eq!(script, expected);
     }
 
     #[test]

@@ -55,6 +55,37 @@ pub fn assemble_block_hex_raw(
     Ok(hex::encode(buf))
 }
 
+/// Wrap a stripped (non-segwit) coinbase with the retained segwit
+/// marker/flag + witness bytes so the result is the broadcast form
+/// dinerod expects in `submitblock`.
+///
+/// Inputs:
+/// - `stripped`: version || vin || vout || locktime
+/// - `witness_bytes`: the per-input witness stacks exactly as the
+///   daemon emitted them for the original template
+/// - `suffix`: just the 4-byte locktime (must match `stripped`'s tail)
+///
+/// Shared by the extended-share block-submit path (`main.rs`) and the
+/// pool-owned shared-template builder (`shared_template.rs`).
+pub fn wrap_stripped_with_segwit_witness(
+    stripped: &[u8],
+    witness_bytes: &[u8],
+    suffix: &[u8],
+) -> Vec<u8> {
+    // stripped = version(4) || vin+vout || locktime(4)
+    // broadcast = version(4) || 00 01 || vin+vout || witness || locktime(4)
+    let locktime_len = suffix.len(); // typically 4
+    assert!(stripped.len() >= 4 + locktime_len);
+    let mid_end = stripped.len() - locktime_len;
+    let mut out = Vec::with_capacity(stripped.len() + 2 + witness_bytes.len());
+    out.extend_from_slice(&stripped[..4]); // version
+    out.extend_from_slice(&[0x00, 0x01]); // segwit marker + flag
+    out.extend_from_slice(&stripped[4..mid_end]); // vin + vout
+    out.extend_from_slice(witness_bytes); // witness stacks
+    out.extend_from_slice(&stripped[mid_end..]); // locktime
+    out
+}
+
 fn compact_size(n: u64) -> Vec<u8> {
     if n < 0xFD {
         vec![n as u8]
@@ -132,5 +163,24 @@ mod tests {
         assert_eq!(&bytes[129..cb_end], &cb[..]);
         assert_eq!(&bytes[cb_end..cb_end + tx1.len()], &tx1[..]);
         assert_eq!(&bytes[cb_end + tx1.len()..], &tx2[..]);
+    }
+
+    #[test]
+    fn wrap_stripped_reinserts_segwit_marker_and_witness() {
+        // stripped = version(4) || vin+vout(3) || locktime(4)
+        let stripped = vec![0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x00];
+        let witness = vec![0xDE, 0xAD];
+        let suffix = vec![0x00, 0x00, 0x00, 0x00];
+        let wrapped = wrap_stripped_with_segwit_witness(&stripped, &witness, &suffix);
+        assert_eq!(
+            wrapped,
+            vec![
+                0x01, 0x00, 0x00, 0x00, // version
+                0x00, 0x01, // segwit marker+flag
+                0xAA, 0xBB, 0xCC, // vin+vout
+                0xDE, 0xAD, // witness
+                0x00, 0x00, 0x00, 0x00, // locktime
+            ]
+        );
     }
 }

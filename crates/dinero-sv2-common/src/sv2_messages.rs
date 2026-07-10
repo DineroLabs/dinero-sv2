@@ -258,3 +258,28 @@ pub struct SetNewPrevHash {
     /// Compact difficulty target for jobs on this `prev_hash`.
     pub nbits: u32,
 }
+
+/// Miner → pool: reward-mode declaration (Dinero extension, 0x23).
+/// Sent once, after OpenStandardMiningChannel.Success. A channel that
+/// never sends it mines SOLO (backward compatible).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetRewardMode {
+    /// Channel this applies to.
+    pub channel_id: u32,
+    /// 0 = solo, 1 = shared.
+    pub mode: u8,
+    /// Payout scriptPubKey credited by the PPLNS ledger (34-byte
+    /// taproot expected; pool validates shape).
+    pub payout_script: Vec<u8>,
+}
+
+/// Pool → miner: PPLNS window standing (Dinero extension, 0x24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowStatus {
+    /// Channel this applies to.
+    pub channel_id: u32,
+    /// The miner's fraction of the current window in basis points.
+    pub window_bps: u32,
+    /// Total shares currently in the window (pool-wide).
+    pub window_shares: u64,
+}

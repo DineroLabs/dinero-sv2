@@ -60,11 +60,20 @@ pub enum SubmitBlockResult {
 }
 
 impl RpcClient {
-    /// Build a new JSON-RPC client.
+    /// Build a new JSON-RPC client with the default 15s per-request
+    /// timeout (right for the pool's own steady-state calls).
     pub fn new(url: String, auth: Auth) -> Result<Self> {
+        Self::with_timeout(url, auth, Duration::from_secs(15))
+    }
+
+    /// Build a new JSON-RPC client with a caller-chosen per-request
+    /// timeout. Mainly for tests that issue calls slower than the
+    /// pool's own steady-state 15s budget (e.g. large batched
+    /// `generatetoaddress` calls against a regtest daemon).
+    pub fn with_timeout(url: String, auth: Auth, timeout: Duration) -> Result<Self> {
         Ok(Self {
             http: Client::builder()
-                .timeout(Duration::from_secs(15))
+                .timeout(timeout)
                 .build()
                 .context("building reqwest client")?,
             url,
