@@ -12,17 +12,18 @@
 //! over the shared `GpuBackend` abstraction (see `backend.rs`).
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use dinero_sv2_codec::sv2::{decode_window_status, encode_set_reward_mode};
 use dinero_sv2_codec::{
     decode_coinbase_context, decode_new_template, decode_open_standard_mining_channel_success,
     decode_set_new_prev_hash, decode_set_target, decode_setup_connection_success,
     decode_submit_shares_error, decode_submit_shares_success, encode_open_standard_mining_channel,
-    encode_setup_connection, encode_submit_shares_extended,
+    encode_setup_connection, encode_submit_shares, encode_submit_shares_extended,
 };
 use dinero_sv2_common::{
     nbits_to_target, CoinbaseContext, CoinbaseOutputWire, HeaderAssembly, NewTemplateDinero,
-    OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero, SubmitSharesExtendedDinero,
-    PROTOCOL_MINING, PROTOCOL_VERSION,
+    OpenStandardMiningChannel, SetRewardMode, SetupConnection, SubmitSharesDinero,
+    SubmitSharesExtendedDinero, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
 use dinero_sv2_jd::{
     assemble_stripped_coinbase,
@@ -37,8 +38,9 @@ use dinero_sv2_transport::{
     Frame, NoiseReader, NoiseSession, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
     MSG_OPEN_STANDARD_MINING_CHANNEL, MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
     MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR,
-    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SET_TARGET, MSG_SUBMIT_SHARES_ERROR,
-    MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
+    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SET_REWARD_MODE, MSG_SET_TARGET,
+    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD,
+    MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE, MSG_WINDOW_STATUS,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,7 +111,9 @@ fn choose_backend(
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn GpuBackend>> {
     // macOS exposes only Metal (OpenCL/CUDA modules are compiled out).
     match choose_backend(choice, true, false, false).map_err(|e| anyhow::anyhow!(e))? {
-        "metal" => Ok(Arc::new(metal_backend::MetalMiner::init().context("metal init")?)),
+        "metal" => Ok(Arc::new(
+            metal_backend::MetalMiner::init().context("metal init")?,
+        )),
         other => bail!("backend {other} is not available on macOS"),
     }
 }
@@ -272,6 +276,21 @@ mod print_backends_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RewardModeChoice {
+    Solo,
+    Shared,
+}
+
+impl RewardModeChoice {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Solo => "solo",
+            Self::Shared => "shared",
+        }
+    }
+}
+
 #[derive(Parser, Clone)]
 #[command(version, about = "Dinero SV2 GPU pool miner (Metal/OpenCL)")]
 struct Args {
@@ -283,6 +302,11 @@ struct Args {
 
     #[arg(long)]
     payout_script_hex: String,
+
+    /// Reward ownership. CLI remains solo by default for backward
+    /// compatibility; Dinero-Qt explicitly selects shared by default.
+    #[arg(long, value_enum, default_value = "solo")]
+    reward_mode: RewardModeChoice,
 
     /// GPU backend: auto (default), metal, opencl, or cuda.
     #[arg(long, value_enum, default_value = "auto")]
@@ -329,11 +353,12 @@ async fn async_main() -> Result<()> {
     let args = Args::parse();
 
     let pinned = parse_server_pubkey(args.server_pubkey.as_deref())?;
-    let payout_script = hex::decode(&args.payout_script_hex)
-        .context("payout_script_hex must be hex")?;
+    let payout_script =
+        hex::decode(&args.payout_script_hex).context("payout_script_hex must be hex")?;
     if payout_script.is_empty() {
         bail!("payout_script_hex decoded to empty script");
     }
+    validate_reward_payout(args.reward_mode, &payout_script)?;
 
     let emitter = Emitter::new(args.json);
     emitter.emit_startup(&args);
@@ -383,10 +408,7 @@ async fn async_main() -> Result<()> {
                     );
                     return Ok(());
                 }
-                emitter.emit(
-                    "session_end",
-                    &serde_json::json!({"reason": "clean-close"}),
-                );
+                emitter.emit("session_end", &serde_json::json!({"reason": "clean-close"}));
             }
             Err(err) => {
                 emitter.emit(
@@ -410,6 +432,15 @@ async fn async_main() -> Result<()> {
         );
         sleep(Duration::from_secs(args.reconnect_secs)).await;
     }
+}
+
+fn validate_reward_payout(mode: RewardModeChoice, payout_script: &[u8]) -> Result<()> {
+    if mode == RewardModeChoice::Shared
+        && (payout_script.len() != 34 || payout_script[0] != 0x51 || payout_script[1] != 0x20)
+    {
+        bail!("shared rewards require a Taproot payout address (34-byte P2TR script)");
+    }
+    Ok(())
 }
 
 fn parse_server_pubkey(hex_opt: Option<&str>) -> Result<Option<[u8; 32]>> {
@@ -437,7 +468,9 @@ async fn run_session(
     emitter: &Emitter,
 ) -> Result<u64> {
     let tcp = TcpStream::connect(args.pool).await.context("connect")?;
-    let session = NoiseSession::initiate_nx(tcp, pinned).await.context("noise handshake")?;
+    let session = NoiseSession::initiate_nx(tcp, pinned)
+        .await
+        .context("noise handshake")?;
     let peer_pubkey = hex::encode(session.peer_static_key());
     emitter.emit(
         "connected",
@@ -490,8 +523,20 @@ async fn run_session(
         &serde_json::json!({
             "channel_id": channel_id,
             "share_target": hex::encode(share_target),
+            "reward_mode": args.reward_mode.as_str(),
         }),
     );
+
+    if args.reward_mode == RewardModeChoice::Shared {
+        let declaration = SetRewardMode {
+            channel_id,
+            mode: 1,
+            payout_script: payout_script.to_vec(),
+        };
+        writer
+            .write_frame(MSG_SET_REWARD_MODE, &encode_set_reward_mode(&declaration)?)
+            .await?;
+    }
 
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Frame>();
     let reader_task = tokio::spawn(async move {
@@ -510,6 +555,8 @@ async fn run_session(
 
     let mut pre_block_state: Option<UtreexoAccumulatorState> = None;
     let mut coinbase_ctx: Option<CoinbaseContext> = None;
+    let mut pending_shared_template: Option<NewTemplateDinero> = None;
+    let mut shared_mode_confirmed = false;
     let mut blocks_found: u64 = 0;
     let mut seq: u32 = 0;
 
@@ -557,17 +604,42 @@ async fn run_session(
                         generation.fetch_add(1, Ordering::SeqCst);
                         pre_block_state = None;
                         coinbase_ctx = None;
+                        pending_shared_template = None;
                     }
                     MSG_UTREEXO_STATE => {
+                        if args.reward_mode == RewardModeChoice::Shared {
+                            continue;
+                        }
                         let state = decode_utreexo_accumulator_state(&frame.payload)?;
                         pre_block_state = Some(state);
                     }
                     MSG_COINBASE_CONTEXT => {
+                        if args.reward_mode == RewardModeChoice::Shared {
+                            continue;
+                        }
                         let ctx = decode_coinbase_context(&frame.payload)?;
                         coinbase_ctx = Some(ctx);
                     }
                     MSG_NEW_MINING_JOB => {
                         let tmpl = decode_new_template(&frame.payload)?;
+                        if args.reward_mode == RewardModeChoice::Shared {
+                            if shared_mode_confirmed {
+                                pending_shared_template = None;
+                                start_hashing_gpu_shared(
+                                    tmpl,
+                                    share_target,
+                                    gpu.clone(),
+                                    args.batch_size,
+                                    Arc::clone(&generation),
+                                    Arc::clone(&measured_mhs_x100),
+                                    share_tx.clone(),
+                                    emitter,
+                                );
+                            } else {
+                                pending_shared_template = Some(tmpl);
+                            }
+                            continue;
+                        }
                         let Some(state) = pre_block_state.clone() else {
                             tracing::warn!("NewMiningJob without UtreexoStateAnnouncement");
                             continue;
@@ -589,6 +661,34 @@ async fn run_session(
                             share_tx.clone(),
                             emitter,
                         );
+                    }
+                    MSG_WINDOW_STATUS if args.reward_mode == RewardModeChoice::Shared => {
+                        let status = decode_window_status(&frame.payload)?;
+                        if status.channel_id != channel_id {
+                            continue;
+                        }
+                        shared_mode_confirmed = true;
+                        emitter.emit(
+                            "window_status",
+                            &serde_json::json!({
+                                "channel_id": status.channel_id,
+                                "window_bps": status.window_bps,
+                                "window_percent": status.window_bps as f64 / 100.0,
+                                "window_shares": status.window_shares,
+                            }),
+                        );
+                        if let Some(tmpl) = pending_shared_template.take() {
+                            start_hashing_gpu_shared(
+                                tmpl,
+                                share_target,
+                                gpu.clone(),
+                                args.batch_size,
+                                Arc::clone(&generation),
+                                Arc::clone(&measured_mhs_x100),
+                                share_tx.clone(),
+                                emitter,
+                            );
+                        }
                     }
                     MSG_SUBMIT_SHARES_SUCCESS => {
                         let s = decode_submit_shares_success(&frame.payload)?;
@@ -647,17 +747,32 @@ async fn run_session(
                     continue;
                 }
                 seq += 1;
-                let ext = SubmitSharesExtendedDinero {
-                    channel_id,
-                    sequence_number: seq,
-                    job_id: u32::try_from(found.template_id).unwrap_or(0),
-                    nonce: found.nonce,
-                    timestamp: found.timestamp,
-                    version: found.version,
-                    coinbase_outputs: found.coinbase_outputs,
-                };
-                let buf = encode_submit_shares_extended(&ext)?;
-                writer.write_frame(MSG_SUBMIT_SHARES_EXTENDED, &buf).await?;
+                let job_id = u32::try_from(found.template_id).unwrap_or(0);
+                if args.reward_mode == RewardModeChoice::Shared {
+                    let share = SubmitSharesDinero {
+                        channel_id,
+                        sequence_number: seq,
+                        job_id,
+                        nonce: found.nonce,
+                        timestamp: found.timestamp,
+                        version: found.version,
+                    };
+                    writer
+                        .write_frame(MSG_SUBMIT_SHARES_STANDARD, &encode_submit_shares(&share))
+                        .await?;
+                } else {
+                    let ext = SubmitSharesExtendedDinero {
+                        channel_id,
+                        sequence_number: seq,
+                        job_id,
+                        nonce: found.nonce,
+                        timestamp: found.timestamp,
+                        version: found.version,
+                        coinbase_outputs: found.coinbase_outputs,
+                    };
+                    let buf = encode_submit_shares_extended(&ext)?;
+                    writer.write_frame(MSG_SUBMIT_SHARES_EXTENDED, &buf).await?;
+                }
                 // Only emit share_submitted JSON for block-target hits.
                 // Sub-block shares fire ~500/sec at full GPU speed; the
                 // per-event UI-thread cost on the Qt side is the dominant
@@ -790,15 +905,6 @@ fn start_hashing_gpu(
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: &Emitter,
 ) {
-    // Race-free cancellation: each spawned thread captures its own
-    // generation number; if the global counter has moved past it, the
-    // thread is stale and must exit. The previous bool-flag approach had
-    // a window where a new `start_hashing_gpu` call could `cancel=false`
-    // before the old thread observed `cancel=true`, leading to two
-    // dispatch threads racing for the GPU buffer mutex and roughly
-    // halving effective throughput.
-    let gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-
     let (encoded_filter, _n) = gcs_build(&tmpl.prev_block_hash, &[&payout_script]);
     let filter_hash = gcs_filter_hash(&encoded_filter);
     let dnrf_script = build_dnrf_script(&filter_hash);
@@ -869,8 +975,6 @@ fn start_hashing_gpu(
         difficulty: tmpl.difficulty,
         coinbase_outputs_commitment: [0u8; 32],
     };
-    let block_target = nbits_to_target(tmpl.difficulty);
-
     let coinbase_outputs_wire: Vec<CoinbaseOutputWire> = miner_outputs
         .iter()
         .map(|o| CoinbaseOutputWire {
@@ -888,11 +992,77 @@ fn start_hashing_gpu(
             "utreexo_root": hex::encode(our_utreexo_root),
             "merkle_root": hex::encode(merkle_root),
             "difficulty_nbits": format!("0x{:08x}", tmpl.difficulty),
-            "block_target": hex::encode(block_target),
+            "block_target": hex::encode(nbits_to_target(tmpl.difficulty)),
             "share_target": hex::encode(share_target),
             "backend": gpu.name(),
+            "reward_mode": "solo",
         }),
     );
+
+    start_hashing_gpu_template(
+        our_template,
+        coinbase_outputs_wire,
+        share_target,
+        gpu,
+        batch_size,
+        generation,
+        measured_mhs_x100,
+        share_tx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_hashing_gpu_shared(
+    tmpl: NewTemplateDinero,
+    share_target: [u8; 32],
+    gpu: Arc<dyn GpuBackend>,
+    batch_size: u32,
+    generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
+    share_tx: mpsc::UnboundedSender<FoundShare>,
+    emitter: &Emitter,
+) {
+    emitter.emit(
+        "new_job",
+        &serde_json::json!({
+            "template_id": tmpl.template_id,
+            "utreexo_root": hex::encode(tmpl.utreexo_root),
+            "merkle_root": hex::encode(tmpl.merkle_root),
+            "difficulty_nbits": format!("0x{:08x}", tmpl.difficulty),
+            "block_target": hex::encode(nbits_to_target(tmpl.difficulty)),
+            "share_target": hex::encode(share_target),
+            "backend": gpu.name(),
+            "reward_mode": "shared",
+        }),
+    );
+
+    start_hashing_gpu_template(
+        tmpl,
+        Vec::new(),
+        share_target,
+        gpu,
+        batch_size,
+        generation,
+        measured_mhs_x100,
+        share_tx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_hashing_gpu_template(
+    tmpl: NewTemplateDinero,
+    coinbase_outputs_wire: Vec<CoinbaseOutputWire>,
+    share_target: [u8; 32],
+    gpu: Arc<dyn GpuBackend>,
+    batch_size: u32,
+    generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
+    share_tx: mpsc::UnboundedSender<FoundShare>,
+) {
+    // Each dispatch thread captures its generation. A new tip, target, or
+    // template advances the counter and makes all older work stale.
+    let gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let block_target = nbits_to_target(tmpl.difficulty);
 
     let tmpl_initial_timestamp = tmpl.timestamp;
     let tmpl_version = tmpl.version;
@@ -922,14 +1092,20 @@ fn start_hashing_gpu(
             if stale() {
                 return;
             }
-            let header_bytes = assemble_header_bytes(&our_template, current_timestamp, tmpl_version);
+            let header_bytes = assemble_header_bytes(&tmpl, current_timestamp, tmpl_version);
             let mut nonce_start: u64 = 0;
             while nonce_start <= u32::MAX as u64 {
                 if stale() {
                     return;
                 }
-                let this_batch = std::cmp::min(batch, (u32::MAX as u64 + 1).saturating_sub(nonce_start)) as u32;
-                let outcome = match gpu.dispatch(&header_bytes, &share_target, nonce_start as u32, this_batch) {
+                let this_batch =
+                    std::cmp::min(batch, (u32::MAX as u64 + 1).saturating_sub(nonce_start)) as u32;
+                let outcome = match gpu.dispatch(
+                    &header_bytes,
+                    &share_target,
+                    nonce_start as u32,
+                    this_batch,
+                ) {
                     Ok(out) => out,
                     Err(err) => {
                         tracing::error!("gpu dispatch ({}) failed: {err}", gpu.name());
@@ -940,7 +1116,8 @@ fn start_hashing_gpu(
                 hashes_since_emit += this_batch as u64;
                 if last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS {
                     let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
-                    let dispatch_ms = total_ms_since_emit / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
+                    let dispatch_ms = total_ms_since_emit
+                        / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
                     // Publish process-wide rolling rate so the next
                     // session's `nominal_hash_rate_bits` reports actual
                     // measured throughput.
@@ -967,7 +1144,7 @@ fn start_hashing_gpu(
                         timestamp: current_timestamp,
                         version: tmpl_version,
                     };
-                    let hash = HeaderAssembly::hash(&our_template, &share);
+                    let hash = HeaderAssembly::hash(&tmpl, &share);
                     if hash < share_target {
                         let meets_block = hash < block_target;
                         // Total nonces searched at this template: completed
@@ -976,8 +1153,7 @@ fn start_hashing_gpu(
                         // proxy that just collapsed to `outcome.nonce`.
                         let timestamp_wraps =
                             current_timestamp.saturating_sub(tmpl_initial_timestamp);
-                        let nonces_searched =
-                            timestamp_wraps * (1u64 << 32) + outcome.nonce as u64;
+                        let nonces_searched = timestamp_wraps * (1u64 << 32) + outcome.nonce as u64;
                         let _ = share_tx.send(FoundShare {
                             generation: gen,
                             template_id: tmpl_id,
@@ -1014,11 +1190,7 @@ fn start_hashing_gpu(
 /// Emit the 128-byte Dinero block header layout (LE) as a byte array so
 /// the Metal kernel can hash it per-thread. Nonce bytes at offset 112
 /// are set to zero; the kernel overwrites them per thread_position.
-fn assemble_header_bytes(
-    tmpl: &NewTemplateDinero,
-    timestamp: u64,
-    version: u32,
-) -> [u8; 128] {
+fn assemble_header_bytes(tmpl: &NewTemplateDinero, timestamp: u64, version: u32) -> [u8; 128] {
     let mut buf = [0u8; 128];
     buf[0..4].copy_from_slice(&version.to_le_bytes());
     buf[4..36].copy_from_slice(&tmpl.prev_block_hash);
@@ -1078,5 +1250,40 @@ fn data_as_object(data: &serde_json::Value) -> serde_json::Map<String, serde_jso
             map.insert("data".to_string(), other.clone());
             map
         }
+    }
+}
+
+#[cfg(test)]
+mod reward_mode_tests {
+    use super::*;
+
+    #[test]
+    fn cli_preserves_solo_default_and_accepts_shared() {
+        let base = [
+            "miner",
+            "--pool",
+            "127.0.0.1:4444",
+            "--payout-script-hex",
+            "51200000000000000000000000000000000000000000000000000000000000000000",
+        ];
+        assert_eq!(
+            Args::try_parse_from(base).unwrap().reward_mode,
+            RewardModeChoice::Solo
+        );
+
+        let shared = base.into_iter().chain(["--reward-mode", "shared"]);
+        assert_eq!(
+            Args::try_parse_from(shared).unwrap().reward_mode,
+            RewardModeChoice::Shared
+        );
+    }
+
+    #[test]
+    fn shared_requires_taproot_but_solo_keeps_existing_scripts() {
+        let mut p2tr = [0x51u8; 34];
+        p2tr[1] = 0x20;
+        assert!(validate_reward_payout(RewardModeChoice::Shared, &p2tr).is_ok());
+        assert!(validate_reward_payout(RewardModeChoice::Shared, &[0x52, 0x20]).is_err());
+        assert!(validate_reward_payout(RewardModeChoice::Solo, &[0x52, 0x20]).is_ok());
     }
 }
