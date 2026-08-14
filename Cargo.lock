@@ -500,6 +500,7 @@ dependencies = [
  "clap",
  "core-graphics-types",
  "cudarc",
+ "dinero-miner-ux",
  "dinero-sv2-codec",
  "dinero-sv2-common",
  "dinero-sv2-jd",
