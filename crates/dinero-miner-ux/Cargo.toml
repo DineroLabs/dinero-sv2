@@ -1,0 +1,16 @@
+[package]
+name        = "dinero-miner-ux"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+rust-version = { workspace = true }
+description = "Shared CLI UX for the Dinero miners: address validation, config, interactive prompt, human display"
+
+[dependencies]
+bech32     = { workspace = true }
+dirs       = { workspace = true }
+hex        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }

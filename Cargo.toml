@@ -10,6 +10,7 @@ members = [
     "crates/dinero-sv2-pool",
     "crates/dinero-sv2-miner",
     "crates/dinero-sv2-gpu-miner",
+    "crates/dinero-miner-ux",
 ]
 
 [workspace.package]
@@ -27,6 +28,8 @@ dinero-sv2-transport = { path = "crates/dinero-sv2-transport" }
 dinero-sv2-jd        = { path = "crates/dinero-sv2-jd" }
 
 anyhow     = "1"
+bech32     = "0.11"
+dirs       = "5"
 thiserror  = "1"
 proptest   = "1"
 sha2       = "0.10"

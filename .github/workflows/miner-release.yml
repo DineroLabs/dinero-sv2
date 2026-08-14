@@ -1,0 +1,129 @@
+# Miner release pipeline — fires on tags `miner-vX.Y.Z` (kept clear of
+# pool/protocol tags). Builds the CPU miner for all four public targets,
+# assembles SHA256SUMS, and publishes a GitHub release with every asset.
+#
+# v0.1.0 scope (owner call 2026-08-14): CPU miner only, shared-mode-first
+# distribution. The GPU miner (dinero-sv2-gpu-miner) is code-complete with
+# the same UX; enable the commented `gpu` matrix entries when GPU binaries
+# are ready to ship.
+#
+# macOS signing/notarization runs LOCALLY, not in CI: after the workflow
+# publishes, sign the darwin asset on the Mac
+#   codesign --force --options runtime \
+#     --sign 'Developer ID Application: DineroLabs LLC (JXJS6ZA5FJ)' dinero-sv2-miner-aarch64-apple-darwin
+#   xcrun notarytool submit ... --keychain-profile dinero-notarytool --wait
+# then replace the release asset (gh release upload --clobber) AND
+# regenerate + re-upload SHA256SUMS so the sums match the signed binary.
+name: miner-release
+
+on:
+  push:
+    tags: ["miner-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            ext: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+            use_cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
+          # GPU lanes — disabled for miner-v0.1.x (CPU-only release scope).
+          # Re-enable by uncommenting; each also needs `bin: dinero-sv2-gpu-miner`
+          # plumbing in the build/rename steps below.
+          # - target: aarch64-apple-darwin (gpu/metal)
+          # - target: x86_64-unknown-linux-gnu (gpu/opencl)
+          # - target: x86_64-pc-windows-msvc (gpu/opencl)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.use_cross == true }}
+        run: cargo install cross --locked
+
+      - name: Build (cross)
+        if: ${{ matrix.use_cross == true }}
+        run: cross build --release --locked -p dinero-sv2-miner --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ matrix.use_cross != true }}
+        run: cargo build --release --locked -p dinero-sv2-miner --target ${{ matrix.target }}
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/dinero-sv2-miner${{ matrix.ext }}" \
+             "dist/dinero-sv2-miner-${{ matrix.target }}${{ matrix.ext }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dinero-sv2-miner-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: assemble SHA256SUMS + publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: SHA256SUMS
+        working-directory: assets
+        run: |
+          sha256sum dinero-sv2-miner-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body: |
+            One-command install (macOS / Linux / Chromebook Crostini):
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.sh | sh
+            ```
+
+            Windows (PowerShell):
+
+            ```powershell
+            irm https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.ps1 | iex
+            ```
+
+            Then run `dinero-miner`, paste your `din1p…` address, and you are
+            mining shared rewards — no node, no flags. Verify downloads
+            against `SHA256SUMS`.
+
+            **Behavior change:** an unspecified `--reward-mode` now resolves
+            to `shared` (previously `solo`). Pass `--reward-mode solo` to
+            keep miner-owned all-or-nothing coinbases.
+
+            This release ships the CPU miner. The GPU worker has the same
+            interactive UX and builds from source; prebuilt GPU binaries
+            come in a later release.

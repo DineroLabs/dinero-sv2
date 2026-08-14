@@ -39,10 +39,12 @@ use dinero_sv2_transport::{
     MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD,
     MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE, MSG_WINDOW_STATUS,
 };
+use dinero_miner_ux::config::FileConfig;
+use dinero_miner_ux::display::{Display, SessionStats};
 use rayon::prelude::*;
-use std::net::SocketAddr;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -66,38 +68,52 @@ impl RewardModeChoice {
 #[derive(Parser, Clone)]
 #[command(version, about = "Dinero SV2 pool miner")]
 struct Args {
-    /// Pool endpoint, e.g. 172.93.160.131:4444
+    /// Pool endpoint as host:port, e.g. pool.dinerolabs.org:4444 or an
+    /// ip:port. Defaults to the well-known Dinero pool when not set here
+    /// or in the saved config. Hostnames re-resolve on every reconnect.
     #[arg(long)]
-    pool: SocketAddr,
+    pool: Option<String>,
 
-    /// Expected pool static pubkey (64-char hex). Strongly recommended —
-    /// without it the client accepts any server key on first contact.
+    /// Expected pool static pubkey (64-char hex). Defaults to the well-known
+    /// Dinero pool's pubkey when not set here or in the saved config.
     #[arg(long)]
     server_pubkey: Option<String>,
 
+    /// Dinero payout address (din1p…). Prompted for interactively if
+    /// omitted, stdin is a terminal, and no address is saved yet.
+    #[arg(long, conflicts_with = "payout_script_hex")]
+    address: Option<String>,
+
     /// Coinbase payout scriptPubKey as hex (34 bytes for Taproot `din1p…`).
     /// Consensus sends the block reward to this script on a block-find.
+    /// Legacy alternative to --address; bypasses address validation.
     #[arg(long)]
-    payout_script_hex: String,
+    payout_script_hex: Option<String>,
 
     /// Reward ownership: solo uses a miner-owned coinbase; shared submits
-    /// standard shares to the pool's PPLNS window. CLI stays solo by default
-    /// for backward compatibility; Dinero-Qt selects shared by default.
-    #[arg(long, value_enum, default_value = "solo")]
-    reward_mode: RewardModeChoice,
+    /// standard shares to the pool's PPLNS window. Unspecified resolves to
+    /// shared; pass this flag (or set it in the saved config) to mine solo.
+    #[arg(long, value_enum)]
+    reward_mode: Option<RewardModeChoice>,
 
     /// Worker identity reported to the pool. Shows up in pool logs.
     #[arg(long, default_value = "dinero-sv2-miner")]
     user_agent: String,
 
-    /// Number of CPU hash threads. 0 = detect logical cores.
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
+    /// Number of CPU hash threads. Unspecified resolves to cores-1 (or the
+    /// saved config's value). Explicit 0 = detect and use all logical cores.
+    #[arg(long)]
+    threads: Option<usize>,
 
     /// Emit newline-delimited JSON events on stdout instead of human-
     /// readable lines. Intended for GUI frontends to parse.
     #[arg(long)]
     json: bool,
+
+    /// Skip writing the resolved address/pool/pubkey/mode/threads to the
+    /// config file. Useful for tests and scripted one-off runs.
+    #[arg(long)]
+    no_save: bool,
 
     /// Reconnect back-off seconds on disconnect. 0 = exit on disconnect.
     #[arg(long, default_value_t = 5)]
@@ -121,12 +137,23 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     let args = Args::parse();
 
-    // Resolve thread count once.
-    let threads = if args.threads == 0 {
-        num_cpus::get()
-    } else {
-        args.threads
-    };
+    // ---- Config precedence: flags > saved file > built-in defaults ----
+    let flags = args_to_flags(&args);
+    let config_path = dinero_miner_ux::config::config_path();
+    let file = dinero_miner_ux::config::load(&config_path);
+    let cores = num_cpus::get();
+    let mut effective = dinero_miner_ux::config::resolve(&flags, &file, cores);
+    if args.threads == Some(0) {
+        // Explicit `--threads 0` keeps its legacy meaning (all logical
+        // cores) rather than the resolver's cores-1 default; it never
+        // touches the saved config's threads value either.
+        effective.threads = cores;
+    }
+    // Floor at 1: a hand-edited (or pre-fix) config with `"threads": 0`
+    // must never silently produce an empty rayon range split — that would
+    // connect, accept jobs, and hash nothing.
+    let threads = effective.threads.max(1);
+    let reward_mode = resolve_reward_mode(&effective.reward_mode);
 
     // Rayon global pool sized to the chosen thread count. `build_global`
     // fails if called twice in the same process — fine here since we only
@@ -136,16 +163,67 @@ async fn async_main() -> Result<()> {
         .build_global()
         .ok();
 
-    let pinned = parse_server_pubkey(args.server_pubkey.as_deref())?;
-    let payout_script =
-        hex::decode(&args.payout_script_hex).context("payout_script_hex must be hex")?;
+    let human = !args.json && std::io::stdout().is_terminal();
+
+    // ---- Resolve the payout address / script ----
+    // `--payout-script-hex` is a legacy escape hatch: verbatim, no address
+    // validation. Otherwise resolve/prompt for a `din1p…` address and derive
+    // the script from it. A resolved address that fails validation is only
+    // recoverable (warn + fall back to the prompt, or fail naming the
+    // config path) when it came from the saved file, not from `--address`
+    // — a flag-sourced bad address keeps failing fast, unchanged.
+    let (resolved_address, payout_script): (Option<String>, Vec<u8>) =
+        if let Some(hex_script) = args.payout_script_hex.as_deref() {
+            let script = hex::decode(hex_script).context("payout_script_hex must be hex")?;
+            (effective.address.clone(), script)
+        } else if let Some(addr) = effective.address.clone() {
+            match classify_resolved_address(args.address.as_deref(), &addr) {
+                AddressOutcome::Ready(script) => (Some(addr), script),
+                AddressOutcome::Fatal(err) => return Err(err),
+                AddressOutcome::Recoverable(err) => {
+                    if std::io::stdin().is_terminal() {
+                        eprintln!(
+                            "warning: saved address in {} is invalid ({err}) — ignoring it",
+                            config_path.display()
+                        );
+                        prompt_for_new_address(human)?
+                    } else {
+                        bail!(
+                            "saved address in {} is invalid: {err} (pass --address/--payout-script-hex, or run interactively to replace it)",
+                            config_path.display()
+                        );
+                    }
+                }
+            }
+        } else if std::io::stdin().is_terminal() {
+            prompt_for_new_address(human)?
+        } else {
+            bail!(
+                "no payout address: pass --address din1p… (or --payout-script-hex), or run interactively"
+            );
+        };
+
     if payout_script.is_empty() {
         bail!("payout_script_hex decoded to empty script");
     }
-    validate_reward_payout(args.reward_mode, &payout_script)?;
+    validate_reward_payout(reward_mode, &payout_script)?;
 
-    let emitter = Emitter::new(args.json);
-    emitter.emit_startup(&args, threads);
+    let pool = effective.pool.clone();
+    validate_pool_endpoint(&pool)?;
+    let pinned = parse_server_pubkey(effective.server_pubkey.as_deref())?;
+    if pinned.is_none() {
+        eprintln!(
+            "warning: no server pubkey configured for pool {pool} — connection is unpinned (trust-on-first-use)"
+        );
+    }
+
+    if !args.no_save {
+        save_config(&config_path, &file, &args, resolved_address);
+    }
+
+    let emitter = Emitter::new(args.json, human);
+    emitter.spawn_ctrlc_summary_handler();
+    emitter.emit_startup(&pool, pinned.is_some(), threads, &args.user_agent);
 
     // Process-wide generation counter. Lives across reconnects so that
     // hashing/telemetry threads spawned in a previous session observe a
@@ -166,6 +244,8 @@ async fn async_main() -> Result<()> {
     loop {
         match run_session(
             &args,
+            &pool,
+            reward_mode,
             pinned.as_ref(),
             &payout_script,
             threads,
@@ -216,6 +296,130 @@ async fn async_main() -> Result<()> {
     }
 }
 
+/// Maps CLI flags onto the config layer's `FileConfig` shape. Only ever
+/// `Some` for a field the user actually supplied — that's what lets the
+/// resolver's flag > file > default precedence work.
+fn args_to_flags(args: &Args) -> FileConfig {
+    FileConfig {
+        address: args.address.clone(),
+        pool: args.pool.clone(),
+        server_pubkey: args.server_pubkey.clone(),
+        reward_mode: args.reward_mode.map(|m| m.as_str().to_string()),
+        threads: match args.threads {
+            // Legacy "all cores" meaning is handled directly in async_main
+            // by overriding the resolved thread count; don't let a literal
+            // 0 flow into the resolver (it would be taken as "zero
+            // threads").
+            Some(0) => None,
+            other => other,
+        },
+    }
+}
+
+/// Syntactic host:port check, done once at startup so garbage fails fast
+/// with a clear message. Deliberately NOT a DNS resolution: name lookup
+/// happens at connect time each session, and a temporarily-unresolvable
+/// name goes through the normal reconnect/backoff path instead of
+/// aborting startup.
+fn validate_pool_endpoint(pool: &str) -> Result<()> {
+    let valid = pool
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+    if !valid {
+        bail!("invalid pool address '{pool}': expected host:port, e.g. pool.dinerolabs.org:4444");
+    }
+    Ok(())
+}
+
+/// Parses the resolved `reward_mode` string (case-insensitively). An
+/// unrecognized value — e.g. a hand-edited config file — falls back to the
+/// resolver's own default (shared) with a one-line warning instead of
+/// failing startup.
+fn resolve_reward_mode(s: &str) -> RewardModeChoice {
+    match s.to_lowercase().as_str() {
+        "solo" => RewardModeChoice::Solo,
+        "shared" => RewardModeChoice::Shared,
+        other => {
+            eprintln!("warning: unknown reward_mode '{other}' in config; using shared");
+            RewardModeChoice::Shared
+        }
+    }
+}
+
+/// How a resolved (flag-or-config) address held up under validation.
+enum AddressOutcome {
+    /// Valid: the derived 34-byte P2TR payout script.
+    Ready(Vec<u8>),
+    /// Invalid and flag-sourced: the user typed it just now, fail fast.
+    Fatal(anyhow::Error),
+    /// Invalid but config-sourced: stale/hand-edited saved file — the
+    /// caller may fall back to the interactive prompt.
+    Recoverable(anyhow::Error),
+}
+
+/// Validates the resolved address, classifying a failure by its source:
+/// `flag_address` is `Some` when `--address` was given (in which case it is
+/// what `addr` resolved from, since flags outrank the config file).
+fn classify_resolved_address(flag_address: Option<&str>, addr: &str) -> AddressOutcome {
+    match decode_address(addr) {
+        Ok(script) => AddressOutcome::Ready(script),
+        Err(err) if flag_address.is_some() => AddressOutcome::Fatal(err),
+        Err(err) => AddressOutcome::Recoverable(err),
+    }
+}
+
+/// Runs the interactive address prompt (no saved-address offer — callers
+/// reach this only when there is no usable saved address) and derives the
+/// payout script. A prompt abort exits the process with status 2.
+fn prompt_for_new_address(human: bool) -> Result<(Option<String>, Vec<u8>)> {
+    if human {
+        eprintln!("⛏  Dinero SV2 Miner");
+    }
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let mut stderr = std::io::stderr();
+    match dinero_miner_ux::prompt::prompt_for_address(&mut stdin, &mut stderr, None) {
+        dinero_miner_ux::prompt::PromptOutcome::Address(addr) => {
+            let script = decode_address(&addr)?;
+            Ok((Some(addr), script))
+        }
+        dinero_miner_ux::prompt::PromptOutcome::Aborted => std::process::exit(2),
+    }
+}
+
+/// Validates a `din1p…` address and returns its 34-byte P2TR scriptPubKey
+/// as raw bytes.
+fn decode_address(addr: &str) -> Result<Vec<u8>> {
+    let script_hex =
+        dinero_miner_ux::address::payout_script_hex(addr).map_err(|e| anyhow::anyhow!(e.message()))?;
+    hex::decode(script_hex).context("payout_script_hex produced non-hex output")
+}
+
+/// Persists the resolved address (always, when present) plus any
+/// explicitly-flagged pool/pubkey/mode/threads, merged onto whatever was
+/// already on disk so unrelated saved settings survive a run that didn't
+/// touch them. Best-effort: a write failure is a warning, not a fatal error.
+fn save_config(path: &std::path::Path, file: &FileConfig, args: &Args, resolved_address: Option<String>) {
+    let mut to_save = file.clone();
+    if let Some(addr) = resolved_address {
+        to_save.address = Some(addr);
+    }
+    if args.pool.is_some() {
+        to_save.pool = args.pool.clone();
+    }
+    if args.server_pubkey.is_some() {
+        to_save.server_pubkey = args.server_pubkey.clone();
+    }
+    if let Some(mode) = args.reward_mode {
+        to_save.reward_mode = Some(mode.as_str().to_string());
+    }
+    if let Some(threads) = args.threads {
+        to_save.threads = if threads == 0 { None } else { Some(threads) };
+    }
+    if let Err(err) = dinero_miner_ux::config::save(path, &to_save) {
+        eprintln!("warning: could not save config to {}: {err}", path.display());
+    }
+}
+
 fn validate_reward_payout(mode: RewardModeChoice, payout_script: &[u8]) -> Result<()> {
     if mode == RewardModeChoice::Shared
         && (payout_script.len() != 34 || payout_script[0] != 0x51 || payout_script[1] != 0x20)
@@ -243,8 +447,11 @@ fn parse_server_pubkey(hex_opt: Option<&str>) -> Result<Option<[u8; 32]>> {
 /// One full SV2 session. Returns the number of block-target hits found
 /// before the session closed normally, or an error if the pool disconnected
 /// unexpectedly.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     args: &Args,
+    pool: &str,
+    reward_mode: RewardModeChoice,
     pinned: Option<&[u8; 32]>,
     payout_script: &[u8],
     threads: usize,
@@ -252,7 +459,9 @@ async fn run_session(
     measured_mhs_x100: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
-    let tcp = TcpStream::connect(args.pool).await.context("connect")?;
+    // `connect(&str)` resolves the hostname per attempt, so a pool DNS
+    // repoint takes effect at the next reconnect without a restart.
+    let tcp = TcpStream::connect(pool).await.context("connect")?;
     let session = NoiseSession::initiate_nx(tcp, pinned)
         .await
         .context("noise handshake")?;
@@ -260,7 +469,7 @@ async fn run_session(
     emitter.emit(
         "connected",
         &serde_json::json!({
-            "pool": args.pool.to_string(),
+            "pool": pool.to_string(),
             "server_pubkey": peer_pubkey,
             "threads": threads,
         }),
@@ -316,11 +525,11 @@ async fn run_session(
         &serde_json::json!({
             "channel_id": channel_id,
             "share_target": hex::encode(share_target),
-            "reward_mode": args.reward_mode.as_str(),
+            "reward_mode": reward_mode.as_str(),
         }),
     );
 
-    if args.reward_mode == RewardModeChoice::Shared {
+    if reward_mode == RewardModeChoice::Shared {
         let declaration = SetRewardMode {
             channel_id,
             mode: 1,
@@ -383,14 +592,14 @@ async fn run_session(
                         pending_shared_template = None;
                     }
                     MSG_UTREEXO_STATE => {
-                        if args.reward_mode == RewardModeChoice::Shared {
+                        if reward_mode == RewardModeChoice::Shared {
                             continue;
                         }
                         let state = decode_utreexo_accumulator_state(&frame.payload)?;
                         pre_block_state = Some(state);
                     }
                     MSG_COINBASE_CONTEXT => {
-                        if args.reward_mode == RewardModeChoice::Shared {
+                        if reward_mode == RewardModeChoice::Shared {
                             continue;
                         }
                         let ctx = decode_coinbase_context(&frame.payload)?;
@@ -398,7 +607,7 @@ async fn run_session(
                     }
                     MSG_NEW_MINING_JOB => {
                         let tmpl = decode_new_template(&frame.payload)?;
-                        if args.reward_mode == RewardModeChoice::Shared {
+                        if reward_mode == RewardModeChoice::Shared {
                             if shared_mode_confirmed {
                                 pending_shared_template = None;
                                 start_hashing_shared(
@@ -438,7 +647,7 @@ async fn run_session(
                             emitter,
                         );
                     }
-                    MSG_WINDOW_STATUS if args.reward_mode == RewardModeChoice::Shared => {
+                    MSG_WINDOW_STATUS if reward_mode == RewardModeChoice::Shared => {
                         let status = decode_window_status(&frame.payload)?;
                         if status.channel_id != channel_id {
                             continue;
@@ -516,7 +725,7 @@ async fn run_session(
                 }
                 seq += 1;
                 let job_id = u32::try_from(found.template_id).unwrap_or(0);
-                if args.reward_mode == RewardModeChoice::Shared {
+                if reward_mode == RewardModeChoice::Shared {
                     let share = SubmitSharesDinero {
                         channel_id,
                         sequence_number: seq,
@@ -549,7 +758,7 @@ async fn run_session(
                         "hash": hex::encode(found.hash),
                         "meets_block_target": found.meets_block_target,
                         "tries": found.tries,
-                        "reward_mode": args.reward_mode.as_str(),
+                        "reward_mode": reward_mode.as_str(),
                     }),
                 );
                 if found.meets_block_target {
@@ -943,41 +1152,86 @@ fn start_hashing_template(
 }
 
 // ───── Structured event emitter ─────
+//
+// `json` OR a non-TTY stdout routes through `OutputMode::Json` /
+// `OutputMode::Plain` — byte-identical to the pre-Task-6 emitter, since
+// GUI wrappers (dinero-qt) and log-redirected runs depend on that wire
+// format never drifting. A TTY with `--json` absent gets `OutputMode::
+// Human`, which translates the exact same `emit(event, data)` calls into
+// `Display`-rendered lines instead of JSON/plain text.
 
 #[derive(Clone)]
 struct Emitter {
-    json: bool,
+    mode: OutputMode,
+}
+
+#[derive(Clone)]
+enum OutputMode {
+    Json,
+    Plain,
+    Human(Arc<Mutex<HumanState>>),
 }
 
 impl Emitter {
-    fn new(json: bool) -> Self {
-        Self { json }
+    fn new(json: bool, human: bool) -> Self {
+        let mode = if json {
+            OutputMode::Json
+        } else if human {
+            OutputMode::Human(Arc::new(Mutex::new(HumanState::new())))
+        } else {
+            OutputMode::Plain
+        };
+        Self { mode }
     }
 
-    fn emit_startup(&self, args: &Args, threads: usize) {
+    fn emit_startup(&self, pool: &str, server_pubkey_pinned: bool, threads: usize, user_agent: &str) {
         self.emit(
             "startup",
             &serde_json::json!({
-                "pool": args.pool.to_string(),
-                "server_pubkey_pinned": args.server_pubkey.is_some(),
+                "pool": pool,
+                "server_pubkey_pinned": server_pubkey_pinned,
                 "threads": threads,
-                "user_agent": args.user_agent,
+                "user_agent": user_agent,
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         );
     }
 
     fn emit(&self, event: &str, data: &serde_json::Value) {
-        if self.json {
-            let mut map = data_as_object(data);
-            map.insert(
-                "event".to_string(),
-                serde_json::Value::String(event.to_string()),
-            );
-            let line = serde_json::Value::Object(map);
-            println!("{}", line);
-        } else {
-            println!("[{event}] {data}");
+        match &self.mode {
+            OutputMode::Json => {
+                let mut map = data_as_object(data);
+                map.insert(
+                    "event".to_string(),
+                    serde_json::Value::String(event.to_string()),
+                );
+                let line = serde_json::Value::Object(map);
+                println!("{}", line);
+            }
+            OutputMode::Plain => {
+                println!("[{event}] {data}");
+            }
+            OutputMode::Human(state) => emit_human(state, event, data),
+        }
+    }
+
+    /// In human mode, listens for Ctrl-C and prints a final session summary
+    /// before exiting — the human-display equivalent of the JSON path's
+    /// `session_end` line. No-op (process just dies on SIGINT as before) in
+    /// JSON/plain mode, matching prior behavior exactly.
+    fn spawn_ctrlc_summary_handler(&self) {
+        if let OutputMode::Human(state) = &self.mode {
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                if let Ok(st) = state.lock() {
+                    let elapsed = st.stats.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    println!();
+                    println!("{}", Display::session_summary(&st.stats, elapsed));
+                    let _ = std::io::stdout().flush();
+                }
+                std::process::exit(0);
+            });
         }
     }
 }
@@ -995,12 +1249,152 @@ fn data_as_object(data: &serde_json::Value) -> serde_json::Map<String, serde_jso
     }
 }
 
+// ───── Human display ─────
+
+/// Live state behind `OutputMode::Human`: rolling session stats plus enough
+/// bookkeeping to repaint the self-overwriting status line cleanly. Shared
+/// (`Arc<Mutex<_>>`) because the telemetry thread in
+/// `start_hashing_template` clones the `Emitter` into its own OS thread.
+struct HumanState {
+    stats: SessionStats,
+    last_line_len: usize,
+    status_live: bool,
+}
+
+impl HumanState {
+    fn new() -> Self {
+        let stats = SessionStats {
+            started: Some(Instant::now()),
+            ..Default::default()
+        };
+        Self {
+            stats,
+            last_line_len: 0,
+            status_live: false,
+        }
+    }
+
+    /// Repaints the status line in place via `\r`, padding with trailing
+    /// spaces to the previous line's length so a shorter line doesn't leave
+    /// stale glyphs from the longer one behind.
+    fn repaint_status(&mut self, out: &mut impl Write) {
+        let line = Display::status_line(&self.stats);
+        let pad = self.last_line_len.saturating_sub(line.chars().count());
+        let _ = write!(out, "\r{line}{}", " ".repeat(pad));
+        let _ = out.flush();
+        self.last_line_len = line.chars().count();
+        self.status_live = true;
+    }
+
+    /// Clears a live status line before printing something that must not
+    /// share its row (a lifecycle line or a block banner).
+    fn clear_status(&mut self, out: &mut impl Write) {
+        if self.status_live {
+            let _ = write!(out, "\r{}\r", " ".repeat(self.last_line_len));
+            let _ = out.flush();
+            self.status_live = false;
+        }
+    }
+}
+
+fn emit_human(state: &Arc<Mutex<HumanState>>, event: &str, data: &serde_json::Value) {
+    let Ok(mut st) = state.lock() else { return };
+    let mut stdout = std::io::stdout();
+    match event {
+        "hashrate" => {
+            if let Some(mhs) = data.get("mhs").and_then(|v| v.as_f64()) {
+                st.stats.hashrate_hs = mhs * 1e6;
+            }
+            st.repaint_status(&mut stdout);
+        }
+        "share_accepted" => {
+            let n = data
+                .get("accepted_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            st.stats.ok += n;
+            st.repaint_status(&mut stdout);
+        }
+        "share_rejected" => {
+            st.stats.rej += 1;
+            st.repaint_status(&mut stdout);
+        }
+        "share_submitted" => {
+            let meets_block = data
+                .get("meets_block_target")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if meets_block {
+                st.stats.blocks += 1;
+                st.clear_status(&mut stdout);
+                let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("");
+                let nonce = data.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+                let tries = data.get("tries").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mode = data
+                    .get("reward_mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let banner =
+                    Display::block_banner(st.stats.blocks, hash, nonce, tries, mode, &now_hms());
+                print!("{banner}");
+                let _ = stdout.flush();
+            }
+        }
+        _ => {
+            st.clear_status(&mut stdout);
+            println!("{}", lifecycle_line(event, data));
+        }
+    }
+}
+
+/// Generic one-line rendering for events that aren't the status line or
+/// the block banner (connection lifecycle, job/window/share-error
+/// notices, startup, session end, ...).
+fn lifecycle_line(event: &str, data: &serde_json::Value) -> String {
+    let parts: Vec<String> = match data {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}={}", compact_value(v)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if parts.is_empty() {
+        format!("»  {event}")
+    } else {
+        format!("»  {event}  {}", parts.join("  "))
+    }
+}
+
+fn compact_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `HH:MM:SS` wall-clock time for the block banner. UTC (no timezone
+/// database is linked in), computed by hand to avoid pulling in a chrono/
+/// time dependency for a single cosmetic timestamp.
+fn now_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day_secs = secs % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        day_secs / 3600,
+        (day_secs % 3600) / 60,
+        day_secs % 60
+    )
+}
+
 #[cfg(test)]
 mod reward_mode_tests {
     use super::*;
 
     #[test]
-    fn cli_preserves_solo_default_and_accepts_shared() {
+    fn cli_reward_mode_unspecified_is_none_but_accepts_shared() {
         let base = [
             "miner",
             "--pool",
@@ -1008,15 +1402,29 @@ mod reward_mode_tests {
             "--payout-script-hex",
             "51200000000000000000000000000000000000000000000000000000000000000000",
         ];
-        assert_eq!(
-            Args::try_parse_from(base).unwrap().reward_mode,
-            RewardModeChoice::Solo
-        );
+        assert_eq!(Args::try_parse_from(base).unwrap().reward_mode, None);
 
         let shared = base.into_iter().chain(["--reward-mode", "shared"]);
         assert_eq!(
             Args::try_parse_from(shared).unwrap().reward_mode,
-            RewardModeChoice::Shared
+            Some(RewardModeChoice::Shared)
+        );
+    }
+
+    #[test]
+    fn unspecified_reward_mode_resolves_to_shared() {
+        // Behavior change (this task): bare invocation used to default to
+        // solo at the clap level; now clap yields None and the config
+        // resolver's default is shared.
+        assert_eq!(resolve_reward_mode("garbage-unknown-mode"), RewardModeChoice::Shared);
+        assert_eq!(
+            dinero_miner_ux::config::resolve(
+                &dinero_miner_ux::config::FileConfig::default(),
+                &dinero_miner_ux::config::FileConfig::default(),
+                4
+            )
+            .reward_mode,
+            "shared"
         );
     }
 
@@ -1028,5 +1436,57 @@ mod reward_mode_tests {
         assert!(validate_reward_payout(RewardModeChoice::Shared, &valid_p2tr).is_ok());
         assert!(validate_reward_payout(RewardModeChoice::Shared, &[0x52, 0x20]).is_err());
         assert!(validate_reward_payout(RewardModeChoice::Solo, &[0x52, 0x20]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    #[test]
+    fn address_and_script_are_mutually_exclusive() {
+        assert!(Args::try_parse_from([
+            "m",
+            "--address",
+            "din1p...x",
+            "--payout-script-hex",
+            "51ab"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn bare_invocation_parses() {
+        let a = Args::try_parse_from(["m"]).unwrap();
+        assert!(a.pool.is_none() && a.address.is_none() && a.reward_mode.is_none());
+    }
+
+    #[test]
+    fn pool_accepts_hostname_endpoints() {
+        let a = Args::try_parse_from(["m", "--pool", "pool.dinerolabs.org:4444"]).unwrap();
+        assert_eq!(a.pool.as_deref(), Some("pool.dinerolabs.org:4444"));
+        assert!(validate_pool_endpoint("pool.dinerolabs.org:4444").is_ok());
+        assert!(validate_pool_endpoint("173.249.200.59:4444").is_ok());
+        assert!(validate_pool_endpoint("no-port-here").is_err());
+        assert!(validate_pool_endpoint(":4444").is_err());
+        assert!(validate_pool_endpoint("host:notaport").is_err());
+    }
+
+    #[test]
+    fn invalid_address_fatal_from_flag_recoverable_from_config() {
+        const GOOD: &str = "din1pafzgzwwfeqkfh7u4kkpe8qy97gey3zcvymx5eumxzx45m08q6tgqedz700";
+        const BAD: &str = "din1p-not-a-real-address";
+        assert!(matches!(
+            classify_resolved_address(None, GOOD),
+            AddressOutcome::Ready(_)
+        ));
+        assert!(matches!(
+            classify_resolved_address(Some(BAD), BAD),
+            AddressOutcome::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_resolved_address(None, BAD),
+            AddressOutcome::Recoverable(_)
+        ));
     }
 }

@@ -17,7 +17,7 @@ zero flags and zero chain state:
 $ dinero-miner
   paste your Dinero address (din1p…): <paste> ⏎
   ✓ valid — saved for next time
-  connected · pool 173.249.200.59:4444 · shared rewards · 7 threads
+  connected · pool pool.dinerolabs.org:4444 · shared rewards · 7 threads
   ⛏  2.09 MH/s   shares 14 ok / 0 rej   blocks 1   up 3m12s
   ■ block found  #1  14:22:07
     hash   000000574714…7fd3b995
@@ -55,7 +55,9 @@ consuming the same binary's `--json` mode unchanged.
    validated interactive address is written back ("saved for next time");
    next interactive run offers Enter-to-reuse:
    `mine to din1pgp5…maph9u? [Enter = yes / paste a new address]`.
-4. **Built-in defaults** — pool `173.249.200.59:4444`, server pubkey
+4. **Built-in defaults** — pool `pool.dinerolabs.org:4444` (DNS A record
+   → the SJ pool box 173.249.200.59; a pool migration is a DNS repoint,
+   picked up at each reconnect, never a client re-release), server pubkey
    `3c879d90c9bb430493dfbf02cecbb93c3ae0d9d6c31d0757595e353fbe927417`,
    reward_mode `shared`, threads = logical cores − 1 (min 1). Key-rotation
    escape hatch: config overrides the pinned pubkey, so a rotation is a

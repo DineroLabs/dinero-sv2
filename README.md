@@ -9,6 +9,58 @@ independently verify every byte, including the header's Utreexo root.
 Pure Rust, no FFI. Works anywhere a Rust crate works: DineroDPI (iOS),
 future pool operators, TP processes running beside `dinerod`, tests.
 
+## Mine in one minute
+
+Install with one pasted command, paste your Dinero address, mine.
+
+**macOS / Linux / Chromebook:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.ps1 | iex
+```
+
+Then:
+
+```
+$ dinero-miner
+  paste your Dinero address (din1p…): <paste> ⏎
+  ✓ valid — saved for next time
+  connected · pool pool.dinerolabs.org:4444 · shared rewards · 7 threads
+  ⛏  2.09 MH/s  14 ok  0 rej  blocks 1
+  ■ block found  #1  14:22:07
+    hash   000000574714…7fd3b995
+    nonce  0x014b216a
+    tries  21,700,970
+```
+
+No node in either reward mode: the pool's node serves templates.
+`shared` = PPLNS split; `solo` = miner-owned coinbase via the pool
+(whole reward if your hash wins).
+
+Your address is validated up front and saved to
+`~/.config/dinero-miner/config.json`; the next run offers it back with
+Enter-to-reuse. Flags > config file > built-in defaults, so `--pool`,
+`--server-pubkey`, `--reward-mode`, and `--threads` all override.
+
+**Chromebook:** enable Linux (Settings → Advanced → Developers →
+"Linux development environment"), open the Terminal app, and paste the
+same Linux one-liner.
+
+> **Behavior change in `miner-v0.1.0`:** an unspecified `--reward-mode`
+> now resolves to `shared` (it used to default to `solo`). Pass
+> `--reward-mode solo` explicitly to keep miner-owned all-or-nothing
+> coinbases.
+
+The first release ships the CPU miner (`dinero-miner`). The GPU worker
+(`dinero-sv2-gpu-miner`, Metal/OpenCL) has the same interactive UX and
+builds from source today; prebuilt GPU release binaries come later.
+
 ## What's in here
 
 ```
