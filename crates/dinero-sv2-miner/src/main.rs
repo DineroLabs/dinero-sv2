@@ -168,33 +168,35 @@ async fn async_main() -> Result<()> {
     // ---- Resolve the payout address / script ----
     // `--payout-script-hex` is a legacy escape hatch: verbatim, no address
     // validation. Otherwise resolve/prompt for a `din1p…` address and derive
-    // the script from it.
+    // the script from it. A resolved address that fails validation is only
+    // recoverable (warn + fall back to the prompt, or fail naming the
+    // config path) when it came from the saved file, not from `--address`
+    // — a flag-sourced bad address keeps failing fast, unchanged.
     let (resolved_address, payout_script): (Option<String>, Vec<u8>) =
         if let Some(hex_script) = args.payout_script_hex.as_deref() {
             let script = hex::decode(hex_script).context("payout_script_hex must be hex")?;
             (effective.address.clone(), script)
         } else if let Some(addr) = effective.address.clone() {
-            let script = decode_address(&addr)?;
-            (Some(addr), script)
+            match classify_resolved_address(args.address.as_deref(), &addr) {
+                AddressOutcome::Ready(script) => (Some(addr), script),
+                AddressOutcome::Fatal(err) => return Err(err),
+                AddressOutcome::Recoverable(err) => {
+                    if std::io::stdin().is_terminal() {
+                        eprintln!(
+                            "warning: saved address in {} is invalid ({err}) — ignoring it",
+                            config_path.display()
+                        );
+                        prompt_for_new_address(human)?
+                    } else {
+                        bail!(
+                            "saved address in {} is invalid: {err} (pass --address/--payout-script-hex, or run interactively to replace it)",
+                            config_path.display()
+                        );
+                    }
+                }
+            }
         } else if std::io::stdin().is_terminal() {
-            if human {
-                eprintln!("⛏  Dinero SV2 Miner");
-            }
-            let mut stdin = std::io::BufReader::new(std::io::stdin());
-            let mut stderr = std::io::stderr();
-            match dinero_miner_ux::prompt::prompt_for_address(
-                &mut stdin,
-                &mut stderr,
-                file.address.as_deref(),
-            ) {
-                dinero_miner_ux::prompt::PromptOutcome::Address(addr) => {
-                    let script = decode_address(&addr)?;
-                    (Some(addr), script)
-                }
-                dinero_miner_ux::prompt::PromptOutcome::Aborted => {
-                    std::process::exit(2);
-                }
-            }
+            prompt_for_new_address(human)?
         } else {
             bail!(
                 "no payout address: pass --address din1p… (or --payout-script-hex), or run interactively"
@@ -210,7 +212,12 @@ async fn async_main() -> Result<()> {
         .pool
         .parse()
         .with_context(|| format!("invalid pool address '{}'", effective.pool))?;
-    let pinned = parse_server_pubkey(Some(&effective.server_pubkey))?;
+    let pinned = parse_server_pubkey(effective.server_pubkey.as_deref())?;
+    if pinned.is_none() {
+        eprintln!(
+            "warning: no server pubkey configured for pool {pool} — connection is unpinned (trust-on-first-use)"
+        );
+    }
 
     if !args.no_save {
         save_config(&config_path, &file, &args, resolved_address);
@@ -218,7 +225,7 @@ async fn async_main() -> Result<()> {
 
     let emitter = Emitter::new(args.json, human);
     emitter.spawn_ctrlc_summary_handler();
-    emitter.emit_startup(&pool.to_string(), true, threads, &args.user_agent);
+    emitter.emit_startup(&pool.to_string(), pinned.is_some(), threads, &args.user_agent);
 
     // Process-wide generation counter. Lives across reconnects so that
     // hashing/telemetry threads spawned in a previous session observe a
@@ -323,6 +330,46 @@ fn resolve_reward_mode(s: &str) -> RewardModeChoice {
             eprintln!("warning: unknown reward_mode '{other}' in config; using shared");
             RewardModeChoice::Shared
         }
+    }
+}
+
+/// How a resolved (flag-or-config) address held up under validation.
+enum AddressOutcome {
+    /// Valid: the derived 34-byte P2TR payout script.
+    Ready(Vec<u8>),
+    /// Invalid and flag-sourced: the user typed it just now, fail fast.
+    Fatal(anyhow::Error),
+    /// Invalid but config-sourced: stale/hand-edited saved file — the
+    /// caller may fall back to the interactive prompt.
+    Recoverable(anyhow::Error),
+}
+
+/// Validates the resolved address, classifying a failure by its source:
+/// `flag_address` is `Some` when `--address` was given (in which case it is
+/// what `addr` resolved from, since flags outrank the config file).
+fn classify_resolved_address(flag_address: Option<&str>, addr: &str) -> AddressOutcome {
+    match decode_address(addr) {
+        Ok(script) => AddressOutcome::Ready(script),
+        Err(err) if flag_address.is_some() => AddressOutcome::Fatal(err),
+        Err(err) => AddressOutcome::Recoverable(err),
+    }
+}
+
+/// Runs the interactive address prompt (no saved-address offer — callers
+/// reach this only when there is no usable saved address) and derives the
+/// payout script. A prompt abort exits the process with status 2.
+fn prompt_for_new_address(human: bool) -> Result<(Option<String>, Vec<u8>)> {
+    if human {
+        eprintln!("⛏  Dinero SV2 Miner");
+    }
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let mut stderr = std::io::stderr();
+    match dinero_miner_ux::prompt::prompt_for_address(&mut stdin, &mut stderr, None) {
+        dinero_miner_ux::prompt::PromptOutcome::Address(addr) => {
+            let script = decode_address(&addr)?;
+            Ok((Some(addr), script))
+        }
+        dinero_miner_ux::prompt::PromptOutcome::Aborted => std::process::exit(2),
     }
 }
 
@@ -1397,5 +1444,23 @@ mod args_tests {
     fn bare_invocation_parses() {
         let a = Args::try_parse_from(["m"]).unwrap();
         assert!(a.pool.is_none() && a.address.is_none() && a.reward_mode.is_none());
+    }
+
+    #[test]
+    fn invalid_address_fatal_from_flag_recoverable_from_config() {
+        const GOOD: &str = "din1pafzgzwwfeqkfh7u4kkpe8qy97gey3zcvymx5eumxzx45m08q6tgqedz700";
+        const BAD: &str = "din1p-not-a-real-address";
+        assert!(matches!(
+            classify_resolved_address(None, GOOD),
+            AddressOutcome::Ready(_)
+        ));
+        assert!(matches!(
+            classify_resolved_address(Some(BAD), BAD),
+            AddressOutcome::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_resolved_address(None, BAD),
+            AddressOutcome::Recoverable(_)
+        ));
     }
 }

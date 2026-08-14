@@ -18,7 +18,10 @@ pub struct FileConfig {
 pub struct Effective {
     pub address: Option<String>,
     pub pool: String,
-    pub server_pubkey: String,
+    /// `None` means unpinned (trust-on-first-use): no explicit flag, no
+    /// saved config value, and the resolved pool isn't the well-known
+    /// default pool (whose pubkey we ship and can safely default to).
+    pub server_pubkey: Option<String>,
     pub reward_mode: String,
     pub threads: usize,
 }
@@ -46,20 +49,33 @@ pub fn save(path: &std::path::Path, c: &FileConfig) -> std::io::Result<()> {
 }
 
 pub fn resolve(flags: &FileConfig, file: &FileConfig, cores: usize) -> Effective {
+    let pool = flags
+        .pool
+        .as_ref()
+        .or(file.pool.as_ref())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DEFAULT_POOL.to_string());
+    // The shipped default pubkey is only trustworthy for the well-known
+    // default pool it was pinned against. A custom pool with no explicit
+    // pubkey (flag or saved config) gets no pin at all — trust-on-first-
+    // use — rather than silently being checked against a key that has
+    // nothing to do with it.
+    let server_pubkey = flags
+        .server_pubkey
+        .as_ref()
+        .or(file.server_pubkey.as_ref())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if pool == DEFAULT_POOL {
+                Some(DEFAULT_POOL_PUBKEY.to_string())
+            } else {
+                None
+            }
+        });
     Effective {
         address: flags.address.as_ref().or(file.address.as_ref()).cloned(),
-        pool: flags
-            .pool
-            .as_ref()
-            .or(file.pool.as_ref())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| DEFAULT_POOL.to_string()),
-        server_pubkey: flags
-            .server_pubkey
-            .as_ref()
-            .or(file.server_pubkey.as_ref())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| DEFAULT_POOL_PUBKEY.to_string()),
+        pool,
+        server_pubkey,
         reward_mode: flags
             .reward_mode
             .as_ref()
@@ -96,7 +112,7 @@ mod tests {
     fn defaults_when_nothing_set() {
         let e = resolve(&FileConfig::default(), &FileConfig::default(), 8);
         assert_eq!(e.pool, DEFAULT_POOL);
-        assert_eq!(e.server_pubkey, DEFAULT_POOL_PUBKEY);
+        assert_eq!(e.server_pubkey.as_deref(), Some(DEFAULT_POOL_PUBKEY));
         assert_eq!(e.reward_mode, "shared");
         assert_eq!(e.threads, 7, "cores - 1");
         assert_eq!(e.address, None);
@@ -126,6 +142,25 @@ mod tests {
             ),
             (Some("din1x"), "h:1", "solo", 3)
         );
+    }
+
+    #[test]
+    fn default_pubkey_only_applies_to_default_pool() {
+        // Non-default pool with no pubkey from flag or config: unpinned
+        // (trust-on-first-use), not silently pinned to the well-known
+        // default pool's key.
+        let e = resolve(
+            &f(None, Some("other.example:4444"), None, None),
+            &FileConfig::default(),
+            8,
+        );
+        assert_eq!(e.pool, "other.example:4444");
+        assert_eq!(e.server_pubkey, None);
+
+        // The well-known default pool still gets its known pin.
+        let e2 = resolve(&FileConfig::default(), &FileConfig::default(), 8);
+        assert_eq!(e2.pool, DEFAULT_POOL);
+        assert_eq!(e2.server_pubkey.as_deref(), Some(DEFAULT_POOL_PUBKEY));
     }
 
     #[test]
