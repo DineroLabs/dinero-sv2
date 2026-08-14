@@ -48,11 +48,11 @@ impl Display {
     }
 
     pub fn fmt_hashrate(hs: f64) -> String {
-        if hs < 1e3 {
+        if hs < 999.995 {
             format!("{} H/s", hs as u64)
-        } else if hs < 1e6 {
+        } else if hs < 999_995.0 {
             format!("{:.2} kH/s", hs / 1e3)
-        } else if hs < 1e9 {
+        } else if hs < 999_999_500.0 {
             format!("{:.2} MH/s", hs / 1e6)
         } else {
             format!("{:.2} GH/s", hs / 1e9)
@@ -142,5 +142,11 @@ mod tests {
         };
         let l = Display::session_summary(&s, 352);
         assert!(l.contains("5m52s") && l.contains("30") && l.contains("blocks 1"));
+    }
+
+    #[test]
+    fn hashrate_units_never_show_mantissa_1000() {
+        assert_eq!(Display::fmt_hashrate(999_999.0), "1.00 MH/s");
+        assert_eq!(Display::fmt_hashrate(999_999_900.0), "1.00 GH/s");
     }
 }
