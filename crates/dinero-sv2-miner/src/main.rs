@@ -43,7 +43,6 @@ use dinero_miner_ux::config::FileConfig;
 use dinero_miner_ux::display::{Display, SessionStats};
 use rayon::prelude::*;
 use std::io::{IsTerminal, Write};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -69,10 +68,11 @@ impl RewardModeChoice {
 #[derive(Parser, Clone)]
 #[command(version, about = "Dinero SV2 pool miner")]
 struct Args {
-    /// Pool endpoint, e.g. 172.93.160.131:4444. Defaults to the well-known
-    /// Dinero pool when not set here, in the saved config, via --address.
+    /// Pool endpoint as host:port, e.g. pool.dinerolabs.org:4444 or an
+    /// ip:port. Defaults to the well-known Dinero pool when not set here
+    /// or in the saved config. Hostnames re-resolve on every reconnect.
     #[arg(long)]
-    pool: Option<SocketAddr>,
+    pool: Option<String>,
 
     /// Expected pool static pubkey (64-char hex). Defaults to the well-known
     /// Dinero pool's pubkey when not set here or in the saved config.
@@ -208,10 +208,8 @@ async fn async_main() -> Result<()> {
     }
     validate_reward_payout(reward_mode, &payout_script)?;
 
-    let pool: SocketAddr = effective
-        .pool
-        .parse()
-        .with_context(|| format!("invalid pool address '{}'", effective.pool))?;
+    let pool = effective.pool.clone();
+    validate_pool_endpoint(&pool)?;
     let pinned = parse_server_pubkey(effective.server_pubkey.as_deref())?;
     if pinned.is_none() {
         eprintln!(
@@ -225,7 +223,7 @@ async fn async_main() -> Result<()> {
 
     let emitter = Emitter::new(args.json, human);
     emitter.spawn_ctrlc_summary_handler();
-    emitter.emit_startup(&pool.to_string(), pinned.is_some(), threads, &args.user_agent);
+    emitter.emit_startup(&pool, pinned.is_some(), threads, &args.user_agent);
 
     // Process-wide generation counter. Lives across reconnects so that
     // hashing/telemetry threads spawned in a previous session observe a
@@ -246,7 +244,7 @@ async fn async_main() -> Result<()> {
     loop {
         match run_session(
             &args,
-            pool,
+            &pool,
             reward_mode,
             pinned.as_ref(),
             &payout_script,
@@ -304,7 +302,7 @@ async fn async_main() -> Result<()> {
 fn args_to_flags(args: &Args) -> FileConfig {
     FileConfig {
         address: args.address.clone(),
-        pool: args.pool.map(|p| p.to_string()),
+        pool: args.pool.clone(),
         server_pubkey: args.server_pubkey.clone(),
         reward_mode: args.reward_mode.map(|m| m.as_str().to_string()),
         threads: match args.threads {
@@ -316,6 +314,21 @@ fn args_to_flags(args: &Args) -> FileConfig {
             other => other,
         },
     }
+}
+
+/// Syntactic host:port check, done once at startup so garbage fails fast
+/// with a clear message. Deliberately NOT a DNS resolution: name lookup
+/// happens at connect time each session, and a temporarily-unresolvable
+/// name goes through the normal reconnect/backoff path instead of
+/// aborting startup.
+fn validate_pool_endpoint(pool: &str) -> Result<()> {
+    let valid = pool
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+    if !valid {
+        bail!("invalid pool address '{pool}': expected host:port, e.g. pool.dinerolabs.org:4444");
+    }
+    Ok(())
 }
 
 /// Parses the resolved `reward_mode` string (case-insensitively). An
@@ -390,8 +403,8 @@ fn save_config(path: &std::path::Path, file: &FileConfig, args: &Args, resolved_
     if let Some(addr) = resolved_address {
         to_save.address = Some(addr);
     }
-    if let Some(pool) = args.pool {
-        to_save.pool = Some(pool.to_string());
+    if args.pool.is_some() {
+        to_save.pool = args.pool.clone();
     }
     if args.server_pubkey.is_some() {
         to_save.server_pubkey = args.server_pubkey.clone();
@@ -437,7 +450,7 @@ fn parse_server_pubkey(hex_opt: Option<&str>) -> Result<Option<[u8; 32]>> {
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     args: &Args,
-    pool: SocketAddr,
+    pool: &str,
     reward_mode: RewardModeChoice,
     pinned: Option<&[u8; 32]>,
     payout_script: &[u8],
@@ -446,6 +459,8 @@ async fn run_session(
     measured_mhs_x100: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
+    // `connect(&str)` resolves the hostname per attempt, so a pool DNS
+    // repoint takes effect at the next reconnect without a restart.
     let tcp = TcpStream::connect(pool).await.context("connect")?;
     let session = NoiseSession::initiate_nx(tcp, pinned)
         .await
@@ -1444,6 +1459,17 @@ mod args_tests {
     fn bare_invocation_parses() {
         let a = Args::try_parse_from(["m"]).unwrap();
         assert!(a.pool.is_none() && a.address.is_none() && a.reward_mode.is_none());
+    }
+
+    #[test]
+    fn pool_accepts_hostname_endpoints() {
+        let a = Args::try_parse_from(["m", "--pool", "pool.dinerolabs.org:4444"]).unwrap();
+        assert_eq!(a.pool.as_deref(), Some("pool.dinerolabs.org:4444"));
+        assert!(validate_pool_endpoint("pool.dinerolabs.org:4444").is_ok());
+        assert!(validate_pool_endpoint("173.249.200.59:4444").is_ok());
+        assert!(validate_pool_endpoint("no-port-here").is_err());
+        assert!(validate_pool_endpoint(":4444").is_err());
+        assert!(validate_pool_endpoint("host:notaport").is_err());
     }
 
     #[test]

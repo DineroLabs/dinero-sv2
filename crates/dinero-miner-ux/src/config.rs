@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_POOL: &str = "173.249.200.59:4444";
+/// DNS name (A record → the SJ pool box). Kept as a hostname so a pool
+/// migration is a DNS repoint that every installed miner follows on its
+/// next reconnect — never a client re-release.
+pub const DEFAULT_POOL: &str = "pool.dinerolabs.org:4444";
 pub const DEFAULT_POOL_PUBKEY: &str =
     "3c879d90c9bb430493dfbf02cecbb93c3ae0d9d6c31d0757595e353fbe927417";
 
@@ -111,6 +114,9 @@ mod tests {
     #[test]
     fn defaults_when_nothing_set() {
         let e = resolve(&FileConfig::default(), &FileConfig::default(), 8);
+        // DNS name, not the raw SJ IP: a pool migration must be a DNS
+        // repoint, never a client re-release.
+        assert_eq!(e.pool, "pool.dinerolabs.org:4444");
         assert_eq!(e.pool, DEFAULT_POOL);
         assert_eq!(e.server_pubkey.as_deref(), Some(DEFAULT_POOL_PUBKEY));
         assert_eq!(e.reward_mode, "shared");
