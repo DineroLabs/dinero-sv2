@@ -38,21 +38,12 @@ pub fn prompt_for_address(
         let trimmed = line.trim();
 
         // Empty line with saved → reuse saved
-        if trimmed.is_empty() {
-            if let Some(saved_addr) = saved {
-                writeln!(out, "  ✓ valid — saved for next time").ok();
-                return PromptOutcome::Address(saved_addr.to_string());
-            }
-            // No saved and empty line: count as invalid attempt
-            strikes += 1;
-            if strikes >= MAX_STRIKES {
-                return PromptOutcome::Aborted;
-            }
-            writeln!(out, "  ✗ Enter a Dinero address.").ok();
-            continue;
+        if trimmed.is_empty() && saved.is_some() {
+            writeln!(out, "  ✓ valid — saved for next time").ok();
+            return PromptOutcome::Address(saved.unwrap().to_string());
         }
 
-        // Validate
+        // Validate (including empty input with no saved)
         match validate_address(trimmed) {
             Ok(normalized) => {
                 writeln!(out, "  ✓ valid — saved for next time").ok();
@@ -122,5 +113,12 @@ mod tests {
     fn eof_aborts() {
         let (r, _) = run("", None);
         assert!(matches!(r, PromptOutcome::Aborted));
+    }
+
+    #[test]
+    fn three_empty_lines_abort_with_three_strikes() {
+        let (r, out) = run("\n\n\n", None);
+        assert!(matches!(r, PromptOutcome::Aborted));
+        assert_eq!(out.matches('✗').count(), 3, "must print ✗ before final abort");
     }
 }
