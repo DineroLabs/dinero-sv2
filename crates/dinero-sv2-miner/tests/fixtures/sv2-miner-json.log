@@ -1,0 +1,9 @@
+{"event":"startup","pool":"173.249.200.59:4444","server_pubkey_pinned":true,"threads":2,"user_agent":"dinerominer-fixture","version":"0.1.0"}
+{"event":"connected","pool":"173.249.200.59:4444","server_pubkey":"3c879d90c9bb430493dfbf02cecbb93c3ae0d9d6c31d0757595e353fbe927417","threads":2}
+{"channel_id":2,"event":"channel_open","reward_mode":"shared","share_target":"0000007fffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+{"event":"set_new_prev_hash","min_ntime":1786711241,"nbits":"0x1e00800a","prev_hash":"51078af54d1dd4322bc1d6a25fd669eec1b55fd2b5fa63cdfb64a47373000000"}
+{"event":"set_new_prev_hash","min_ntime":1786711241,"nbits":"0x1e00800a","prev_hash":"51078af54d1dd4322bc1d6a25fd669eec1b55fd2b5fa63cdfb64a47373000000"}
+{"channel_id":2,"event":"window_status","window_bps":0,"window_percent":0.0,"window_shares":19563}
+{"block_target":"000000800a000000000000000000000000000000000000000000000000000000","difficulty_nbits":"0x1e00800a","event":"new_job","merkle_root":"cc565aa6a16ddf10a11e9fe82dd0e80746c0360246edf8c411586752c53fdded","reward_mode":"shared","share_target":"0000007fffffffffffffffffffffffffffffffffffffffffffffffffffffffff","template_id":2,"utreexo_root":"adf237a84587cf252621f89453be54df7168f47f210d06d656bcb634c61197c6"}
+{"backend":"cpu","event":"hashrate","hashes_since_last":8388608,"interval_s":2.0,"mhs":4.19}
+{"event":"share_submitted","hash":"0000003a861a070d15bc179476d84a5f844b335865e906d7d9febed6bc43e456","meets_block_target":true,"nonce":"0x8083b478","reward_mode":"shared","sequence_number":1,"tries":8631416}

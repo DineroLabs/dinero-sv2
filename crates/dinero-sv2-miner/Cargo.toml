@@ -17,11 +17,12 @@ dinero-sv2-common    = { workspace = true }
 dinero-sv2-codec     = { workspace = true }
 dinero-sv2-transport = { workspace = true }
 dinero-sv2-jd        = { workspace = true }
+dinero-miner-ux      = { path = "../dinero-miner-ux" }
 anyhow     = { workspace = true }
 hex        = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-tokio      = { workspace = true }
+tokio      = { workspace = true, features = ["signal"] }
 clap       = { workspace = true }
 tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
