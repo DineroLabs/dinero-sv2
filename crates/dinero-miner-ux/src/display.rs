@@ -352,9 +352,17 @@ impl FeedWindow {
     pub fn repaint(&mut self, width: usize, colors: bool) -> String {
         let mut output = String::new();
 
-        // Non-first repaint: cursor up 10 lines to column 1
+        // Non-first repaint: cursor up 9 lines to column 1 (a 10-row region
+        // needs 9 up-moves to return from its last row to its first — see
+        // clear()'s matching 9-up-move math below; `\x1b[10F` was an
+        // off-by-one that made the region drift 1 row further up the screen
+        // on every repaint), then erase cursor-to-end-of-screen so any
+        // stale/duplicated lines left below the region by a desync from a
+        // different cause (e.g. a lifecycle println! interleaved between
+        // two repaints, or a taller-than-expected celebration frame)
+        // self-heal within one redraw instead of accumulating.
         if self.painted {
-            output.push_str("\x1b[10F");
+            output.push_str("\x1b[9F\x1b[J");
         }
 
         // Panel line (blank if no last_block yet)
@@ -516,7 +524,23 @@ mod tests {
         assert!(first.contains("  row-a\x1b[K"));
         assert!(!first.ends_with('\n'));
         let second = w.repaint(80, false);
-        assert!(second.starts_with("\x1b[10F"), "later paints move up 10 lines");
+        // A 10-row region needs 9 total up-moves to return from the last row
+        // (status line) to the first (panel line) — matching clear()'s own
+        // 9-up-move math below. `\x1b[10F` (one too many) was the actual bug:
+        // it makes the region drift 1 row further up the screen on every
+        // single repaint, indistinguishable from correct on a screen where
+        // the region happens to start at absolute row 0 (nowhere higher to
+        // go), but catastrophic once anything (banner/lifecycle text) is
+        // printed above it, since the region walks up through — and erases
+        // — that content over time. `\x1b[J` (erase cursor-to-end-of-screen)
+        // is added as defense in depth: it self-heals any stale/duplicated
+        // lines left below the region by a desync from a different cause
+        // (e.g. a lifecycle println! interleaved between two repaints).
+        assert!(
+            second.starts_with("\x1b[9F\x1b[J"),
+            "later paints move up 9 lines (not 10) then erase to end of screen: {:?}",
+            &second[..second.len().min(20)]
+        );
         let clear = w.clear();
         assert_eq!(clear, format!("\r\x1b[K{}", "\x1b[1A\x1b[K".repeat(9)));
         assert!(!w.clear().contains('\x1b'), "cleared window clears to nothing");
