@@ -45,7 +45,7 @@ use dinero_sv2_transport::{
 use dinero_miner_ux::config::FileConfig;
 use dinero_miner_ux::display::{Display, SessionStats};
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -349,6 +349,40 @@ struct Args {
 
     #[arg(long, default_value_t = 0)]
     max_blocks: u64,
+
+    /// Quiet human display (the pre-FX single status line). FX (live hash
+    /// feed + color) is the default on interactive terminals.
+    #[arg(long)]
+    plain: bool,
+}
+
+/// Which output mode `async_main` should construct, resolved from
+/// `--json`/TTY-ness/`--plain`/terminal-FX-support. Kept as a pure function
+/// of those four booleans so the decision table is unit-testable without a
+/// real terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeChoice {
+    Json,
+    PlainMachine,
+    HumanV1,
+    Fx,
+}
+
+/// `json` wins outright (GUI wire format). Otherwise: a non-TTY stdout is
+/// always the machine-readable plain-text path (log redirection etc.).
+/// On a TTY, `--plain` (or a terminal that doesn't support the FX escape
+/// sequences) falls back to the v1 single-status-line human display;
+/// otherwise FX is the default.
+fn choose_mode(json: bool, tty: bool, plain: bool, term_ok: bool) -> ModeChoice {
+    if json {
+        ModeChoice::Json
+    } else if !tty {
+        ModeChoice::PlainMachine
+    } else if plain || !term_ok {
+        ModeChoice::HumanV1
+    } else {
+        ModeChoice::Fx
+    }
 }
 
 fn main() -> Result<()> {
@@ -381,7 +415,15 @@ async fn async_main() -> Result<()> {
     let effective = dinero_miner_ux::config::resolve(&flags, &file, 1);
     let reward_mode = resolve_reward_mode(&effective.reward_mode);
 
-    let human = !args.json && std::io::stdout().is_terminal();
+    let mode = choose_mode(
+        args.json,
+        std::io::stdout().is_terminal(),
+        args.plain,
+        dinero_miner_ux::theme::term_supports_fx(),
+    );
+    // FX mode shares the v1 prompt look (banner-lite) — only the emitter's
+    // steady-state rendering differs.
+    let human = matches!(mode, ModeChoice::HumanV1 | ModeChoice::Fx);
 
     // ---- Resolve the payout address / script ----
     // `--payout-script-hex` is a legacy escape hatch: verbatim, no address
@@ -438,7 +480,56 @@ async fn async_main() -> Result<()> {
         save_config(&config_path, &file, &args, resolved_address);
     }
 
-    let emitter = Emitter::new(args.json, human, reward_mode.as_str());
+    // Shared job snapshot + live nonce position for the FX display's
+    // real-hash sampler. Harmless to build unconditionally (a few extra
+    // words of Mutex/Atomic) — only ever populated/read in FX mode.
+    let sampler_state = Arc::new(SamplerState {
+        job: Mutex::new(None),
+        nonce_hint: AtomicU64::new(0),
+    });
+    // Never set until process exit (the Ctrl-C path exits the process
+    // directly) — reconnects reuse the same screen/ticker.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let emitter = if matches!(mode, ModeChoice::Fx) {
+        let fx = dinero_miner_ux::fx::FxScreen::new(
+            Box::new(std::io::stdout()),
+            dinero_miner_ux::fx::FxConfig {
+                width: dinero_miner_ux::theme::term_width(),
+                colors: dinero_miner_ux::theme::colors_enabled(),
+                reward_mode: reward_mode.as_str().to_string(),
+                frame_delay_ms: 160,
+            },
+        );
+
+        // Build the real-hash sampler and spawn the ticker right after
+        // constructing the FxScreen — Task 5's review found `on_block`'s
+        // erase math assumes the region has been painted at least once
+        // before a block event, which the ticker's first tick guarantees.
+        let sampler_state2 = Arc::clone(&sampler_state);
+        let sampler: dinero_miner_ux::fx::HashSampler = Arc::new(move || {
+            let job = sampler_state2.job.lock().ok()?.clone()?;
+            let hint = sampler_state2.nonce_hint.load(Ordering::Relaxed);
+            let share = SubmitSharesDinero {
+                channel_id: 0,
+                sequence_number: 0,
+                job_id: 0,
+                nonce: hint as u32,
+                timestamp: job.timestamp + (hint >> 32),
+                version: job.version,
+            };
+            Some(dinero_miner_ux::fx::CandidateSample {
+                nonce: hint as u32,
+                hash: HeaderAssembly::hash(&job, &share),
+            })
+        });
+        fx.spawn_ticker(sampler, Arc::clone(&stop_flag));
+
+        fx.print_banner();
+        Emitter::new_fx(fx)
+    } else {
+        Emitter::new(args.json, human, reward_mode.as_str())
+    };
     emitter.spawn_ctrlc_summary_handler();
     emitter.emit_startup(&args, &pool, pinned.is_some());
 
@@ -476,6 +567,7 @@ async fn async_main() -> Result<()> {
             &gpu,
             Arc::clone(&generation),
             Arc::clone(&measured_mhs_x100),
+            Arc::clone(&sampler_state),
             &emitter,
         )
         .await
@@ -669,6 +761,7 @@ async fn run_session(
     gpu: &Arc<dyn GpuBackend>,
     generation: Arc<AtomicU64>,
     measured_mhs_x100: Arc<AtomicU64>,
+    sampler_state: Arc<SamplerState>,
     emitter: &Emitter,
 ) -> Result<u64> {
     // `connect(&str)` resolves the hostname per attempt, so a pool DNS
@@ -838,6 +931,7 @@ async fn run_session(
                                     args.batch_size,
                                     Arc::clone(&generation),
                                     Arc::clone(&measured_mhs_x100),
+                                    Arc::clone(&sampler_state),
                                     share_tx.clone(),
                                     emitter,
                                 );
@@ -864,6 +958,7 @@ async fn run_session(
                             args.batch_size,
                             Arc::clone(&generation),
                             Arc::clone(&measured_mhs_x100),
+                            Arc::clone(&sampler_state),
                             share_tx.clone(),
                             emitter,
                         );
@@ -891,6 +986,7 @@ async fn run_session(
                                 args.batch_size,
                                 Arc::clone(&generation),
                                 Arc::clone(&measured_mhs_x100),
+                                Arc::clone(&sampler_state),
                                 share_tx.clone(),
                                 emitter,
                             );
@@ -1077,6 +1173,12 @@ async fn expect_channel_open<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// Job snapshot + live nonce position for the FX display sampler.
+struct SamplerState {
+    job: Mutex<Option<NewTemplateDinero>>,
+    nonce_hint: AtomicU64, // low 32 bits nonce; high 32 bits timestamp offset
+}
+
 #[derive(Debug)]
 struct FoundShare {
     generation: u64,
@@ -1108,6 +1210,7 @@ fn start_hashing_gpu(
     batch_size: u32,
     generation: Arc<AtomicU64>,
     measured_mhs_x100: Arc<AtomicU64>,
+    sampler_state: Arc<SamplerState>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: &Emitter,
 ) {
@@ -1213,6 +1316,7 @@ fn start_hashing_gpu(
         batch_size,
         generation,
         measured_mhs_x100,
+        sampler_state,
         share_tx,
         emitter.clone(),
     );
@@ -1226,6 +1330,7 @@ fn start_hashing_gpu_shared(
     batch_size: u32,
     generation: Arc<AtomicU64>,
     measured_mhs_x100: Arc<AtomicU64>,
+    sampler_state: Arc<SamplerState>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: &Emitter,
 ) {
@@ -1251,6 +1356,7 @@ fn start_hashing_gpu_shared(
         batch_size,
         generation,
         measured_mhs_x100,
+        sampler_state,
         share_tx,
         emitter.clone(),
     );
@@ -1265,6 +1371,7 @@ fn start_hashing_gpu_template(
     batch_size: u32,
     generation: Arc<AtomicU64>,
     measured_mhs_x100: Arc<AtomicU64>,
+    sampler_state: Arc<SamplerState>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: Emitter,
 ) {
@@ -1272,6 +1379,10 @@ fn start_hashing_gpu_template(
     // template advances the counter and makes all older work stale.
     let gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
     let block_target = nbits_to_target(tmpl.difficulty);
+
+    // Snapshot the job for the FX display's sampler. In non-FX modes this
+    // is a cheap, harmless write — nothing ever reads it back.
+    *sampler_state.job.lock().unwrap() = Some(tmpl.clone());
 
     let tmpl_initial_timestamp = tmpl.timestamp;
     let tmpl_version = tmpl.version;
@@ -1323,6 +1434,10 @@ fn start_hashing_gpu_template(
                 };
                 total_ms_since_emit += outcome.elapsed_ms;
                 hashes_since_emit += this_batch as u64;
+                sampler_state.nonce_hint.store(
+                    ((current_timestamp - tmpl_initial_timestamp) << 32) | nonce_start,
+                    Ordering::Relaxed,
+                );
                 if last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS {
                     let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
                     let dispatch_ms = total_ms_since_emit
@@ -1424,6 +1539,7 @@ enum OutputMode {
     Json,
     Plain,
     Human(Arc<Mutex<HumanState>>),
+    Fx(dinero_miner_ux::fx::FxScreen),
 }
 
 impl Emitter {
@@ -1436,6 +1552,15 @@ impl Emitter {
             OutputMode::Plain
         };
         Self { mode }
+    }
+
+    /// FX mode's `FxScreen` is constructed (and its ticker spawned) by the
+    /// caller in `async_main` before the reconnect loop — this just wraps
+    /// it as the emitter's routing target.
+    fn new_fx(fx: dinero_miner_ux::fx::FxScreen) -> Self {
+        Self {
+            mode: OutputMode::Fx(fx),
+        }
     }
 
     fn emit_startup(&self, args: &Args, pool: &str, server_pubkey_pinned: bool) {
@@ -1468,6 +1593,31 @@ impl Emitter {
                 println!("[{event}] {data}");
             }
             OutputMode::Human(state) => emit_human(state, event, data),
+            OutputMode::Fx(fx) => match event {
+                "gpu_ready" => {
+                    if let Some(b) = data.get("backend").and_then(|v| v.as_str()) {
+                        fx.set_backend(b);
+                    }
+                    fx.lifecycle(&lifecycle_line(event, data));
+                }
+                "hashrate" => { if let Some(mhs) = data.get("mhs").and_then(|v| v.as_f64()) { fx.on_hashrate(mhs); } }
+                "share_accepted" => fx.on_share_ok(data.get("accepted_count").and_then(|v| v.as_u64()).unwrap_or(1)),
+                "share_rejected" => fx.on_share_rejected(),
+                "window_status" => { if let Some(bps) = data.get("window_bps").and_then(|v| v.as_u64()) { fx.on_window(bps); } }
+                "new_job" => {
+                    // Solo templates carry the exact coinbase value for the DIN total.
+                    if let Some(una) = data.get("coinbase_value_una").and_then(|v| v.as_u64()) { fx.on_solo_job_value(una); }
+                    // deliberately NOT surfaced as a lifecycle line — job churn would
+                    // spam the permanent history; the feed itself shows the work.
+                }
+                "set_new_prev_hash" => { /* same: silent in FX mode */ }
+                "share_submitted" => {
+                    if data.get("meets_block_target").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        fx.on_block(data.get("hash").and_then(|v| v.as_str()).unwrap_or(""), &now_hms());
+                    }
+                }
+                _ => fx.lifecycle(&lifecycle_line(event, data)),
+            },
         }
     }
 
@@ -1489,6 +1639,10 @@ impl Emitter {
                 "hashrate",
                 &serde_json::json!({"mhs": mhs, "backend": backend}),
             ),
+            OutputMode::Fx(fx) => {
+                fx.set_backend(backend);
+                fx.on_hashrate(mhs);
+            }
             _ => println!(
                 "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"timestamp\":{},\"backend\":\"{}\"}}",
                 mhs, dispatch_ms, nonce_start, timestamp, backend,
@@ -1501,18 +1655,29 @@ impl Emitter {
     /// `session_end` line. No-op (process just dies on SIGINT as before) in
     /// JSON/plain mode, matching prior behavior exactly.
     fn spawn_ctrlc_summary_handler(&self) {
-        if let OutputMode::Human(state) = &self.mode {
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                if let Ok(st) = state.lock() {
-                    let elapsed = st.stats.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                    println!();
-                    println!("{}", Display::session_summary(&st.stats, elapsed));
-                    let _ = std::io::stdout().flush();
-                }
-                std::process::exit(0);
-            });
+        match &self.mode {
+            OutputMode::Human(state) => {
+                let state = Arc::clone(state);
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    if let Ok(st) = state.lock() {
+                        let elapsed = st.stats.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        println!();
+                        println!("{}", Display::session_summary(&st.stats, elapsed));
+                        let _ = std::io::stdout().flush();
+                    }
+                    std::process::exit(0);
+                });
+            }
+            OutputMode::Fx(fx) => {
+                let fx = fx.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    fx.print_summary();
+                    std::process::exit(0);
+                });
+            }
+            OutputMode::Json | OutputMode::Plain => {}
         }
     }
 }
@@ -1764,5 +1929,22 @@ mod reward_mode_tests {
         assert!(validate_reward_payout(RewardModeChoice::Shared, &p2tr).is_ok());
         assert!(validate_reward_payout(RewardModeChoice::Shared, &[0x52, 0x20]).is_err());
         assert!(validate_reward_payout(RewardModeChoice::Solo, &[0x52, 0x20]).is_ok());
+    }
+
+    #[test]
+    fn plain_flag_parses() {
+        assert!(Args::try_parse_from(["m", "--plain"]).unwrap().plain);
+        assert!(!Args::try_parse_from(["m"]).unwrap().plain);
+    }
+
+    #[test]
+    fn mode_selection_rules() {
+        // pure helper: (json, tty, plain, term_ok) -> Mode
+        use ModeChoice::*;
+        assert_eq!(choose_mode(true, true, false, true), Json);
+        assert_eq!(choose_mode(false, false, false, true), PlainMachine);
+        assert_eq!(choose_mode(false, true, true, true), HumanV1);
+        assert_eq!(choose_mode(false, true, false, false), HumanV1);
+        assert_eq!(choose_mode(false, true, false, true), Fx);
     }
 }
