@@ -31,15 +31,30 @@ it's hacking") while staying honest and cheap.
     Share submissions render bright green (`▓ SHARE ✓`), rejects red,
     stale-job notices yellow. Lines scroll within the window only.
   - **Status line** below the feed, bold:
-    `⛏ 4.19 MH/s │ 14 ok │ 0 rejected │ ▂▃▅▇ │ up 3m12s` (the word is
-    spelled out — never abbreviated to "rej") — the sparkline
+    `⛏ 4.19 MH/s │ 14 ok │ 0 rejected │ blocks 2 │ ≈87.3 DIN │ ▂▃▅▇ │ up 3m12s`
+    (the word is spelled out — never abbreviated to "rej"; the DIN
+    token appears once the first block is found) — the sparkline
     renders the most recent 12 hashrate samples, one ▁▂▃▄▅▆▇█ cell each,
     scaled to the min/max of those samples. GPU miner appends the
     backend name (`· metal`).
-- **Block found:** feed freezes, a gold full-width flash animation plays
-  (~5 frames over ~1 s), then the permanent gold block banner (v1 format,
-  colored) prints ABOVE the live region so it survives in scrollback.
-  The live region resumes below.
+- **Block found (owner calls 2026-08-15):** feed freezes and the gold
+  full-width flash animation (~5 frames over ~1 s) plays on a line BELOW
+  the status line — at the bottom, where the eye already is. There are
+  NO permanent per-block banners (10–15 finds must never cover the
+  screen): instead the live region carries a one-line **last-block
+  panel** (gold, updated in place): `■ block #7 · 14:22:07 ·
+  000000574714…7fd3`, and the status line carries the **session DIN
+  total**. The dynamic region is always the entire main view;
+  scrollback stays limited to banner, lifecycle lines, and the exit
+  summary.
+- **Session DIN total:** solo blocks add the template's exact coinbase
+  value; shared blocks add an ESTIMATE — block subsidy × the miner's
+  PPLNS window share (`window_bps`) at find time — and the total is
+  prefixed `≈` whenever any estimated component is included. The FX
+  layer learns `coinbase_value_una` from solo `new_job` events and
+  `window_bps` from `window_status` events; una→DIN conversion uses the
+  chain's coin constant (verify against dinero-v8 at implementation).
+  The exit summary includes the same total.
 - **Ctrl-C:** clears the live region, prints the session summary
   (existing v1 renderer, colored).
 
