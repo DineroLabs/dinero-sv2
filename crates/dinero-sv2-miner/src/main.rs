@@ -357,6 +357,7 @@ async fn async_main() -> Result<()> {
                             "blocks_found": blocks_found,
                         }),
                     );
+                    emitter.print_fx_summary();
                     return Ok(());
                 }
                 emitter.emit(
@@ -373,11 +374,13 @@ async fn async_main() -> Result<()> {
                     }),
                 );
                 if args.reconnect_secs == 0 {
+                    emitter.print_fx_summary();
                     return Err(err);
                 }
             }
         }
         if args.reconnect_secs == 0 {
+            emitter.print_fx_summary();
             return Ok(());
         }
         emitter.emit(
@@ -1359,6 +1362,18 @@ impl Emitter {
                 }
                 _ => fx.lifecycle(&lifecycle_line(event, data)),
             },
+        }
+    }
+
+    /// FX mode's non-interactive exits (max-blocks reached, no-reconnect
+    /// clean close, no-reconnect fatal error) call this before returning
+    /// from `async_main`'s reconnect loop so the painted region is cleared
+    /// and a summary line lands instead of gluing to the shell prompt —
+    /// the same cleanup Ctrl-C already gets via `print_summary`. No-op in
+    /// Json/Plain/Human mode, matching prior behavior exactly.
+    fn print_fx_summary(&self) {
+        if let OutputMode::Fx(fx) = &self.mode {
+            fx.print_summary();
         }
     }
 

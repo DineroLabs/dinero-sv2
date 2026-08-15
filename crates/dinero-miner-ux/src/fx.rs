@@ -235,7 +235,11 @@ impl FxScreen {
         Self::write_flush(&mut inner, &out);
     }
 
-    /// clear region, v1 session_summary.
+    /// clear region, v1 session_summary + FX's session DIN total (spec:
+    /// "the exit summary includes the same total" as the status line),
+    /// painted BOLD when colors are on. v1 `Display::session_summary`
+    /// itself is untouched — the DIN segment is appended here so the
+    /// --plain/v1 output stays byte-stable.
     pub fn print_summary(&self) {
         let mut inner = self.inner.lock().unwrap();
         let mut out = inner.window.clear();
@@ -245,7 +249,14 @@ impl FxScreen {
             .started
             .map(|s| s.elapsed().as_secs())
             .unwrap_or(0);
-        out.push_str(&Display::session_summary(&inner.window.stats, elapsed));
+        let colors = inner.cfg.colors;
+        let mut line = Display::session_summary(&inner.window.stats, elapsed);
+        if inner.window.stats.blocks > 0 {
+            let din_total = inner.window.session_din_una as f64 / display::UNA_PER_DIN as f64;
+            let din_prefix = if inner.window.din_estimated { "≈" } else { "" };
+            line.push_str(&format!(" | {}{:.2} DIN", din_prefix, din_total));
+        }
+        out.push_str(&theme::paint(theme::BOLD, &line, colors));
         out.push('\n');
         Self::write_flush(&mut inner, &out);
     }
@@ -361,6 +372,35 @@ mod tests {
         let plain = crate::theme::strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
         assert!(plain.contains("3 ok") && plain.contains("1 rejected"));
         assert!(plain.contains("SHARE ✓") && plain.contains("✗ rejected"));
+    }
+
+    #[test]
+    fn print_summary_carries_din_total_colored_bold() {
+        let (fx, buf) = screen_with_buffer();
+        fx.on_window(4500); // 45% PPLNS window
+        fx.on_block("000000574714975b", "14:22:07");
+        buf.lock().unwrap().clear();
+        fx.print_summary();
+        let raw = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // colors:false in screen_with_buffer() — no SGR color codes, even
+        // though clear() still emits cursor-movement CSI sequences.
+        assert!(
+            !raw.contains(theme::BOLD) && !raw.contains(theme::RESET),
+            "colors:false — no BOLD/RESET SGR in summary"
+        );
+        let plain = crate::theme::strip_ansi(&raw);
+        assert!(
+            plain.contains("≈45.00 DIN"),
+            "exit summary carries the session DIN total: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn print_summary_omits_din_when_no_blocks() {
+        let (fx, buf) = screen_with_buffer();
+        fx.print_summary();
+        let plain = crate::theme::strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+        assert!(!plain.contains("DIN"), "no blocks found -> no DIN total in summary: {plain:?}");
     }
 
     #[test]
