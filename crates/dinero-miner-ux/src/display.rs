@@ -1,4 +1,17 @@
 use std::time::Instant;
+use std::collections::VecDeque;
+
+pub const FEED_HEIGHT: usize = 8;
+/// Region = 1 last-block panel line + FEED_HEIGHT feed rows + 1 status
+/// line = 10 lines, CONSTANT from the first frame (panel renders blank
+/// until the first find) so cursor math never varies. NO permanent
+/// per-block banners exist (owner call 2026-08-15): the panel updates
+/// in place and scrollback stays clean however many blocks land.
+pub const REGION_LINES: usize = FEED_HEIGHT + 2;
+
+/// Verified from dinero-v8/src/consensus/consensus.hpp:
+/// `static constexpr int64_t COIN = 100'000'000;  // 1 DIN = 100,000,000 units (8 decimals)`
+pub const UNA_PER_DIN: u64 = 100_000_000;
 
 /// DINERO block-letter banner + gold motto line. Ends with '\n'.
 pub fn banner(colors: bool) -> String {
@@ -242,6 +255,136 @@ impl Display {
     }
 }
 
+pub struct FeedWindow {
+    pub stats: SessionStats,
+    pub backend: Option<String>,
+    pub last_block: Option<String>,
+    pub session_din_una: u64,
+    pub din_estimated: bool,
+    rows: VecDeque<String>,
+    rates: Vec<f64>,
+    painted: bool,
+}
+
+impl FeedWindow {
+    pub fn new() -> Self {
+        FeedWindow {
+            stats: SessionStats::default(),
+            backend: None,
+            last_block: None,
+            session_din_una: 0,
+            din_estimated: false,
+            rows: VecDeque::new(),
+            rates: Vec::new(),
+            painted: false,
+        }
+    }
+
+    pub fn push_row(&mut self, row: String) {
+        self.rows.push_back(row);
+        if self.rows.len() > FEED_HEIGHT {
+            self.rows.pop_front();
+        }
+    }
+
+    pub fn record_rate(&mut self, mhs: f64) {
+        self.stats.hashrate_hs = mhs * 1e6;
+        self.rates.push(mhs);
+        if self.rates.len() > 40 {
+            self.rates.remove(0);
+        }
+    }
+
+    pub fn record_block(&mut self, no: u64, hash: &str, local_time: &str, value_una: u64, estimated: bool) {
+        self.stats.blocks += 1;
+        self.session_din_una += value_una;
+        if estimated {
+            self.din_estimated = true;
+        }
+        // Panel format: `  ■ block #<n> · <local_time> · <hash16>…`
+        self.last_block = Some(format!("  ■ block #{} · {} · {}", no, local_time, hash));
+    }
+
+    pub fn status_line_fx(&self, colors: bool) -> String {
+        let hashrate_str = Display::fmt_hashrate(self.stats.hashrate_hs);
+        let sparkline_str = sparkline(&self.rates);
+
+        // Format uptime
+        let uptime_str = if let Some(started) = self.stats.started {
+            let elapsed_secs = started.elapsed().as_secs();
+            Display::format_duration(elapsed_secs)
+        } else {
+            "0s".to_string()
+        };
+
+        // Build status line with DIN token only if blocks > 0
+        let mut status = format!(
+            "  ⛏ {} │ {} ok │ {} rejected │ blocks {}",
+            hashrate_str, self.stats.ok, self.stats.rej, self.stats.blocks
+        );
+
+        if self.stats.blocks > 0 {
+            let din_total = self.session_din_una as f64 / UNA_PER_DIN as f64;
+            let din_prefix = if self.din_estimated { "≈" } else { "" };
+            status.push_str(&format!(" │ {}{:.2} DIN", din_prefix, din_total));
+        }
+
+        status.push_str(&format!(" │ {} │ up {}", sparkline_str, uptime_str));
+
+        if let Some(ref backend) = self.backend {
+            status.push_str(&format!("[ · {}]", backend));
+        }
+
+        crate::theme::paint(crate::theme::BRIGHT_GREEN, &status, colors)
+    }
+
+    pub fn repaint(&mut self, _width: usize, colors: bool) -> String {
+        let mut output = String::new();
+
+        // Non-first repaint: cursor up 10 lines to column 1
+        if self.painted {
+            output.push_str("\x1b[10F");
+        }
+
+        // Panel line (blank if no last_block yet)
+        if let Some(ref block) = self.last_block {
+            output.push_str(&crate::theme::paint(crate::theme::GOLD, block, colors));
+        } else {
+            output.push(' ');
+        }
+        output.push_str("\x1b[K\n");
+
+        // Feed rows: pad to FEED_HEIGHT with blanks
+        for i in 0..FEED_HEIGHT {
+            if i < self.rows.len() {
+                output.push_str(&self.rows[i]);
+            }
+            output.push_str("\x1b[K\n");
+        }
+
+        // Status line (no trailing newline)
+        output.push_str(&self.status_line_fx(colors));
+        output.push_str("\x1b[K");
+
+        self.painted = true;
+        output
+    }
+
+    pub fn clear(&mut self) -> String {
+        if !self.painted {
+            return String::new();
+        }
+
+        let mut output = String::from("\r\x1b[K");
+        for _ in 0..9 {
+            output.push_str("\x1b[1A\x1b[K");
+        }
+
+        self.painted = false;
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +491,52 @@ mod tests {
         assert!(f[4].contains("B L O C K   F O U N D") && f[4].contains("#3"));
         let colored = celebration_frames(80, 1, true);
         assert!(colored[0].contains("\x1b[1;33m"));
+    }
+
+    #[test]
+    fn feed_window_repaint_and_clear_cursor_math() {
+        let mut w = FeedWindow::new();
+        w.push_row("  row-a".into());
+        w.record_rate(4.19);
+        let first = w.repaint(80, false);
+        assert!(!first.starts_with("\x1b["), "first paint has no cursor-up");
+        assert_eq!(first.matches('\n').count(), REGION_LINES - 1,
+            "panel + 8 rows + status = 10 lines from the very first frame");
+        assert!(first.contains("  row-a\x1b[K"));
+        assert!(!first.ends_with('\n'));
+        let second = w.repaint(80, false);
+        assert!(second.starts_with("\x1b[10F"), "later paints move up 10 lines");
+        let clear = w.clear();
+        assert_eq!(clear, format!("\r\x1b[K{}", "\x1b[1A\x1b[K".repeat(9)));
+        assert!(!w.clear().contains('\x1b'), "cleared window clears to nothing");
+    }
+    #[test]
+    fn status_line_fx_wording_and_din_total() {
+        let mut w = FeedWindow::new();
+        w.stats.ok = 14; w.stats.rej = 2;
+        w.record_rate(4.19);
+        let s = crate::theme::strip_ansi(&w.status_line_fx(true));
+        assert!(s.contains("4.19 MH/s") && s.contains("14 ok"));
+        assert!(s.contains("2 rejected"), "spec: never 'rej'");
+        assert!(!s.contains(" rej "), "abbreviation banned");
+        assert!(s.contains('│') && s.contains('▁'));
+        assert!(!s.contains("DIN"), "no DIN token before the first block");
+        w.backend = Some("metal".into());
+        assert!(crate::theme::strip_ansi(&w.status_line_fx(false)).contains("· metal"));
+    }
+    #[test]
+    fn last_block_panel_and_session_din() {
+        let mut w = FeedWindow::new();
+        // solo: exact value (no ≈). 100 DIN = 100 × UNA_PER_DIN.
+        w.record_block(1, "000000574714975b", "14:22:07", 100 * UNA_PER_DIN, false);
+        let s = crate::theme::strip_ansi(&w.status_line_fx(false));
+        assert!(s.contains("blocks 1") && s.contains("100.00 DIN") && !s.contains('≈'));
+        let panel = crate::theme::strip_ansi(w.last_block.as_deref().unwrap());
+        assert!(panel.contains("■ block #1") && panel.contains("14:22:07") && panel.contains("000000574714975b"));
+        // shared: estimated 45% of 100 DIN → total flips to ≈
+        w.record_block(2, "0000003a861a070d", "15:01:44", 45 * UNA_PER_DIN, true);
+        let s2 = crate::theme::strip_ansi(&w.status_line_fx(false));
+        assert!(s2.contains("blocks 2") && s2.contains("≈145.00 DIN"));
+        assert!(crate::theme::strip_ansi(w.last_block.as_deref().unwrap()).contains("block #2"));
     }
 }
