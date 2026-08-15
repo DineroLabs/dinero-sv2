@@ -22,14 +22,17 @@ it's hacking") while staying honest and cheap.
 
 ## What the screen does
 
-- **Startup:** DINERO block-letter ASCII banner (color), then the normal
-  lifecycle lines (`connected · pool … · shared rewards · N threads`).
+- **Startup:** DINERO block-letter ASCII banner (color) with the motto
+  centered beneath it in gold — `· Real Money For Free People ·` — then
+  the normal lifecycle lines
+  (`connected · pool … · shared rewards · N threads`).
 - **Live region** (repainted in place):
   - ~8-line **hash feed**: `0x<nonce>… <hash>… ✗` lines in dim green.
     Share submissions render bright green (`▓ SHARE ✓`), rejects red,
     stale-job notices yellow. Lines scroll within the window only.
   - **Status line** below the feed, bold:
-    `⛏ 4.19 MH/s │ 14 ok │ 0 rej │ ▂▃▅▇ │ up 3m12s` — the sparkline
+    `⛏ 4.19 MH/s │ 14 ok │ 0 rejected │ ▂▃▅▇ │ up 3m12s` (the word is
+    spelled out — never abbreviated to "rej") — the sparkline
     renders the most recent 12 hashrate samples, one ▁▂▃▄▅▆▇█ cell each,
     scaled to the min/max of those samples. GPU miner appends the
     backend name (`· metal`).
