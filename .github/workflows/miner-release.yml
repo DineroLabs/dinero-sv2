@@ -29,6 +29,12 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # `release` environment carries the Azure OIDC federation for Windows
+    # code signing (subject repo:DineroLabs/dinero-sv2:environment:release).
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +85,29 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/dinero-sv2-miner${{ matrix.ext }}" \
              "dist/dinero-sv2-miner-${{ matrix.target }}${{ matrix.ext }}"
+
+      # Windows Authenticode signing via Azure Artifact Signing (Trusted
+      # Signing). Gated on the WINDOWS_SIGNING_READY repo variable so tags
+      # cut before the identity validation clears still release unsigned
+      # rather than failing. Flip the variable to 'true' once the
+      # certificate profile exists.
+      - name: Azure login (OIDC)
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' && vars.WINDOWS_SIGNING_READY == 'true' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binary
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' && vars.WINDOWS_SIGNING_READY == 'true' }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
 
       - uses: actions/upload-artifact@v4
         with:
