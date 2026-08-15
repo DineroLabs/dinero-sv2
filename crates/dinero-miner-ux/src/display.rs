@@ -365,9 +365,23 @@ impl FeedWindow {
             output.push_str("\x1b[9F\x1b[J");
         }
 
-        // Panel line (blank if no last_block yet)
+        // Panel line (blank if no last_block yet). `last_block` carries the
+        // full 64-hex-char block hash (see record_block), so it must be
+        // truncated to width the same way feed_line/status_line_fx are —
+        // untruncated it's ~89 chars, which wraps on any terminal narrower
+        // than ~91 columns, defeating the fixed 10-physical-row region and
+        // the `\x1b[9F` cursor math above. `last_block` is stored as plain
+        // text (painted only here at repaint time), so truncate before
+        // painting — painting after truncation would count ANSI bytes
+        // toward the width budget.
         if let Some(ref block) = self.last_block {
-            output.push_str(&crate::theme::paint(crate::theme::GOLD, block, colors));
+            let truncated = if block.chars().count() > width {
+                let head: String = block.chars().take(width.saturating_sub(1)).collect();
+                format!("{}…", head)
+            } else {
+                block.clone()
+            };
+            output.push_str(&crate::theme::paint(crate::theme::GOLD, &truncated, colors));
         } else {
             output.push(' ');
         }
@@ -597,5 +611,32 @@ mod tests {
         let s2 = crate::theme::strip_ansi(&w.status_line_fx(200, false));
         assert!(s2.contains("blocks 2") && s2.contains("≈145.00 DIN"));
         assert!(crate::theme::strip_ansi(w.last_block.as_deref().unwrap()).contains("0000003a861a070d…"), "hash must have trailing ellipsis");
+    }
+    #[test]
+    fn repaint_region_lines_all_fit_within_width() {
+        // Pins the whole-region invariant: every physical line the fixed
+        // 10-row region emits must fit within `width`, or the region wraps
+        // on a real terminal and desyncs the `\x1b[9F` cursor-up math. Uses
+        // a REAL 64-hex-char block hash (what `hex::encode(found.hash)`
+        // actually produces in both miners), not the short test hashes
+        // used elsewhere in this file — the panel line was previously
+        // never truncated and ran ~89 chars with a real hash, wrapping on
+        // any terminal narrower than ~91 columns.
+        let mut w = FeedWindow::new();
+        w.push_row(feed_line(FeedKind::Share, 0x1234, &[0xabu8; 32], 80, false));
+        w.record_rate(4.19);
+        let real_hash = "0000005144829cc92581498e5f3d139cb0eddd556df74ee41cea3aea74e6e200";
+        assert_eq!(real_hash.len(), 64, "sanity: this is a real block-hash length");
+        w.record_block(1, real_hash, "05:38:41", 100 * UNA_PER_DIN, false);
+        let width = 80;
+        let out = w.repaint(width, false);
+        for line in out.split('\n') {
+            let stripped = crate::theme::strip_ansi(line);
+            assert!(
+                stripped.chars().count() <= width,
+                "physical line exceeds width {width}: {} chars: {stripped:?}",
+                stripped.chars().count()
+            );
+        }
     }
 }
