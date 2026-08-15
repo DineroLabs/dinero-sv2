@@ -305,7 +305,7 @@ impl FeedWindow {
         self.last_block = Some(format!("  ■ block #{} · {} · {}…", no, local_time, hash));
     }
 
-    pub fn status_line_fx(&self, colors: bool) -> String {
+    pub fn status_line_fx(&self, width: usize, colors: bool) -> String {
         let hashrate_str = Display::fmt_hashrate(self.stats.hashrate_hs);
         let sparkline_str = sparkline(&self.rates);
 
@@ -332,13 +332,24 @@ impl FeedWindow {
         status.push_str(&format!(" │ {} │ up {}", sparkline_str, uptime_str));
 
         if let Some(ref backend) = self.backend {
-            status.push_str(&format!("[ · {}]", backend));
+            status.push_str(&format!(" · {}", backend));
         }
+
+        // Truncate to width, same shape as feed_line: the status line shares
+        // the fixed 10-line cursor-up-N region with the feed rows, so any
+        // line wider than the real terminal wraps onto an extra screen row
+        // and desyncs the `\x1b[NF` cursor math on the next repaint.
+        let status = if status.chars().count() > width {
+            let truncated: String = status.chars().take(width.saturating_sub(1)).collect();
+            format!("{}…", truncated)
+        } else {
+            status
+        };
 
         crate::theme::paint(crate::theme::BRIGHT_GREEN, &status, colors)
     }
 
-    pub fn repaint(&mut self, _width: usize, colors: bool) -> String {
+    pub fn repaint(&mut self, width: usize, colors: bool) -> String {
         let mut output = String::new();
 
         // Non-first repaint: cursor up 10 lines to column 1
@@ -363,7 +374,7 @@ impl FeedWindow {
         }
 
         // Status line (no trailing newline)
-        output.push_str(&self.status_line_fx(colors));
+        output.push_str(&self.status_line_fx(width, colors));
         output.push_str("\x1b[K");
 
         self.painted = true;
@@ -515,28 +526,51 @@ mod tests {
         let mut w = FeedWindow::new();
         w.stats.ok = 14; w.stats.rej = 2;
         w.record_rate(4.19);
-        let s = crate::theme::strip_ansi(&w.status_line_fx(true));
+        let s = crate::theme::strip_ansi(&w.status_line_fx(200, true));
         assert!(s.contains("4.19 MH/s") && s.contains("14 ok"));
         assert!(s.contains("2 rejected"), "spec: never 'rej'");
         assert!(!s.contains(" rej "), "abbreviation banned");
         assert!(s.contains('│') && s.contains('▁'));
         assert!(!s.contains("DIN"), "no DIN token before the first block");
         w.backend = Some("metal".into());
-        assert!(crate::theme::strip_ansi(&w.status_line_fx(false)).contains("· metal"));
+        let with_backend = crate::theme::strip_ansi(&w.status_line_fx(200, false));
+        assert!(with_backend.contains("· metal"));
+        assert!(
+            !with_backend.contains('['),
+            "backend suffix must not be wrapped in literal brackets: {with_backend:?}"
+        );
+    }
+    #[test]
+    fn status_line_fx_truncates_to_width() {
+        // Same failure mode as feed rows: the status line shares the fixed
+        // 10-line cursor-up-N region, so an untruncated line wider than the
+        // real terminal wraps onto an extra row and desyncs the repaint math
+        // on a genuinely narrow (e.g. COLUMNS=60) terminal.
+        let mut w = FeedWindow::new();
+        w.stats.ok = 14; w.stats.rej = 2;
+        w.record_rate(4.19);
+        w.backend = Some("metal".into());
+        let s = crate::theme::strip_ansi(&w.status_line_fx(60, false));
+        assert!(
+            s.chars().count() <= 60,
+            "status line must not exceed the configured width: {} chars: {s:?}",
+            s.chars().count()
+        );
+        assert!(s.ends_with('…'), "truncated status line must carry an ellipsis: {s:?}");
     }
     #[test]
     fn last_block_panel_and_session_din() {
         let mut w = FeedWindow::new();
         // solo: exact value (no ≈). 100 DIN = 100 × UNA_PER_DIN.
         w.record_block(1, "000000574714975b", "14:22:07", 100 * UNA_PER_DIN, false);
-        let s = crate::theme::strip_ansi(&w.status_line_fx(false));
+        let s = crate::theme::strip_ansi(&w.status_line_fx(200, false));
         assert!(s.contains("blocks 1") && s.contains("100.00 DIN") && !s.contains('≈'));
         let panel = crate::theme::strip_ansi(w.last_block.as_deref().unwrap());
         assert!(panel.contains("■ block #1") && panel.contains("14:22:07"));
         assert!(panel.contains("000000574714975b…"), "hash must have trailing ellipsis");
         // shared: estimated 45% of 100 DIN → total flips to ≈
         w.record_block(2, "0000003a861a070d", "15:01:44", 45 * UNA_PER_DIN, true);
-        let s2 = crate::theme::strip_ansi(&w.status_line_fx(false));
+        let s2 = crate::theme::strip_ansi(&w.status_line_fx(200, false));
         assert!(s2.contains("blocks 2") && s2.contains("≈145.00 DIN"));
         assert!(crate::theme::strip_ansi(w.last_block.as_deref().unwrap()).contains("0000003a861a070d…"), "hash must have trailing ellipsis");
     }
