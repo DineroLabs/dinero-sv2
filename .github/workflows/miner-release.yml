@@ -1,6 +1,8 @@
 # Miner release pipeline — fires on tags `miner-vX.Y.Z` (kept clear of
-# pool/protocol tags). Builds the CPU miner for all four public targets,
-# assembles SHA256SUMS, and publishes a GitHub release with every asset.
+# pool/protocol tags). Builds the CPU miner for all five public targets
+# (incl. BOTH macOS architectures — the Intel slice cross-compiles from
+# the arm64 runner), assembles SHA256SUMS, and publishes a GitHub
+# release with every asset.
 #
 # v0.1.0 scope (owner call 2026-08-14): CPU miner only, shared-mode-first
 # distribution. The GPU miner (dinero-sv2-gpu-miner) is code-complete with
@@ -8,7 +10,7 @@
 # are ready to ship.
 #
 # macOS signing/notarization runs LOCALLY, not in CI: after the workflow
-# publishes, sign the darwin asset on the Mac
+# publishes, sign BOTH darwin assets (aarch64 AND x86_64) on the Mac
 #   codesign --force --options runtime \
 #     --sign 'Developer ID Application: DineroLabs LLC (JXJS6ZA5FJ)' dinero-sv2-miner-aarch64-apple-darwin
 #   xcrun notarytool submit ... --keychain-profile dinero-notarytool --wait
@@ -32,6 +34,9 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
+            os: macos-14
+            ext: ""
+          - target: x86_64-apple-darwin
             os: macos-14
             ext: ""
           - target: x86_64-unknown-linux-gnu
