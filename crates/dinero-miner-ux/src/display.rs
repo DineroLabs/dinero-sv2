@@ -302,7 +302,7 @@ impl FeedWindow {
             self.din_estimated = true;
         }
         // Panel format: `  ■ block #<n> · <local_time> · <hash16>…`
-        self.last_block = Some(format!("  ■ block #{} · {} · {}", no, local_time, hash));
+        self.last_block = Some(format!("  ■ block #{} · {} · {}…", no, local_time, hash));
     }
 
     pub fn status_line_fx(&self, colors: bool) -> String {
@@ -532,11 +532,12 @@ mod tests {
         let s = crate::theme::strip_ansi(&w.status_line_fx(false));
         assert!(s.contains("blocks 1") && s.contains("100.00 DIN") && !s.contains('≈'));
         let panel = crate::theme::strip_ansi(w.last_block.as_deref().unwrap());
-        assert!(panel.contains("■ block #1") && panel.contains("14:22:07") && panel.contains("000000574714975b"));
+        assert!(panel.contains("■ block #1") && panel.contains("14:22:07"));
+        assert!(panel.contains("000000574714975b…"), "hash must have trailing ellipsis");
         // shared: estimated 45% of 100 DIN → total flips to ≈
         w.record_block(2, "0000003a861a070d", "15:01:44", 45 * UNA_PER_DIN, true);
         let s2 = crate::theme::strip_ansi(&w.status_line_fx(false));
         assert!(s2.contains("blocks 2") && s2.contains("≈145.00 DIN"));
-        assert!(crate::theme::strip_ansi(w.last_block.as_deref().unwrap()).contains("block #2"));
+        assert!(crate::theme::strip_ansi(w.last_block.as_deref().unwrap()).contains("0000003a861a070d…"), "hash must have trailing ellipsis");
     }
 }
