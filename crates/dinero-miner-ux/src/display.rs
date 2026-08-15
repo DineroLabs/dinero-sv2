@@ -76,6 +76,80 @@ pub fn sparkline(samples: &[f64]) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum FeedKind {
+    Candidate,
+    Share,
+    Rejected,
+    Stale,
+}
+
+/// One feed row: `  0x<nonce8>  <hash-prefix>…  <suffix>`, truncated to
+/// `width` display chars (ANSI excluded) ending with `…` when needed.
+pub fn feed_line(kind: FeedKind, nonce: u32, hash: &[u8; 32], width: usize, colors: bool) -> String {
+    // Hash prefix: first 10 bytes = 20 hex chars
+    let hash_hex = format!("{:02x?}", &hash[..10])
+        .replace('[', "")
+        .replace(']', "")
+        .replace(", ", "")
+        .to_lowercase();
+
+    let suffix = match kind {
+        FeedKind::Candidate => "✗".to_string(),
+        FeedKind::Share => "▓ SHARE ✓ pool accepted".to_string(),
+        FeedKind::Rejected => "✗ rejected".to_string(),
+        FeedKind::Stale => "↻ stale job".to_string(),
+    };
+
+    // Build plain row: "  0x<nonce>  <hash>…  <suffix>"
+    let plain_row = format!("  0x{:08x}  {}…  {}", nonce, hash_hex, suffix);
+
+    // Truncate to width if needed
+    let truncated = if plain_row.chars().count() > width {
+        let truncated_str: String = plain_row.chars().take(width - 1).collect();
+        format!("{}…", truncated_str)
+    } else {
+        plain_row
+    };
+
+    // Paint the row based on kind
+    match kind {
+        FeedKind::Candidate => crate::theme::paint(crate::theme::DIM_GREEN, &truncated, colors),
+        FeedKind::Share => crate::theme::paint(crate::theme::BRIGHT_GREEN, &truncated, colors),
+        FeedKind::Rejected => crate::theme::paint(crate::theme::RED, &truncated, colors),
+        FeedKind::Stale => crate::theme::paint(crate::theme::YELLOW, &truncated, colors),
+    }
+}
+
+/// Gold flash frames: █×n, ▓×n, █×n, ▒×n, then "■■■  B L O C K   F O U N D   #<no>  ■■■".
+pub fn celebration_frames(width: usize, block_no: u64, colors: bool) -> Vec<String> {
+    let mut frames = Vec::new();
+
+    // Flash bar formula: "  " + ch.repeat(width.saturating_sub(24).min(56))
+    let bar_len = width.saturating_sub(24).min(56);
+    let bar = format!("  {}", "█".repeat(bar_len));
+
+    // Frame 1: █ characters
+    frames.push(crate::theme::paint(crate::theme::GOLD, &bar, colors));
+
+    // Frame 2: ▓ characters
+    let bar_mid = format!("  {}", "▓".repeat(bar_len));
+    frames.push(crate::theme::paint(crate::theme::GOLD, &bar_mid, colors));
+
+    // Frame 3: █ characters again
+    frames.push(crate::theme::paint(crate::theme::GOLD, &bar, colors));
+
+    // Frame 4: ▒ characters
+    let bar_light = format!("  {}", "▒".repeat(bar_len));
+    frames.push(crate::theme::paint(crate::theme::GOLD, &bar_light, colors));
+
+    // Frame 5: Message
+    let message = format!("■■■  B L O C K   F O U N D   #{}  ■■■", block_no);
+    frames.push(crate::theme::paint(crate::theme::GOLD, &message, colors));
+
+    frames
+}
+
 #[derive(Default)]
 pub struct SessionStats {
     pub hashrate_hs: f64,
@@ -246,5 +320,33 @@ mod tests {
         // more than 12 samples → only the last 12 render
         let many: Vec<f64> = (0..30).map(|i| i as f64).collect();
         assert_eq!(sparkline(&many).chars().count(), 12);
+    }
+
+    #[test]
+    fn feed_line_kinds_and_truncation() {
+        let h = [0u8; 32];
+        let cand = feed_line(FeedKind::Candidate, 0x8f31a2c4, &h, 100, false);
+        assert_eq!(cand, "  0x8f31a2c4  00000000000000000000…  ✗");
+        let share = feed_line(FeedKind::Share, 1, &h, 100, false);
+        assert!(share.ends_with("▓ SHARE ✓ pool accepted"));
+        assert!(feed_line(FeedKind::Rejected, 1, &h, 100, false).ends_with("✗ rejected"));
+        assert!(feed_line(FeedKind::Stale, 1, &h, 100, false).ends_with("↻ stale job"));
+        // width 60: full candidate row already fits (39 chars); width smaller
+        // than content truncates with … at exactly `width` chars
+        let narrow = feed_line(FeedKind::Share, 1, &h, 30, false);
+        assert_eq!(narrow.chars().count(), 30);
+        assert!(narrow.ends_with('…'));
+        // colored share row carries bright green and resets
+        let colored = feed_line(FeedKind::Share, 1, &h, 100, true);
+        assert!(colored.contains("\x1b[1;92m") && colored.ends_with("\x1b[0m"));
+    }
+    #[test]
+    fn celebration_shape() {
+        let f = celebration_frames(80, 3, false);
+        assert_eq!(f.len(), 5);
+        assert!(f[0].trim_start().chars().all(|c| c == '█'));
+        assert!(f[4].contains("B L O C K   F O U N D") && f[4].contains("#3"));
+        let colored = celebration_frames(80, 1, true);
+        assert!(colored[0].contains("\x1b[1;33m"));
     }
 }
