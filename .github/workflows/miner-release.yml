@@ -150,9 +150,19 @@ jobs:
             irm https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.ps1 | iex
             ```
 
-            Then run `dinero-miner`, paste your `din1p…` address, and you are
-            mining shared rewards — no node, no flags. Verify downloads
-            against `SHA256SUMS`.
+            Then start shared CPU mining with an explicit reward address:
+
+            ```sh
+            cd "$HOME/.local/bin" && ./dinero-miner --address "YOUR_DIN1_ADDRESS" --reward-mode shared --threads 2
+            ```
+
+            The interactive dashboard keeps Dinero pinned at the top, displays
+            the complete reward address, and devotes 31 rows to full 256-bit
+            candidate hashes. It also shows Noise NX security, pool/channel
+            state, accepted and rejected shares, session work, reconnect health,
+            and a timestamped network feed. `Ctrl-C` restores the original shell.
+            No node or chain sync is required. Verify downloads against
+            `SHA256SUMS`.
 
             **Behavior change:** an unspecified `--reward-mode` now resolves
             to `shared` (previously `solo`). Pass `--reward-mode solo` to

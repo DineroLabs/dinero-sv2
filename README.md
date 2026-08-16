@@ -11,7 +11,8 @@ future pool operators, TP processes running beside `dinerod`, tests.
 
 ## Mine in one minute
 
-Install with one pasted command, paste your Dinero address, mine.
+Install with one pasted command, then launch directly with your Dinero reward
+address. No node, configuration file, or chain sync is required.
 
 **macOS / Linux / Chromebook:**
 
@@ -25,19 +26,31 @@ curl -fsSL https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/
 irm https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.ps1 | iex
 ```
 
-Then:
+Then start shared CPU mining on macOS or Linux (replace the placeholder with
+your own complete `din1p…` reward address):
 
+```sh
+cd "$HOME/.local/bin" && ./dinero-miner --address "YOUR_DIN1_ADDRESS" --reward-mode shared --threads 2
 ```
-$ dinero-miner
-  paste your Dinero address (din1p…): <paste> ⏎
-  ✓ valid — saved for next time
-  connected · pool pool.dinerolabs.org:4444 · shared rewards · 7 threads
-  ⛏  2.09 MH/s  14 ok  0 rej  blocks 1
-  ■ block found  #1  14:22:07
-    hash   000000574714…7fd3b995
-    nonce  0x014b216a
-    tries  21,700,970
+
+On Windows PowerShell:
+
+```powershell
+cd "$env:LOCALAPPDATA\DineroMiner\bin"; .\dinero-miner.exe --address "YOUR_DIN1_ADDRESS" --reward-mode shared --threads 2
 ```
+
+`--threads 2` uses two CPU threads; choose a different positive number for
+more or less CPU usage. The miner validates and saves the address, connects to
+`pool.dinerolabs.org:4444`, and opens a dedicated full-screen terminal with:
+
+- a pinned Dinero header and complete reward address;
+- the Noise NX security, channel, worker, target, and uptime state;
+- 31 rolling rows of real nonces and complete 256-bit candidate hashes;
+- accepted/rejected share telemetry, session work, and reconnect health; and
+- a timestamped network feed. `Ctrl-C` restores the original shell screen.
+
+Running `dinero-miner` without `--address` remains supported and prompts for a
+reward address interactively.
 
 No node in either reward mode: the pool's node serves templates.
 `shared` = PPLNS split; `solo` = miner-owned coinbase via the pool
@@ -57,7 +70,7 @@ same Linux one-liner.
 > `--reward-mode solo` explicitly to keep miner-owned all-or-nothing
 > coinbases.
 
-The first release ships the CPU miner (`dinero-miner`). The GPU worker
+Current public releases ship the CPU miner (`dinero-miner`). The GPU worker
 (`dinero-sv2-gpu-miner`, Metal/OpenCL) has the same interactive UX and
 builds from source today; prebuilt GPU release binaries come later.
 
