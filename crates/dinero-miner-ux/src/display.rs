@@ -1,36 +1,77 @@
 use std::time::Instant;
 use std::collections::VecDeque;
 
-pub const FEED_HEIGHT: usize = 8;
-/// Region = 1 last-block panel line + FEED_HEIGHT feed rows + 1 status
-/// line = 10 lines, CONSTANT from the first frame (panel renders blank
-/// until the first find) so cursor math never varies. NO permanent
-/// per-block banners exist (owner call 2026-08-15): the panel updates
-/// in place and scrollback stays clean however many blocks land.
-pub const REGION_LINES: usize = FEED_HEIGHT + 2;
+/// The hash engine is the main visual attraction: keep a full 31-row rolling
+/// window of real nonce/hash candidates at all times.
+pub const FEED_HEIGHT: usize = 31;
+pub const EVENT_HEIGHT: usize = 4;
+/// Fixed dashboard below the permanent four-line logo. Titles and blank
+/// placeholders are present from frame one so no live update can change the
+/// physical height, wrap upward, or erase the DINERO header.
+pub const REGION_LINES: usize = 1 + 4 + 1 + FEED_HEIGHT + 1 + 4 + 1 + EVENT_HEIGHT + 1;
 
 /// Verified from dinero-v8/src/consensus/consensus.hpp:
 /// `static constexpr int64_t COIN = 100'000'000;  // 1 DIN = 100,000,000 units (8 decimals)`
 pub const UNA_PER_DIN: u64 = 100_000_000;
 
-/// DINERO block-letter banner + gold motto line. Ends with '\n'.
+fn fit_plain(line: &str, width: usize) -> String {
+    if line.chars().count() > width {
+        let head: String = line.chars().take(width.saturating_sub(1)).collect();
+        format!("{}…", head)
+    } else {
+        line.to_string()
+    }
+}
+
+fn box_row(content: &str, width: usize) -> String {
+    let inner = width.saturating_sub(2);
+    let fitted = fit_plain(content, inner);
+    format!("│{fitted:<inner$}│")
+}
+
+fn box_split(left: &str, right: &str, width: usize) -> String {
+    let inner = width.saturating_sub(3);
+    let left_width = inner / 2;
+    let right_width = inner - left_width;
+    let left = fit_plain(left, left_width);
+    let right = fit_plain(right, right_width);
+    format!("│{left:<left_width$}│{right:<right_width$}│")
+}
+
+fn box_rule(title: &str, width: usize) -> String {
+    let prefix = format!("├─ {title} ");
+    let fill = "─".repeat(width.saturating_sub(prefix.chars().count() + 1));
+    format!("{prefix}{fill}┤")
+}
+
+fn clock_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 86_400)
+        .unwrap_or(0);
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// Compact, permanent DINERO banner + gold motto line. Three art rows are
+/// half the height of the original six-row banner, leaving room for telemetry.
 pub fn banner(colors: bool) -> String {
     let art_lines = [
-        "  ██████╗ ██╗███╗   ██╗███████╗██████╗  ██████╗",
-        "  ██╔══██╗██║████╗  ██║██╔════╝██╔══██╗██╔═══██╗",
-        "  ██║  ██║██║██╔██╗ ██║█████╗  ██████╔╝██║   ██║",
-        "  ██║  ██║██║██║╚██╗██║██╔══╝  ██╔══██╗██║   ██║",
-        "  ██████╔╝██║██║ ╚████║███████╗██║  ██║╚██████╔╝",
-        "  ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝",
+        "█▀▄  █  █▄ █  █▀▀  █▀▄  █▀█",
+        "█  █ █  █ ▀█  █▀   █▀▄  █ █",
+        "█▄▀  █  █  █  █▄▄  █  █ █▄█",
     ];
+    let width = crate::theme::term_width();
 
     let mut result = String::new();
     for line in &art_lines {
+        let padding = " ".repeat(width.saturating_sub(line.chars().count()) / 2);
+        result.push_str(&padding);
         result.push_str(&crate::theme::paint(crate::theme::BRIGHT_GREEN, line, colors));
         result.push('\n');
     }
 
-    let motto = "        · Real Money For Free People ·";
+    let motto = "· Real Money For Free People ·";
+    result.push_str(&" ".repeat(width.saturating_sub(motto.chars().count()) / 2));
     result.push_str(&crate::theme::paint(crate::theme::GOLD, motto, colors));
     result.push('\n');
 
@@ -97,25 +138,25 @@ pub enum FeedKind {
     Stale,
 }
 
-/// One feed row: `  0x<nonce8>  <hash-prefix>…  <suffix>`, truncated to
-/// `width` display chars (ANSI excluded) ending with `…` when needed.
+/// One feed row: `0x<nonce8> <full-64-char-hash> <marker>`. This is 77
+/// columns, so a standard 80-column terminal shows every hash byte without
+/// an ellipsis. Genuinely narrower terminals still truncate rather than wrap
+/// and corrupt the fixed dashboard.
 pub fn feed_line(kind: FeedKind, nonce: u32, hash: &[u8; 32], width: usize, colors: bool) -> String {
-    // Hash prefix: first 10 bytes = 20 hex chars
-    let hash_hex = format!("{:02x?}", &hash[..10])
+    let hash_hex = format!("{:02x?}", hash)
         .replace('[', "")
         .replace(']', "")
         .replace(", ", "")
         .to_lowercase();
 
-    let suffix = match kind {
-        FeedKind::Candidate => "✗".to_string(),
-        FeedKind::Share => "▓ SHARE ✓ pool accepted".to_string(),
-        FeedKind::Rejected => "✗ rejected".to_string(),
-        FeedKind::Stale => "↻ stale job".to_string(),
+    let marker = match kind {
+        FeedKind::Candidate => "✗",
+        FeedKind::Share => "✓",
+        FeedKind::Rejected => "!",
+        FeedKind::Stale => "↻",
     };
 
-    // Build plain row: "  0x<nonce>  <hash>…  <suffix>"
-    let plain_row = format!("  0x{:08x}  {}…  {}", nonce, hash_hex, suffix);
+    let plain_row = format!("0x{:08x} {} {}", nonce, hash_hex, marker);
 
     // Truncate to width if needed
     let truncated = if plain_row.chars().count() > width {
@@ -261,21 +302,48 @@ pub struct FeedWindow {
     pub last_block: Option<String>,
     pub session_din_una: u64,
     pub din_estimated: bool,
+    pub pool: String,
+    pub reward_mode: String,
+    pub threads: usize,
+    pub connection: String,
+    pub channel: Option<u64>,
+    pub target: Option<String>,
+    pub reconnects: u64,
+    pub pinned: bool,
+    pub last_share: Option<Instant>,
+    pub reward_address: String,
     rows: VecDeque<String>,
     rates: Vec<f64>,
+    events: VecDeque<String>,
     painted: bool,
 }
 
 impl FeedWindow {
     pub fn new() -> Self {
+        Self::with_session(String::new(), String::new(), 0, false, String::new())
+    }
+
+    pub fn with_session(pool: String, reward_mode: String, threads: usize, pinned: bool,
+                        reward_address: String) -> Self {
         FeedWindow {
             stats: SessionStats::default(),
             backend: None,
             last_block: None,
             session_din_una: 0,
             din_estimated: false,
+            pool,
+            reward_mode,
+            threads,
+            connection: "STARTING".to_string(),
+            channel: None,
+            target: None,
+            reconnects: 0,
+            pinned,
+            last_share: None,
+            reward_address,
             rows: VecDeque::new(),
             rates: Vec::new(),
+            events: VecDeque::new(),
             painted: false,
         }
     }
@@ -295,14 +363,66 @@ impl FeedWindow {
         }
     }
 
+    pub fn push_event(&mut self, event: String) {
+        let event = event.trim_start_matches("»  ");
+        self.events.push_back(format!(" {}  {}", clock_hms(), event));
+        if self.events.len() > EVENT_HEIGHT {
+            self.events.pop_front();
+        }
+    }
+
+    pub fn set_lifecycle(&mut self, connection: Option<&str>, channel: Option<u64>,
+                         target: Option<String>, reconnect: bool) {
+        if let Some(value) = connection {
+            self.connection = value.to_string();
+        }
+        if let Some(value) = channel {
+            self.channel = Some(value);
+        }
+        if let Some(value) = target {
+            self.target = Some(value);
+        }
+        if reconnect {
+            self.reconnects += 1;
+        }
+    }
+
+    fn console_telemetry(&self, width: usize, colors: bool) -> [String; 4] {
+        let total = self.stats.ok + self.stats.rej;
+        let success = if total == 0 { 100.0 } else { self.stats.ok as f64 * 100.0 / total as f64 };
+        let ok_fill = ((success / 100.0) * 12.0).round() as usize;
+        let ok_bar = format!("{}{}", "█".repeat(ok_fill), "▏".repeat(12 - ok_fill));
+        let rejected_bar = if self.stats.rej == 0 { "·" } else { "▏" };
+        let secure = if self.pinned { "NOISE NX PINNED" } else { "UNPINNED" };
+        let last_share = self.last_share.map(|t| format!("{}s ago", t.elapsed().as_secs()))
+            .unwrap_or_else(|| "waiting".to_string());
+        let din = self.session_din_una as f64 / UNA_PER_DIN as f64;
+        let prefix = if self.din_estimated || self.reward_mode == "shared" { "≈" } else { "" };
+        let rows = [
+            box_split(&format!(" ACCEPTED {:>6}  {ok_bar}", self.stats.ok),
+                      &format!(" CONNECTION  ● {}", self.connection), width),
+            box_split(&format!(" REJECTED {:>6}  {rejected_bar}", self.stats.rej),
+                      &format!(" SECURITY    {secure}"), width),
+            box_split(&format!(" SUCCESS   {:>6.1}%", success),
+                      &format!(" RECONNECTS  {}", self.reconnects), width),
+            box_split(&format!(" SESSION WORK  {prefix}{din:.2} DIN"),
+                      &format!(" LAST SHARE   {last_share}"), width),
+        ];
+        rows.map(|row| crate::theme::paint(crate::theme::BRIGHT_GREEN, &row, colors))
+    }
+
     pub fn record_block(&mut self, no: u64, hash: &str, local_time: &str, value_una: u64, estimated: bool) {
         self.stats.blocks += 1;
         self.session_din_una += value_una;
         if estimated {
             self.din_estimated = true;
         }
-        // Panel format: `  ■ block #<n> · <local_time> · <hash16>…`
-        self.last_block = Some(format!("  ■ block #{} · {} · {}…", no, local_time, hash));
+        let din = value_una as f64 / UNA_PER_DIN as f64;
+        let prefix = if estimated { "≈" } else { "" };
+        self.last_block = Some(format!(
+            "  ■ block #{} · {} · {}… · {}{:.2} DIN",
+            no, local_time, hash, prefix, din
+        ));
     }
 
     pub fn status_line_fx(&self, width: usize, colors: bool) -> String {
@@ -350,54 +470,75 @@ impl FeedWindow {
     }
 
     pub fn repaint(&mut self, width: usize, colors: bool) -> String {
+        let width = width.max(60);
         let mut output = String::new();
 
-        // Non-first repaint: cursor up 9 lines to column 1 (a 10-row region
-        // needs 9 up-moves to return from its last row to its first — see
-        // clear()'s matching 9-up-move math below; `\x1b[10F` was an
-        // off-by-one that made the region drift 1 row further up the screen
-        // on every repaint), then erase cursor-to-end-of-screen so any
-        // stale/duplicated lines left below the region by a desync from a
-        // different cause (e.g. a lifecycle println! interleaved between
-        // two repaints, or a taller-than-expected celebration frame)
-        // self-heal within one redraw instead of accumulating.
+        // Repaint only the fixed dashboard. The compact logo lives above this
+        // region and is never part of the cursor-up/erase operation.
         if self.painted {
-            output.push_str("\x1b[9F\x1b[J");
+            output.push_str(&format!("\x1b[{}F\x1b[J", REGION_LINES - 1));
         }
 
-        // Panel line (blank if no last_block yet). `last_block` carries the
-        // full 64-hex-char block hash (see record_block), so it must be
-        // truncated to width the same way feed_line/status_line_fx are —
-        // untruncated it's ~89 chars, which wraps on any terminal narrower
-        // than ~91 columns, defeating the fixed 10-physical-row region and
-        // the `\x1b[9F` cursor math above. `last_block` is stored as plain
-        // text (painted only here at repaint time), so truncate before
-        // painting — painting after truncation would count ANSI bytes
-        // toward the width budget.
-        if let Some(ref block) = self.last_block {
-            let truncated = if block.chars().count() > width {
-                let head: String = block.chars().take(width.saturating_sub(1)).collect();
-                format!("{}…", head)
-            } else {
-                block.clone()
-            };
-            output.push_str(&crate::theme::paint(crate::theme::GOLD, &truncated, colors));
-        } else {
-            output.push(' ');
+        let top_title = " DINERO // SV2 MINING TERMINAL ";
+        let top_fill = "─".repeat(width.saturating_sub(top_title.chars().count() + 3));
+        output.push_str(&theme_line(&format!("╭─{top_title}{top_fill}╮"), colors));
+        output.push_str("\x1b[K\n");
+        let secure = if self.pinned { "● SECURE / NOISE NX" } else { "● UNPINNED" };
+        let worker = if cfg!(target_arch = "x86_64") { "intel-mac" } else { "apple-silicon" };
+        let uptime = self.stats.started.map(|s| Display::format_duration(s.elapsed().as_secs()))
+            .unwrap_or_else(|| "0s".to_string());
+        let channel = self.channel.map(|v| format!("#{v}")).unwrap_or_else(|| "--".to_string());
+        for row in [
+            box_split(&format!(" NODE  {}", self.pool), &format!(" LINK  {secure}"), width),
+            box_split(&format!(" MODE  {} · PPLNS", self.reward_mode.to_uppercase()),
+                      &format!(" WORKER  {worker} · {} threads", self.threads), width),
+            box_split(&format!(" CHAN  {channel}"), &format!(" UPTIME  {uptime}"), width),
+        ] {
+            output.push_str(&theme_line(&row, colors));
+            output.push_str("\x1b[K\n");
         }
+        output.push_str(&theme_line(
+            &box_row(&format!(" REWARD  {}", self.reward_address), width), colors));
+        output.push_str("\x1b[K\n");
+        let hash_title = format!("HASH ENGINE · {} · TARGET {}",
+            Display::fmt_hashrate(self.stats.hashrate_hs),
+            self.target.as_deref().map(|t| &t[..t.len().min(10)]).unwrap_or("pending"));
+        output.push_str(&theme_line(&box_rule(&hash_title, width), colors));
         output.push_str("\x1b[K\n");
 
         // Feed rows: pad to FEED_HEIGHT with blanks
         for i in 0..FEED_HEIGHT {
             if i < self.rows.len() {
-                output.push_str(&self.rows[i]);
+                let plain = crate::theme::strip_ansi(&self.rows[i]);
+                output.push_str(&crate::theme::paint(crate::theme::DIM_GREEN,
+                    &box_row(&plain, width), colors));
+            } else {
+                output.push_str(&box_row("", width));
             }
             output.push_str("\x1b[K\n");
         }
 
-        // Status line (no trailing newline)
-        output.push_str(&self.status_line_fx(width, colors));
-        output.push_str("\x1b[K");
+        output.push_str(&theme_line(&box_rule("SHARE TELEMETRY ────────────────┬─ SESSION HEALTH", width), colors));
+        output.push_str("\x1b[K\n");
+        for row in self.console_telemetry(width, colors) {
+            output.push_str(&row);
+            output.push_str("\x1b[K\n");
+        }
+
+        output.push_str(&theme_line(&box_rule("NETWORK FEED ───────────────────┴", width), colors));
+        output.push_str("\x1b[K\n");
+        for i in 0..EVENT_HEIGHT {
+            if i < self.events.len() {
+                output.push_str(&crate::theme::paint(crate::theme::DIM_GREEN,
+                    &box_row(&self.events[i], width), colors));
+            } else {
+                output.push_str(&box_row("", width));
+            }
+            output.push_str("\x1b[K\n");
+        }
+        let footer = " ^C STOP │ [S] STATS │ [L] LOG │ [C] COMPACT ";
+        let footer_fill = "─".repeat(width.saturating_sub(footer.chars().count() + 3));
+        output.push_str(&theme_line(&format!("╰─{footer}{footer_fill}╯"), colors));
 
         self.painted = true;
         output
@@ -409,13 +550,17 @@ impl FeedWindow {
         }
 
         let mut output = String::from("\r\x1b[K");
-        for _ in 0..9 {
+        for _ in 0..REGION_LINES - 1 {
             output.push_str("\x1b[1A\x1b[K");
         }
 
         self.painted = false;
         output
     }
+}
+
+fn theme_line(line: &str, colors: bool) -> String {
+    crate::theme::paint(crate::theme::BRIGHT_GREEN, line, colors)
 }
 
 #[cfg(test)]
@@ -479,7 +624,7 @@ mod tests {
     #[test]
     fn banner_carries_motto_and_art() {
         let plain = crate::theme::strip_ansi(&banner(true));
-        assert!(plain.contains("██████╗"));
+        assert!(plain.contains("█▀▄") && plain.contains("█▄▀"));
         assert!(plain.contains("· Real Money For Free People ·"));
         assert!(banner(true).contains("\x1b[1;33m"), "motto painted gold");
         assert!(!banner(false).contains('\x1b'), "no ANSI when colors off");
@@ -502,13 +647,16 @@ mod tests {
     fn feed_line_kinds_and_truncation() {
         let h = [0u8; 32];
         let cand = feed_line(FeedKind::Candidate, 0x8f31a2c4, &h, 100, false);
-        assert_eq!(cand, "  0x8f31a2c4  00000000000000000000…  ✗");
+        assert_eq!(cand, format!("0x8f31a2c4 {} ✗", "0".repeat(64)));
+        assert_eq!(cand.chars().count(), 77);
+        let exact_80 = feed_line(FeedKind::Candidate, 0x8f31a2c4, &h, 80, false);
+        assert_eq!(exact_80, cand, "80 columns must show the complete hash");
+        assert!(!exact_80.contains('…'));
         let share = feed_line(FeedKind::Share, 1, &h, 100, false);
-        assert!(share.ends_with("▓ SHARE ✓ pool accepted"));
-        assert!(feed_line(FeedKind::Rejected, 1, &h, 100, false).ends_with("✗ rejected"));
-        assert!(feed_line(FeedKind::Stale, 1, &h, 100, false).ends_with("↻ stale job"));
-        // width 60: full candidate row already fits (39 chars); width smaller
-        // than content truncates with … at exactly `width` chars
+        assert!(share.ends_with('✓'));
+        assert!(feed_line(FeedKind::Rejected, 1, &h, 100, false).ends_with('!'));
+        assert!(feed_line(FeedKind::Stale, 1, &h, 100, false).ends_with('↻'));
+        // A genuinely narrow terminal truncates rather than wrapping.
         let narrow = feed_line(FeedKind::Share, 1, &h, 30, false);
         assert_eq!(narrow.chars().count(), 30);
         assert!(narrow.ends_with('…'));
@@ -534,8 +682,8 @@ mod tests {
         let first = w.repaint(80, false);
         assert!(!first.starts_with("\x1b["), "first paint has no cursor-up");
         assert_eq!(first.matches('\n').count(), REGION_LINES - 1,
-            "panel + 8 rows + status = 10 lines from the very first frame");
-        assert!(first.contains("  row-a\x1b[K"));
+            "fixed dashboard has the same physical height from frame one");
+        assert!(first.contains("row-a"));
         assert!(!first.ends_with('\n'));
         let second = w.repaint(80, false);
         // A 10-row region needs 9 total up-moves to return from the last row
@@ -550,14 +698,30 @@ mod tests {
         // is added as defense in depth: it self-heals any stale/duplicated
         // lines left below the region by a desync from a different cause
         // (e.g. a lifecycle println! interleaved between two repaints).
+        let repaint_prefix = format!("\x1b[{}F\x1b[J", REGION_LINES - 1);
         assert!(
-            second.starts_with("\x1b[9F\x1b[J"),
-            "later paints move up 9 lines (not 10) then erase to end of screen: {:?}",
+            second.starts_with(&repaint_prefix),
+            "later paints move across the dashboard only, then erase downward: {:?}",
             &second[..second.len().min(20)]
         );
         let clear = w.clear();
-        assert_eq!(clear, format!("\r\x1b[K{}", "\x1b[1A\x1b[K".repeat(9)));
+        assert_eq!(clear, format!("\r\x1b[K{}", "\x1b[1A\x1b[K".repeat(REGION_LINES - 1)));
         assert!(!w.clear().contains('\x1b'), "cleared window clears to nothing");
+    }
+    #[test]
+    fn hash_engine_is_at_least_a_quarter_of_the_dashboard() {
+        assert!(FEED_HEIGHT * 4 >= REGION_LINES);
+    }
+    #[test]
+    fn network_feed_keeps_only_the_latest_events() {
+        let mut w = FeedWindow::new();
+        for n in 1..=5 {
+            w.push_event(format!("event-{n}"));
+        }
+        let out = crate::theme::strip_ansi(&w.repaint(80, false));
+        assert!(!out.contains("event-1"));
+        assert!(out.contains("event-2") && out.contains("event-5"));
+        assert!(out.contains("HASH ENGINE") && out.contains("NETWORK FEED"));
     }
     #[test]
     fn status_line_fx_wording_and_din_total() {
@@ -615,8 +779,8 @@ mod tests {
     #[test]
     fn repaint_region_lines_all_fit_within_width() {
         // Pins the whole-region invariant: every physical line the fixed
-        // 10-row region emits must fit within `width`, or the region wraps
-        // on a real terminal and desyncs the `\x1b[9F` cursor-up math. Uses
+        // dashboard emits must fit within `width`, or the region wraps
+        // on a real terminal and desyncs the fixed-region cursor math. Uses
         // a REAL 64-hex-char block hash (what `hex::encode(found.hash)`
         // actually produces in both miners), not the short test hashes
         // used elsewhere in this file — the panel line was previously

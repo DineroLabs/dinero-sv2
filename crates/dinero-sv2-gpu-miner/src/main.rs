@@ -476,6 +476,8 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    let reward_address = resolved_address.clone()
+        .unwrap_or_else(|| "custom payout script".to_string());
     if !args.no_save {
         save_config(&config_path, &file, &args, resolved_address);
     }
@@ -499,13 +501,18 @@ async fn async_main() -> Result<()> {
                 colors: dinero_miner_ux::theme::colors_enabled(),
                 reward_mode: reward_mode.as_str().to_string(),
                 frame_delay_ms: 160,
+                pool: pool.clone(),
+                threads: 0,
+                pinned: pinned.is_some(),
+                reward_address,
             },
         );
 
-        // Build the real-hash sampler and spawn the ticker right after
-        // constructing the FxScreen — Task 5's review found `on_block`'s
-        // erase math assumes the region has been painted at least once
-        // before a block event, which the ticker's first tick guarantees.
+        // Establish the alternate screen and permanent logo before the ticker
+        // can paint its first dashboard frame.
+        fx.print_banner();
+
+        // Build the real-hash sampler and spawn the ticker below the logo.
         let sampler_state2 = Arc::clone(&sampler_state);
         let sampler: dinero_miner_ux::fx::HashSampler = Arc::new(move || {
             let job = sampler_state2.job.lock().ok()?.clone()?;
@@ -524,8 +531,6 @@ async fn async_main() -> Result<()> {
             })
         });
         fx.spawn_ticker(sampler, Arc::clone(&stop_flag));
-
-        fx.print_banner();
         Emitter::new_fx(fx)
     } else {
         Emitter::new(args.json, human, reward_mode.as_str())

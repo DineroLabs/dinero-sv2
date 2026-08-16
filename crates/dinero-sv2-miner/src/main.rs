@@ -259,6 +259,8 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    let reward_address = resolved_address.clone()
+        .unwrap_or_else(|| "custom payout script".to_string());
     if !args.no_save {
         save_config(&config_path, &file, &args, resolved_address);
     }
@@ -282,13 +284,19 @@ async fn async_main() -> Result<()> {
                 colors: dinero_miner_ux::theme::colors_enabled(),
                 reward_mode: reward_mode.as_str().to_string(),
                 frame_delay_ms: 160,
+                pool: pool.clone(),
+                threads,
+                pinned: pinned.is_some(),
+                reward_address,
             },
         );
 
-        // Build the real-hash sampler and spawn the ticker right after
-        // constructing the FxScreen — Task 5's review found `on_block`'s
-        // erase math assumes the region has been painted at least once
-        // before a block event, which the ticker's first tick guarantees.
+        // Establish the alternate screen and permanent logo before the ticker
+        // can paint its first dashboard frame. Reversing these two operations
+        // creates a race where the cursor origin is captured above the logo.
+        fx.print_banner();
+
+        // Build the real-hash sampler and spawn the ticker below the logo.
         let sampler_state2 = Arc::clone(&sampler_state);
         let sampler: dinero_miner_ux::fx::HashSampler = Arc::new(move || {
             let job = sampler_state2.job.lock().ok()?.clone()?;
@@ -307,8 +315,6 @@ async fn async_main() -> Result<()> {
             })
         });
         fx.spawn_ticker(sampler, Arc::clone(&stop_flag));
-
-        fx.print_banner();
         Emitter::new_fx(fx)
     } else {
         Emitter::new(args.json, human)
@@ -1360,6 +1366,15 @@ impl Emitter {
                         fx.on_block(data.get("hash").and_then(|v| v.as_str()).unwrap_or(""), &now_hms());
                     }
                 }
+                "connected" => fx.lifecycle_state(&lifecycle_line(event, data), Some("ONLINE"), None, None, false),
+                "channel_open" => fx.lifecycle_state(
+                    &lifecycle_line(event, data), Some("ONLINE"),
+                    data.get("channel_id").and_then(|v| v.as_u64()), None, false),
+                "set_target" => fx.lifecycle_state(
+                    &lifecycle_line(event, data), None, None,
+                    data.get("max_target").and_then(|v| v.as_str()).map(str::to_string), false),
+                "session_end" => fx.lifecycle_state(&lifecycle_line(event, data), Some("OFFLINE"), None, None, false),
+                "reconnect_wait" => fx.lifecycle_state(&lifecycle_line(event, data), Some("RECONNECTING"), None, None, true),
                 _ => fx.lifecycle(&lifecycle_line(event, data)),
             },
         }
