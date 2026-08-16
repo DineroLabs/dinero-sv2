@@ -23,6 +23,10 @@ pub struct FxConfig {
     pub colors: bool,
     pub reward_mode: String,
     pub frame_delay_ms: u64,
+    pub pool: String,
+    pub threads: usize,
+    pub pinned: bool,
+    pub reward_address: String,
 }
 
 /// Block subsidy backing the "shared" reward-mode estimate.
@@ -42,6 +46,7 @@ struct Inner {
     last_window_bps: Option<u64>,
     last_solo_value_una: Option<u64>,
     tick_count: u64,
+    alternate_screen: bool,
 }
 
 #[derive(Clone)]
@@ -51,7 +56,9 @@ pub struct FxScreen {
 
 impl FxScreen {
     pub fn new(out: Box<dyn Write + Send>, cfg: FxConfig) -> Self {
-        let mut window = FeedWindow::new();
+        let mut window = FeedWindow::with_session(
+            cfg.pool.clone(), cfg.reward_mode.clone(), cfg.threads, cfg.pinned,
+            cfg.reward_address.clone());
         window.stats.started = Some(Instant::now());
         FxScreen {
             inner: Arc::new(Mutex::new(Inner {
@@ -62,6 +69,7 @@ impl FxScreen {
                 last_window_bps: None,
                 last_solo_value_una: None,
                 tick_count: 0,
+                alternate_screen: false,
             })),
         }
     }
@@ -71,24 +79,38 @@ impl FxScreen {
         let _ = inner.out.flush();
     }
 
-    /// banner() + blank line.
+    /// Enter a clean alternate screen, place the permanent logo at row one,
+    /// then leave a blank line before the fixed dashboard. The user's shell
+    /// history remains intact in the primary screen and returns on exit.
     pub fn print_banner(&self) {
         let mut inner = self.inner.lock().unwrap();
         let colors = inner.cfg.colors;
-        let mut out = display::banner(colors);
+        let mut out = String::from("\x1b[?1049h\x1b[2J\x1b[H");
+        inner.alternate_screen = true;
+        out.push_str(&display::banner(colors));
         out.push('\n'); // blank line under the banner
         Self::write_flush(&mut inner, &out);
     }
 
-    /// clear region → permanent line → repaint.
+    /// Keep lifecycle activity inside the dashboard's network feed. Nothing
+    /// is printed above or below the fixed region, so the logo remains pinned.
     pub fn lifecycle(&self, line: &str) {
         let mut inner = self.inner.lock().unwrap();
-        let mut out = inner.window.clear();
-        out.push_str(line);
-        out.push('\n');
+        inner.window.push_event(line.to_string());
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
-        out.push_str(&inner.window.repaint(width, colors));
+        let out = inner.window.repaint(width, colors);
+        Self::write_flush(&mut inner, &out);
+    }
+
+    pub fn lifecycle_state(&self, line: &str, connection: Option<&str>,
+                           channel: Option<u64>, target: Option<String>, reconnect: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.window.set_lifecycle(connection, channel, target, reconnect);
+        inner.window.push_event(line.to_string());
+        let width = inner.cfg.width;
+        let colors = inner.cfg.colors;
+        let out = inner.window.repaint(width, colors);
         Self::write_flush(&mut inner, &out);
     }
 
@@ -116,6 +138,7 @@ impl FxScreen {
     pub fn on_share_ok(&self, n: u64) {
         let mut inner = self.inner.lock().unwrap();
         inner.window.stats.ok += n;
+        inner.window.last_share = Some(Instant::now());
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
         let row = match inner.last_sample {
@@ -229,6 +252,9 @@ impl FxScreen {
         inner
             .window
             .record_block(block_no, hash_hex, local_time, value_una, estimated);
+        if let Some(block) = inner.window.last_block.clone() {
+            inner.window.push_event(block);
+        }
 
         let mut out = erase;
         out.push_str(&inner.window.repaint(width, colors));
@@ -255,6 +281,10 @@ impl FxScreen {
             let din_total = inner.window.session_din_una as f64 / display::UNA_PER_DIN as f64;
             let din_prefix = if inner.window.din_estimated { "≈" } else { "" };
             line.push_str(&format!(" | {}{:.2} DIN", din_prefix, din_total));
+        }
+        if inner.alternate_screen {
+            out.push_str("\x1b[?1049l");
+            inner.alternate_screen = false;
         }
         out.push_str(&theme::paint(theme::BOLD, &line, colors));
         out.push('\n');
@@ -319,6 +349,10 @@ mod tests {
             colors: false,
             reward_mode: "shared".to_string(),
             frame_delay_ms: 0,
+            pool: "pool.dinerolabs.org:4444".to_string(),
+            threads: 2,
+            pinned: true,
+            reward_address: "din1ptestrewardaddress".to_string(),
         };
         let fx = FxScreen::new(writer, cfg);
         // Seed a realistic rate so the status line's unit formatting is
@@ -370,7 +404,7 @@ mod tests {
         fx.on_share_ok(3);
         fx.on_share_rejected();
         let plain = crate::theme::strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
-        assert!(plain.contains("3 ok") && plain.contains("1 rejected"));
+        assert!(plain.contains("ACCEPTED      3") && plain.contains("REJECTED      1"));
         assert!(plain.contains("SHARE ✓") && plain.contains("✗ rejected"));
     }
 
@@ -401,6 +435,21 @@ mod tests {
         fx.print_summary();
         let plain = crate::theme::strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
         assert!(!plain.contains("DIN"), "no blocks found -> no DIN total in summary: {plain:?}");
+    }
+
+    #[test]
+    fn banner_uses_alternate_screen_and_summary_restores_shell() {
+        let (fx, buf) = screen_with_buffer();
+        fx.print_banner();
+        let entered = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(entered.starts_with("\x1b[?1049h\x1b[2J\x1b[H"));
+        assert!(crate::theme::strip_ansi(&entered).contains("Real Money For Free People"));
+
+        buf.lock().unwrap().clear();
+        fx.print_summary();
+        let restored = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(restored.contains("\x1b[?1049l"));
+        assert!(restored.contains("Session:"));
     }
 
     #[test]
