@@ -662,6 +662,10 @@ async fn run_session(
     let mut pre_block_state: Option<UtreexoAccumulatorState> = None;
     let mut coinbase_ctx: Option<CoinbaseContext> = None;
     let mut pending_shared_template: Option<NewTemplateDinero> = None;
+    // Keep the latest shared template so a vardiff SetTarget can restart
+    // hashing immediately. SV2 does not require the pool to follow a target
+    // update with another NewMiningJob.
+    let mut current_shared_template: Option<NewTemplateDinero> = None;
     let mut shared_mode_confirmed = false;
     let mut blocks_found: u64 = 0;
     let mut seq: u32 = 0;
@@ -692,6 +696,7 @@ async fn run_session(
                         pre_block_state = None;
                         coinbase_ctx = None;
                         pending_shared_template = None;
+                        current_shared_template = None;
                     }
                     MSG_UTREEXO_STATE => {
                         if reward_mode == RewardModeChoice::Shared {
@@ -710,6 +715,7 @@ async fn run_session(
                     MSG_NEW_MINING_JOB => {
                         let tmpl = decode_new_template(&frame.payload)?;
                         if reward_mode == RewardModeChoice::Shared {
+                            current_shared_template = Some(tmpl.clone());
                             if shared_mode_confirmed {
                                 pending_shared_template = None;
                                 start_hashing_shared(
@@ -811,12 +817,26 @@ async fn run_session(
                                 "max_target": hex::encode(st.max_target),
                             }),
                         );
-                        // Update local target. Bump generation so any
-                        // in-flight rayon workers exit; the next
-                        // NewMiningJob will respawn with the new target
-                        // baked in.
+                        // Update local target and replace the active shared
+                        // workers immediately. A SetTarget applies to the
+                        // current job; the pool is not required to send a
+                        // replacement NewMiningJob after vardiff changes.
                         share_target = st.max_target;
                         generation.fetch_add(1, Ordering::SeqCst);
+                        if reward_mode == RewardModeChoice::Shared && shared_mode_confirmed {
+                            if let Some(tmpl) = current_shared_template.clone() {
+                                start_hashing_shared(
+                                    tmpl,
+                                    share_target,
+                                    threads,
+                                    Arc::clone(&generation),
+                                    Arc::clone(&measured_mhs_x100),
+                                    Arc::clone(&sampler_state),
+                                    share_tx.clone(),
+                                    emitter,
+                                );
+                            }
+                        }
                     }
                     other => {
                         tracing::debug!("unhandled frame msg_type=0x{:02x}", other);
