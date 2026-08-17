@@ -753,16 +753,69 @@ async fn serve_miner(
     // ---- Phase C: normal operation ----
     let mut current: Option<Arc<TemplateBundle>> = None;
     let mut last_sequence_number: u32 = 0;
-    // None = solo (default, backward compatible); Some(payout_script) =
-    // shared mode, set by an explicit SetRewardMode{mode:1, ...} frame.
+    // None = solo; Some(payout_script) = shared mode. Modern miners send
+    // SetRewardMode immediately after channel-open success. Wait briefly
+    // for that declaration before sending any work so a shared miner never
+    // receives (or displays) a misleading solo bootstrap job. Legacy miners
+    // that do not implement SetRewardMode retain a bounded solo fallback.
     let mut reward_mode: Option<Vec<u8>> = None;
+
+    match tokio::time::timeout(Duration::from_secs(2), session.read_frame()).await {
+        Ok(Ok(Some(f))) if f.msg_type == MSG_SET_REWARD_MODE => {
+            match decode_set_reward_mode(&f.payload) {
+                Ok(m) if m.mode == 1 => {
+                    if m.payout_script.len() == 34
+                        && m.payout_script[0] == 0x51
+                        && m.payout_script[1] == 0x20
+                    {
+                        info!(
+                            channel_id,
+                            payout = %hex::encode(&m.payout_script),
+                            "miner opened in SHARED mode"
+                        );
+                        reward_mode = Some(m.payout_script);
+                    } else {
+                        send_share_error(&mut session, channel_id, 0, "bad-payout-script").await?;
+                        return Ok(());
+                    }
+                }
+                Ok(_) => {
+                    info!(channel_id, "miner explicitly opened in SOLO mode");
+                }
+                Err(e) => {
+                    warn!(error = %e, "bad initial SetRewardMode payload");
+                    send_share_error(&mut session, channel_id, 0, "bad-payload").await?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(Ok(Some(f))) => {
+            warn!(
+                msg_type = f.msg_type,
+                "expected SetRewardMode before first mining job"
+            );
+            return Ok(());
+        }
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            info!(
+                channel_id,
+                "legacy miner did not declare reward mode; defaulting to SOLO"
+            );
+        }
+    }
 
     let initial = rx.borrow_and_update().clone();
     if let Some(bundle) = initial {
-        // A brand-new connection is always solo until it explicitly
-        // opts into shared mode, so the initial push is unconditionally
-        // `push_job` — matches the pre-Task-6 behaviour exactly.
-        push_job(&mut session, channel_id, &bundle.pt).await?;
+        match &reward_mode {
+            Some(payout_script) => {
+                if let Some(st) = bundle.shared.as_ref() {
+                    push_shared_job(&mut session, channel_id, st, &window, payout_script).await?;
+                }
+            }
+            None => push_job(&mut session, channel_id, &bundle.pt).await?,
+        }
         current = Some(bundle);
     }
 
