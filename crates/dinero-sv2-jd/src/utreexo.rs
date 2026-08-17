@@ -129,7 +129,14 @@ pub fn leaf_hash_for_height(
     activation_height: u32,
 ) -> [u8; 32] {
     if created_height >= activation_height {
-        leaf_hash_v2(txid, vout, amount, script_pubkey, created_height, is_coinbase)
+        leaf_hash_v2(
+            txid,
+            vout,
+            amount,
+            script_pubkey,
+            created_height,
+            is_coinbase,
+        )
     } else {
         leaf_hash(txid, vout, amount, script_pubkey)
     }
@@ -210,6 +217,22 @@ pub enum UtreexoError {
         /// Forest's leaf count.
         num_leaves: u64,
     },
+    /// An internal root-slot operation calculated an impossible index.
+    /// This is kept recoverable so malformed daemon state or a future
+    /// accumulator bug can never panic a long-running pool process.
+    #[error(
+        "cannot {operation} root at level {level}: index {index} out of bounds for {roots} roots"
+    )]
+    RootIndexOutOfBounds {
+        /// Root-vector operation being attempted.
+        operation: &'static str,
+        /// Forest level whose root was requested.
+        level: usize,
+        /// Calculated index in `forest_roots`.
+        index: usize,
+        /// Current `forest_roots` length.
+        roots: usize,
+    },
 }
 
 /// One leaf to remove from the accumulator. Mirrors the per-outpoint
@@ -267,6 +290,7 @@ impl UtreexoAccumulatorState {
     /// for the target level; together these bit manipulations are
     /// equivalent to `num_leaves += 1` (binary carry propagation).
     pub fn add_leaf(&mut self, leaf: [u8; 32]) -> Result<(), UtreexoError> {
+        self.validate()?;
         if self.num_leaves == u64::MAX {
             return Err(UtreexoError::NumLeavesOverflow {
                 current: self.num_leaves,
@@ -276,12 +300,12 @@ impl UtreexoAccumulatorState {
         let mut carry = leaf;
         let mut level = 0usize;
         while (self.num_leaves >> level) & 1 == 1 {
-            let existing = pop_root_at_level(self, level);
+            let existing = pop_root_at_level(self, level)?;
             self.num_leaves &= !(1u64 << level);
             carry = node_hash(&existing, &carry);
             level += 1;
         }
-        insert_root_at_level(self, level, carry);
+        insert_root_at_level(self, level, carry)?;
         self.num_leaves |= 1u64 << level;
         Ok(())
     }
@@ -330,10 +354,10 @@ impl UtreexoAccumulatorState {
     /// pre-coinbase Utreexo state that JD miners need to recompute the
     /// header `utreexo_root`.
     pub fn apply_deletions(&mut self, targets: &[DeletionTarget]) -> Result<(), UtreexoError> {
+        self.validate()?;
         if targets.is_empty() {
             return Ok(());
         }
-        self.validate()?;
 
         // Step 1: bucket targets by tree height. The position's
         // tree-height (= forest_roots index for that height bit) lives
@@ -577,18 +601,42 @@ pub fn commitment(state: &UtreexoAccumulatorState) -> Result<[u8; 32], UtreexoEr
 /// Given `level` (a tree height), find the index inside
 /// `state.forest_roots` that currently holds the tree at that height
 /// and remove it.
-fn pop_root_at_level(state: &mut UtreexoAccumulatorState, level: usize) -> [u8; 32] {
+fn pop_root_at_level(
+    state: &mut UtreexoAccumulatorState,
+    level: usize,
+) -> Result<[u8; 32], UtreexoError> {
     // Roots are stored smallest-first. The position of the `level`-th
     // root is the number of 1-bits in num_leaves below `level`.
     let idx = count_ones_below(state.num_leaves, level);
-    state.forest_roots.remove(idx)
+    if idx >= state.forest_roots.len() {
+        return Err(UtreexoError::RootIndexOutOfBounds {
+            operation: "remove",
+            level,
+            index: idx,
+            roots: state.forest_roots.len(),
+        });
+    }
+    Ok(state.forest_roots.remove(idx))
 }
 
 /// Insert a new root at a given tree height, preserving smallest-first
 /// ordering.
-fn insert_root_at_level(state: &mut UtreexoAccumulatorState, level: usize, root: [u8; 32]) {
+fn insert_root_at_level(
+    state: &mut UtreexoAccumulatorState,
+    level: usize,
+    root: [u8; 32],
+) -> Result<(), UtreexoError> {
     let idx = count_ones_below(state.num_leaves, level);
+    if idx > state.forest_roots.len() {
+        return Err(UtreexoError::RootIndexOutOfBounds {
+            operation: "insert",
+            level,
+            index: idx,
+            roots: state.forest_roots.len(),
+        });
+    }
     state.forest_roots.insert(idx, root);
+    Ok(())
 }
 
 /// Number of 1-bits in `n` at positions strictly below `level`.
@@ -614,6 +662,40 @@ mod tests {
         assert!(s.validate().is_ok());
         assert_eq!(s.forest_roots.len(), 0);
         assert_eq!(s.num_leaves, 0);
+    }
+
+    #[test]
+    fn malformed_state_add_leaf_returns_error_instead_of_panicking() {
+        let mut state = UtreexoAccumulatorState {
+            forest_roots: Vec::new(),
+            num_leaves: 1,
+        };
+
+        assert_eq!(
+            state.add_leaf(leaf(1)),
+            Err(UtreexoError::RootCountMismatch {
+                roots: 0,
+                num_leaves: 1,
+                popcount: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_state_empty_deletions_still_validate() {
+        let mut state = UtreexoAccumulatorState {
+            forest_roots: Vec::new(),
+            num_leaves: 1,
+        };
+
+        assert_eq!(
+            state.apply_deletions(&[]),
+            Err(UtreexoError::RootCountMismatch {
+                roots: 0,
+                num_leaves: 1,
+                popcount: 1,
+            })
+        );
     }
 
     #[test]

@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
     let (tx, rx) = watch::channel::<Option<Arc<TemplateBundle>>>(None);
 
     // Template producer task.
-    {
+    let mut template_producer = {
         let rpc = rpc.clone();
         let payout = args.payout_address.clone();
         let poll = Duration::from_secs(args.poll_secs);
@@ -514,12 +514,21 @@ async fn main() -> Result<()> {
                 last_template_at = Some(std::time::Instant::now());
                 last_nbits = Some(pt.wire.difficulty);
             }
-        });
-    }
+        })
+    };
 
     // Miner acceptor.
     loop {
-        let (sock, peer) = listener.accept().await?;
+        let (sock, peer) = tokio::select! {
+            result = &mut template_producer => {
+                match result {
+                    Ok(()) => anyhow::bail!("template producer exited unexpectedly"),
+                    Err(e) => return Err(anyhow::Error::new(e)
+                        .context("template producer task failed")),
+                }
+            }
+            accepted = listener.accept() => accepted?,
+        };
         let rx = rx.clone();
         let rpc = rpc.clone();
         let ledger = ledger.clone();
@@ -764,14 +773,13 @@ async fn serve_miner(
     let mut accepted_in_window: u64 = 0;
     let mut window_start = std::time::Instant::now();
     let vardiff_window = vardiff.and_then(|v| v.window);
-    let mut vardiff_tick = vardiff_window
-        .map(|w| {
-            let mut t = tokio::time::interval(w);
-            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // First tick fires immediately; consume it so we wait a
-            // full window before our first measurement.
-            t
-        });
+    let mut vardiff_tick = vardiff_window.map(|w| {
+        let mut t = tokio::time::interval(w);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; consume it so we wait a
+        // full window before our first measurement.
+        t
+    });
 
     loop {
         tokio::select! {
@@ -1065,7 +1073,11 @@ async fn push_shared_job(
         let w = window.lock().expect("pplns window mutex");
         (w.miner_bps(payout_script), w.len() as u64)
     };
-    let ws = WindowStatus { channel_id, window_bps: bps, window_shares: shares };
+    let ws = WindowStatus {
+        channel_id,
+        window_bps: bps,
+        window_shares: shares,
+    };
     session
         .write_frame(MSG_WINDOW_STATUS, &encode_window_status(&ws)?)
         .await?;
@@ -1161,11 +1173,7 @@ async fn handle_share(
         .await?;
 
     if meets_block {
-        let mempool_data: Vec<Vec<u8>> = pt
-            .mempool_txs
-            .iter()
-            .map(|t| t.data.clone())
-            .collect();
+        let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
         match try_submit_block(&pt.wire, &share, &pt.coinbase_full_hex, &mempool_data, rpc).await {
             Ok(SubmitBlockResult::Accepted) => {
                 info!(
@@ -1198,8 +1206,7 @@ async fn try_submit_block(
     mempool_tx_data: &[Vec<u8>],
     rpc: &RpcClient,
 ) -> Result<SubmitBlockResult> {
-    let block_hex =
-        block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
+    let block_hex = block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
     rpc.submit_block(&block_hex).await
 }
 
@@ -1232,7 +1239,13 @@ async fn handle_shared_share(
         Err(e) => {
             warn!(error = %e, "bad shared share shape");
             ledger.reject(miner_key);
-            send_share_error(session, channel_id, *last_sequence_number, "invalid-payload").await?;
+            send_share_error(
+                session,
+                channel_id,
+                *last_sequence_number,
+                "invalid-payload",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1247,7 +1260,13 @@ async fn handle_shared_share(
     let Some(st) = bundle.shared.as_ref() else {
         warn!("shared share received but no shared template built this refresh");
         ledger.reject(miner_key);
-        send_share_error(session, channel_id, share.sequence_number, "no-shared-template").await?;
+        send_share_error(
+            session,
+            channel_id,
+            share.sequence_number,
+            "no-shared-template",
+        )
+        .await?;
         return Ok(());
     };
 
@@ -1587,11 +1606,7 @@ async fn handle_extended_share(
             &pt.coinbase_witness_bytes,
             &pt.coinbase_suffix,
         );
-        let mempool_data: Vec<Vec<u8>> = pt
-            .mempool_txs
-            .iter()
-            .map(|t| t.data.clone())
-            .collect();
+        let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
         match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase, &mempool_data) {
             Ok(block_hex) => match rpc.submit_block(&block_hex).await {
                 Ok(SubmitBlockResult::Accepted) => {
@@ -1697,15 +1712,9 @@ async fn apply_mempool_to_pre_coinbase(
             );
         }
         for (i, p) in proofs.iter().enumerate() {
-            let success = p
-                .get("success")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let success = p.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
             if !success {
-                let why = p
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                let why = p.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
                 anyhow::bail!(
                     "getutxoproofs_batch: outpoint #{i} ({}:{}) failed: {why}",
                     outpoints[i].0,
@@ -1724,8 +1733,8 @@ async fn apply_mempool_to_pre_coinbase(
                 .get("siblings")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("proof #{i}: missing siblings"))?;
-            let leaf_bytes = hex::decode(leaf_hex)
-                .with_context(|| format!("proof #{i} leaf_hash hex"))?;
+            let leaf_bytes =
+                hex::decode(leaf_hex).with_context(|| format!("proof #{i} leaf_hash hex"))?;
             if leaf_bytes.len() != 32 {
                 anyhow::bail!("proof #{i}: leaf_hash is {} bytes", leaf_bytes.len());
             }
@@ -1733,11 +1742,11 @@ async fn apply_mempool_to_pre_coinbase(
             leaf_hash_arr.copy_from_slice(&leaf_bytes);
             let mut siblings: Vec<[u8; 32]> = Vec::with_capacity(siblings_arr.len());
             for (j, s) in siblings_arr.iter().enumerate() {
-                let s_hex = s.as_str().ok_or_else(|| {
-                    anyhow::anyhow!("proof #{i} sibling[{j}] not a string")
-                })?;
-                let sb = hex::decode(s_hex)
-                    .with_context(|| format!("proof #{i} sibling[{j}] hex"))?;
+                let s_hex = s
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("proof #{i} sibling[{j}] not a string"))?;
+                let sb =
+                    hex::decode(s_hex).with_context(|| format!("proof #{i} sibling[{j}] hex"))?;
                 if sb.len() != 32 {
                     anyhow::bail!("proof #{i} sibling[{j}] is {} bytes", sb.len());
                 }

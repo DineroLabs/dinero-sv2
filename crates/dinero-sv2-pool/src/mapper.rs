@@ -271,8 +271,8 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
             .ok_or_else(|| anyhow!("missing transactions[{i}].txid"))?;
         let txid_raw = hex_reverse_32(txid_disp)?;
         leaves.push(txid_raw);
-        let data_bytes = hex::decode(tx_data_hex)
-            .with_context(|| format!("transactions[{i}].data hex"))?;
+        let data_bytes =
+            hex::decode(tx_data_hex).with_context(|| format!("transactions[{i}].data hex"))?;
         let (inputs, outputs) = parse_segwit_tx_inputs_outputs(&data_bytes)
             .with_context(|| format!("transactions[{i}] parse"))?;
         mempool_txs.push(MempoolTx {
@@ -369,11 +369,7 @@ fn coinbase_merkle_path(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     while level.len() > 1 {
         // The coinbase sits at index 0 every level, so its sibling is
         // index 1 (or duplicate when level is just [coinbase]).
-        let sibling = if level.len() >= 2 {
-            level[1]
-        } else {
-            level[0]
-        };
+        let sibling = if level.len() >= 2 { level[1] } else { level[0] };
         path.push(sibling);
 
         let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
@@ -425,10 +421,10 @@ fn parse_segwit_tx_inputs_outputs(
         let (ss_len, n2) = read_compact_size(bytes, cur)?;
         cur += n2 + ss_len as usize;
         cur += 4; // sequence
-        // dinerod's `getutxoproofs_batch` takes display-order txid, so
-        // callers will reverse `prev_txid` before issuing the RPC. We
-        // store raw here for symmetry with the rest of the codebase
-        // ("raw is what consensus uses").
+                  // dinerod's `getutxoproofs_batch` takes display-order txid, so
+                  // callers will reverse `prev_txid` before issuing the RPC. We
+                  // store raw here for symmetry with the rest of the codebase
+                  // ("raw is what consensus uses").
         inputs.push((prev_txid, vout));
     }
     let (out_count, n3) = read_compact_size(bytes, cur)?;
@@ -482,10 +478,14 @@ pub fn map_utreexo_roots(json: &Value) -> Result<UtreexoAccumulatorState> {
         a.copy_from_slice(&bytes);
         forest_roots.push(a);
     }
-    Ok(UtreexoAccumulatorState {
+    let state = UtreexoAccumulatorState {
         forest_roots,
         num_leaves,
-    })
+    };
+    state
+        .validate()
+        .context("getutreexoroots returned inconsistent accumulator state")?;
+    Ok(state)
 }
 
 fn hex_reverse_32(s: &str) -> Result<[u8; 32]> {
@@ -573,14 +573,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rejects_inconsistent_utreexo_root_count() {
+        let err = map_utreexo_roots(&json!({
+            "num_leaves": 1,
+            "roots": []
+        }))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("inconsistent accumulator state"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn extract_fee_script_finds_first_non_op_return_output() {
         let pt = map_template(&fixture(), 42).unwrap();
         let script = extract_fee_script(&pt.coinbase_full_hex).unwrap();
         // Fixture's sole output: 0x51 0x20 <32-byte taproot payload>.
-        let expected = hex::decode(
-            "5120d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
-        )
-        .unwrap();
+        let expected =
+            hex::decode("5120d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42")
+                .unwrap();
         assert_eq!(script, expected);
     }
 
@@ -594,21 +607,23 @@ pub(crate) mod tests {
             "01",       // in_count
             "0000000000000000000000000000000000000000000000000000000000000000",
             "ffffffff", // prevout idx
-            "03", "023c14", // scriptSig
-            "ffffffff", // sequence
-            "02",       // out_count
+            "03",
+            "023c14",           // scriptSig
+            "ffffffff",         // sequence
+            "02",               // out_count
             "0000000000000000", // value = 0 (OP_RETURN output)
-            "04", "6a020000", // OP_RETURN push
+            "04",
+            "6a020000",         // OP_RETURN push
             "00e40b5402000000", // value = 10000000000
-            "22", "5120",
+            "22",
+            "5120",
             "d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
             "00000000" // locktime
         );
         let script = extract_fee_script(hex_data).unwrap();
-        let expected = hex::decode(
-            "5120d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
-        )
-        .unwrap();
+        let expected =
+            hex::decode("5120d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42")
+                .unwrap();
         assert_eq!(script, expected);
     }
 
