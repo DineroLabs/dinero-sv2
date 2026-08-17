@@ -38,6 +38,21 @@ fn box_split(left: &str, right: &str, width: usize) -> String {
     format!("│{left:<left_width$}│{right:<right_width$}│")
 }
 
+/// Human-readable worker platform for the dashboard. Keep OS and CPU
+/// architecture separate: `x86_64` also describes Windows and Linux, so it
+/// must never be used as a proxy for an Intel Mac.
+fn worker_platform(os: &str, arch: &str) -> String {
+    match (os, arch) {
+        ("windows", "x86_64") => "windows-x86_64".into(),
+        ("windows", "aarch64") => "windows-arm64".into(),
+        ("macos", "x86_64") => "macos-intel".into(),
+        ("macos", "aarch64") => "macos-apple-silicon".into(),
+        ("linux", "x86_64") => "linux-x86_64".into(),
+        ("linux", "aarch64") => "linux-arm64".into(),
+        _ => format!("{os}-{arch}"),
+    }
+}
+
 fn box_rule(title: &str, width: usize) -> String {
     let prefix = format!("├─ {title} ");
     let fill = "─".repeat(width.saturating_sub(prefix.chars().count() + 1));
@@ -484,7 +499,7 @@ impl FeedWindow {
         output.push_str(&theme_line(&format!("╭─{top_title}{top_fill}╮"), colors));
         output.push_str("\x1b[K\n");
         let secure = if self.pinned { "● SECURE / NOISE NX" } else { "● UNPINNED" };
-        let worker = if cfg!(target_arch = "x86_64") { "intel-mac" } else { "apple-silicon" };
+        let worker = worker_platform(std::env::consts::OS, std::env::consts::ARCH);
         let uptime = self.stats.started.map(|s| Display::format_duration(s.elapsed().as_secs()))
             .unwrap_or_else(|| "0s".to_string());
         let channel = self.channel.map(|v| format!("#{v}")).unwrap_or_else(|| "--".to_string());
@@ -722,6 +737,16 @@ mod tests {
         assert!(!out.contains("event-1"));
         assert!(out.contains("event-2") && out.contains("event-5"));
         assert!(out.contains("HASH ENGINE") && out.contains("NETWORK FEED"));
+    }
+    #[test]
+    fn worker_platform_uses_both_os_and_architecture() {
+        assert_eq!(worker_platform("windows", "x86_64"), "windows-x86_64");
+        assert_eq!(worker_platform("windows", "aarch64"), "windows-arm64");
+        assert_eq!(worker_platform("macos", "x86_64"), "macos-intel");
+        assert_eq!(worker_platform("macos", "aarch64"), "macos-apple-silicon");
+        assert_eq!(worker_platform("linux", "x86_64"), "linux-x86_64");
+        assert_eq!(worker_platform("linux", "aarch64"), "linux-arm64");
+        assert_eq!(worker_platform("freebsd", "riscv64"), "freebsd-riscv64");
     }
     #[test]
     fn status_line_fx_wording_and_din_total() {
