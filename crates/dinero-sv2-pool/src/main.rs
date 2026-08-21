@@ -13,7 +13,7 @@
 //! no persistent share ledger. See crate docs in
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
-use dinero_sv2_pool::{accounting, block, journal, mapper, rpc, shared_template, split, target};
+use dinero_sv2_pool::{accounting, block, dedup, journal, mapper, rpc, shared_template, split, target};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -62,6 +62,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry};
+use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
 use crate::mapper::PoolTemplate;
 use crate::rpc::{Auth, RpcClient, SubmitBlockResult};
@@ -75,7 +76,12 @@ use crate::target::{hash_meets_target, leading_zero_bits_target, target_for_hash
 /// (or vice versa) — see amendments for Task 6.
 struct TemplateBundle {
     pt: PoolTemplate,
-    shared: Option<Arc<SharedTemplate>>,
+    /// PPLNS split outputs for this refresh (value outputs only), from
+    /// which each shared channel derives its OWN template with a
+    /// per-channel scriptSig extranonce — so no two channels ever grind
+    /// the same header. `None` when the shared build can't work this
+    /// refresh (pre-flighted in the producer).
+    shared_split: Option<Vec<CoinbaseOutput>>,
     /// Whether the *solo* template materially changed this refresh
     /// (new tip or new nbits). `false` on a bundle republished solely
     /// because `--refresh-same-tip-secs` elapsed (a `stale_same_tip`
@@ -276,6 +282,12 @@ async fn main() -> Result<()> {
         "share difficulty policy"
     );
     let ledger = Arc::new(Ledger::default());
+    // Pool-wide accepted-share dedup: a header hash is credited at most
+    // once, across ALL channels. Rejects both same-channel resubmission
+    // (PPLNS weight farming) and identical work found twice. 65_536
+    // entries ≈ days of share traffic at live rates — far beyond any
+    // window where a legitimate duplicate could exist.
+    let dedup = Arc::new(Mutex::new(ShareDedup::new(65_536)));
     // Per-connection channel id allocator. Channel 1 is reserved as the
     // historical default; new connections take 2, 3, … so pool logs and
     // future SetTarget routing can disambiguate miners on the wire.
@@ -461,7 +473,7 @@ async fn main() -> Result<()> {
                 // erroring) just leaves `shared = None`: shared miners
                 // get no new job until the next successful refresh, but
                 // solo mining and the pool itself are unaffected.
-                let shared = match mapper::extract_fee_script(&pt.coinbase_full_hex) {
+                let shared_split = match mapper::extract_fee_script(&pt.coinbase_full_hex) {
                     Ok(fee_script) => {
                         // Snapshot the weights and release the window lock
                         // immediately — compute_split/merge_duplicate_outputs
@@ -488,12 +500,19 @@ async fn main() -> Result<()> {
                         };
                         let split_outputs =
                             split::merge_duplicate_outputs(split::compute_split(&weights, &params));
+                        // Pre-flight an extranonce-free build so a split
+                        // that can't produce a valid template is logged
+                        // ONCE here instead of once per channel. The
+                        // per-channel builds in `serve_miner` reuse these
+                        // exact split outputs with the channel's own
+                        // scriptSig extranonce.
                         match shared_template::build_shared_template(
                             &pt,
-                            split_outputs,
+                            split_outputs.clone(),
+                            None,
                             utreexo_maturity_leaf_height,
                         ) {
-                            Ok(st) => Some(Arc::new(st)),
+                            Ok(_) => Some(split_outputs),
                             Err(e) => {
                                 warn!(error = %e, "build_shared_template failed — shared miners get no job this refresh");
                                 None
@@ -507,7 +526,7 @@ async fn main() -> Result<()> {
                 };
                 let _ = tx.send(Some(Arc::new(TemplateBundle {
                     pt: pt.clone(),
-                    shared,
+                    shared_split,
                     solo_changed,
                 })));
                 last_tip = Some(tip);
@@ -538,6 +557,7 @@ async fn main() -> Result<()> {
         let vardiff_copy = vardiff;
         let window = window.clone();
         let journal = journal.clone();
+        let dedup = dedup.clone();
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         tokio::spawn(async move {
             info!(%peer, channel_id, "miner connected — handshake starting");
@@ -561,6 +581,7 @@ async fn main() -> Result<()> {
                 channel_id,
                 window,
                 journal,
+                dedup,
                 utreexo_maturity_leaf_height,
             )
             .await
@@ -595,6 +616,7 @@ async fn serve_miner(
     channel_id: u32,
     window: Arc<Mutex<PplnsWindow>>,
     journal: Arc<Mutex<WindowJournal>>,
+    dedup: Arc<Mutex<ShareDedup>>,
     utreexo_maturity_leaf_height: u32,
 ) -> Result<()> {
     // ---- Phase A: SetupConnection ----
@@ -752,6 +774,10 @@ async fn serve_miner(
 
     // ---- Phase C: normal operation ----
     let mut current: Option<Arc<TemplateBundle>> = None;
+    // This channel's OWN shared template (per-channel scriptSig
+    // extranonce baked in), derived from the bundle at each push so
+    // share validation always matches the header the miner is grinding.
+    let mut current_shared: Option<Arc<SharedTemplate>> = None;
     let mut last_sequence_number: u32 = 0;
     // None = solo; Some(payout_script) = shared mode. Modern miners send
     // SetRewardMode immediately after channel-open success. Wait briefly
@@ -810,8 +836,11 @@ async fn serve_miner(
     if let Some(bundle) = initial {
         match &reward_mode {
             Some(payout_script) => {
-                if let Some(st) = bundle.shared.as_ref() {
-                    push_shared_job(&mut session, channel_id, st, &window, payout_script).await?;
+                if let Some(st) =
+                    derive_channel_shared(&bundle, channel_id, utreexo_maturity_leaf_height)
+                {
+                    push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
+                    current_shared = Some(st);
                 }
             }
             None => push_job(&mut session, channel_id, &bundle.pt).await?,
@@ -866,8 +895,13 @@ async fn serve_miner(
                             // (logged in the producer), skip the push —
                             // the miner keeps its last job until the
                             // next successful refresh. Never crash.
-                            if let Some(st) = bundle.shared.as_ref() {
-                                push_shared_job(&mut session, channel_id, st, &window, payout_script).await?;
+                            if let Some(st) = derive_channel_shared(
+                                &bundle,
+                                channel_id,
+                                utreexo_maturity_leaf_height,
+                            ) {
+                                push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
+                                current_shared = Some(st);
                             }
                             current = Some(bundle);
                         }
@@ -965,8 +999,13 @@ async fn serve_miner(
                                     // Push the current shared job immediately so the
                                     // miner doesn't idle until the next refresh.
                                     if let Some(bundle) = current.as_ref() {
-                                        if let Some(st) = bundle.shared.as_ref() {
-                                            push_shared_job(&mut session, channel_id, st, &window, &m.payout_script).await?;
+                                        if let Some(st) = derive_channel_shared(
+                                            bundle,
+                                            channel_id,
+                                            utreexo_maturity_leaf_height,
+                                        ) {
+                                            push_shared_job(&mut session, channel_id, &st, &window, &m.payout_script).await?;
+                                            current_shared = Some(st);
                                         }
                                     }
                                 } else {
@@ -994,6 +1033,7 @@ async fn serve_miner(
                                     miner_key,
                                     rpc.as_ref(),
                                     ledger.as_ref(),
+                                    &dedup,
                                 )
                                 .await?;
                             }
@@ -1003,6 +1043,7 @@ async fn serve_miner(
                                     &mut session,
                                     &payload,
                                     current.as_ref(),
+                                    current_shared.as_ref(),
                                     share_target,
                                     channel_id,
                                     &mut last_sequence_number,
@@ -1012,6 +1053,7 @@ async fn serve_miner(
                                     ledger.as_ref(),
                                     &window,
                                     &journal,
+                                    &dedup,
                                 )
                                 .await?;
                             }
@@ -1029,6 +1071,7 @@ async fn serve_miner(
                             miner_key,
                             rpc.as_ref(),
                             ledger.as_ref(),
+                            &dedup,
                             utreexo_maturity_leaf_height,
                         )
                         .await?;
@@ -1036,6 +1079,37 @@ async fn serve_miner(
                     other => warn!(msg_type = other, "unexpected frame type from miner"),
                 }
             }
+        }
+    }
+}
+
+/// Build THIS channel's shared template from the bundle's PPLNS split:
+/// same payout outputs, but with the channel id spliced into the
+/// coinbase scriptSig as an extranonce so the header (merkle_root +
+/// utreexo_root) is unique to the channel. Channel ids are allocated
+/// once per connection for the pool's lifetime, so no two live (or
+/// reconnected) channels ever share a header. Returns `None` (warned)
+/// when this refresh has no shared split or the build fails.
+fn derive_channel_shared(
+    bundle: &TemplateBundle,
+    channel_id: u32,
+    utreexo_maturity_leaf_height: u32,
+) -> Option<Arc<SharedTemplate>> {
+    let split = bundle.shared_split.as_ref()?;
+    match shared_template::build_shared_template(
+        &bundle.pt,
+        split.clone(),
+        Some(channel_id),
+        utreexo_maturity_leaf_height,
+    ) {
+        Ok(st) => Some(Arc::new(st)),
+        Err(e) => {
+            warn!(
+                channel_id,
+                error = %e,
+                "per-channel shared template build failed — channel keeps its last job"
+            );
+            None
         }
     }
 }
@@ -1155,6 +1229,7 @@ async fn handle_share(
     miner_key: MinerKey,
     rpc: &RpcClient,
     ledger: &Ledger,
+    dedup: &Arc<Mutex<ShareDedup>>,
 ) -> Result<()> {
     let share = match decode_submit_shares(payload) {
         Ok(s) => s,
@@ -1202,6 +1277,16 @@ async fn handle_share(
         session
             .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
             .await?;
+        return Ok(());
+    }
+
+    // Pool-wide dedup (solo standard channels all grind the identical
+    // daemon template, so cross-channel duplicates are possible here
+    // until solo work is per-channel too).
+    if !dedup.lock().expect("share dedup mutex").insert(hash) {
+        warn!(hash = %hex::encode(hash), channel_id, "duplicate share rejected");
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, share.sequence_number, "duplicate-share").await?;
         return Ok(());
     }
 
@@ -1275,6 +1360,7 @@ async fn handle_shared_share(
     session: &mut NoiseSession<TcpStream>,
     payload: &[u8],
     current: Option<&Arc<TemplateBundle>>,
+    current_shared: Option<&Arc<SharedTemplate>>,
     share_target: [u8; 32],
     channel_id: u32,
     last_sequence_number: &mut u32,
@@ -1284,6 +1370,7 @@ async fn handle_shared_share(
     ledger: &Ledger,
     window: &Arc<Mutex<PplnsWindow>>,
     journal: &Arc<Mutex<WindowJournal>>,
+    dedup: &Arc<Mutex<ShareDedup>>,
 ) -> Result<()> {
     let miner_key = miner_key_for_payout_script(payout_script);
 
@@ -1310,7 +1397,7 @@ async fn handle_shared_share(
         send_share_error(session, channel_id, share.sequence_number, "no-template").await?;
         return Ok(());
     };
-    let Some(st) = bundle.shared.as_ref() else {
+    let Some(st) = current_shared else {
         warn!("shared share received but no shared template built this refresh");
         ledger.reject(miner_key);
         send_share_error(
@@ -1334,6 +1421,20 @@ async fn handle_shared_share(
     if !meets_share {
         debug!(hash = %hex::encode(hash), "shared share below share-target");
         send_share_error(session, channel_id, share.sequence_number, "under-target").await?;
+        return Ok(());
+    }
+
+    // Pool-wide dedup: never credit the same header hash twice —
+    // whether resubmitted on this channel or found by another one.
+    if !dedup.lock().expect("share dedup mutex").insert(hash) {
+        warn!(
+            hash = %hex::encode(hash),
+            channel_id,
+            payout = %hex::encode(payout_script),
+            "duplicate shared share rejected"
+        );
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, share.sequence_number, "duplicate-share").await?;
         return Ok(());
     }
 
@@ -1445,6 +1546,7 @@ async fn handle_extended_share(
     miner_key: MinerKey,
     rpc: &RpcClient,
     ledger: &Ledger,
+    dedup: &Arc<Mutex<ShareDedup>>,
     utreexo_maturity_leaf_height: u32,
 ) -> Result<()> {
     let ext = match decode_submit_shares_extended(payload) {
@@ -1625,6 +1727,16 @@ async fn handle_extended_share(
     if !meets_share {
         debug!(hash = %hex::encode(hash), "extended share below share-target");
         send_share_error(session, channel_id, ext.sequence_number, "under-target").await?;
+        return Ok(());
+    }
+
+    // Pool-wide dedup: extended-share miners own their coinbase (work
+    // is already unique per miner), but resubmitting the same share
+    // must still not double-credit.
+    if !dedup.lock().expect("share dedup mutex").insert(hash) {
+        warn!(hash = %hex::encode(hash), channel_id, "duplicate extended share rejected");
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "duplicate-share").await?;
         return Ok(());
     }
 
