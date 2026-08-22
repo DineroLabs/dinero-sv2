@@ -6,9 +6,11 @@
 //! accounting without duplicating them.
 
 pub mod accounting;
+pub mod backend;
+pub mod block;
 pub mod dedup;
 pub mod extranonce;
-pub mod block;
+pub mod job_generation;
 pub mod journal;
 pub mod mapper;
 pub mod rpc;

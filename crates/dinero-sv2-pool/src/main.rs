@@ -13,7 +13,10 @@
 //! no persistent share ledger. See crate docs in
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
-use dinero_sv2_pool::{accounting, block, dedup, journal, mapper, rpc, shared_template, split, target};
+use dinero_sv2_pool::{
+    accounting, backend, block, dedup, job_generation, journal, mapper, rpc, shared_template,
+    split, target,
+};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -62,6 +65,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry};
+use crate::backend::BackendPool;
 use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
 use crate::mapper::PoolTemplate;
@@ -89,6 +93,11 @@ struct TemplateBundle {
     /// and curtime fresh, not to reissue identical solo work. See the
     /// producer loop and `serve_miner`'s `rx.changed` arm.
     solo_changed: bool,
+    /// Monotonic backend-selection generation. A change forces a fresh job and
+    /// makes every prior job_id stale even when both healthy daemons share the
+    /// same chain tip.
+    backend_epoch: u64,
+    backend_endpoint: String,
 }
 
 /// Hash a shared-mode miner's payout script into the ledger's
@@ -118,9 +127,10 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:4444")]
     bind: SocketAddr,
 
-    /// dinerod RPC URL.
-    #[arg(long, default_value = "http://127.0.0.1:20998")]
-    rpc_url: String,
+    /// dinerod RPC URL. Repeat this option (or use comma-separated values) to
+    /// configure health-checked failover backends.
+    #[arg(long, value_delimiter = ',', default_value = "http://127.0.0.1:20998")]
+    rpc_url: Vec<String>,
 
     /// Cookie file (ignored if --rpc-user / --rpc-password are set).
     #[arg(long)]
@@ -249,13 +259,17 @@ async fn main() -> Result<()> {
         (Some(u), Some(p), _) => Auth::UserPass(u.clone(), p.clone()),
         _ => Auth::Cookie(args.cookie.clone().unwrap_or_else(default_cookie_path)),
     };
-    let rpc = Arc::new(RpcClient::new(args.rpc_url.clone(), auth).context("building rpc client")?);
-
-    let best = rpc
-        .get_best_block_hash()
-        .await
-        .context("initial getbestblockhash — is dinerod running?")?;
-    info!(tip = %best, "connected to dinerod");
+    let rpc_clients = args
+        .rpc_url
+        .iter()
+        .map(|url| RpcClient::new(url.clone(), auth.clone()).map(Arc::new))
+        .collect::<Result<Vec<_>>>()
+        .context("building rpc clients")?;
+    let backends = Arc::new(BackendPool::new(rpc_clients)?);
+    info!(
+        backend_count = backends.len(),
+        "configured dinerod backend pool"
+    );
 
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
@@ -315,7 +329,7 @@ async fn main() -> Result<()> {
 
     // Template producer task.
     let mut template_producer = {
-        let rpc = rpc.clone();
+        let backends = backends.clone();
         let payout = args.payout_address.clone();
         let poll = Duration::from_secs(args.poll_secs);
         let refresh_same_tip = if args.refresh_same_tip_secs == 0 {
@@ -335,32 +349,29 @@ async fn main() -> Result<()> {
             let mut last_tip: Option<String> = None;
             let mut last_template_at: Option<std::time::Instant> = None;
             let mut last_nbits: Option<u32> = None;
+            let mut last_backend_epoch: Option<u64> = None;
             let mut template_id: u64 = 0;
             loop {
                 ticker.tick().await;
-                let tip = match rpc.get_best_block_hash().await {
-                    Ok(h) => h,
+                let (backend, gbt) = match backends.select_template(&payout).await {
+                    Ok(v) => v,
                     Err(e) => {
-                        warn!(error = %e, "getbestblockhash failed");
+                        warn!(error = %e, "no mining-safe backend; miners retain their last job while failover retries");
                         continue;
                     }
                 };
+                let rpc = backend.client.clone();
+                let tip = backend.health.best_hash.clone();
+                let backend_changed = last_backend_epoch != Some(backend.epoch);
                 let tip_changed = last_tip.as_deref() != Some(tip.as_str());
                 let stale_same_tip = match (refresh_same_tip, last_template_at) {
                     (Some(window), Some(t)) => t.elapsed() >= window,
                     (Some(_), None) => true,
                     (None, _) => false,
                 };
-                if !tip_changed && !stale_same_tip {
+                if !tip_changed && !stale_same_tip && !backend_changed {
                     continue;
                 }
-                let gbt = match rpc.get_block_template(&payout).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error = %e, "getblocktemplate failed");
-                        continue;
-                    }
-                };
                 template_id = template_id.wrapping_add(1);
                 let mut pt = match mapper::map_template(&gbt, template_id) {
                     Ok(t) => t,
@@ -396,7 +407,7 @@ async fn main() -> Result<()> {
                 if !pt.mempool_txs.is_empty() {
                     if let Some(pre_block) = pt.utreexo_pre_block.as_ref().cloned() {
                         match apply_mempool_to_pre_coinbase(
-                            &rpc,
+                            rpc.as_ref(),
                             &pre_block,
                             &pt.mempool_txs,
                             pt.height,
@@ -453,13 +464,17 @@ async fn main() -> Result<()> {
                 // skip the solo push (and skip rebasing `current` onto
                 // this bundle) while still refreshing shared jobs every
                 // window.
-                let solo_changed = tip_changed || nbits_changed;
+                let solo_changed = tip_changed || nbits_changed || backend_changed;
                 info!(
                     template_id = pt.wire.template_id,
                     tip = %tip,
                     nbits = format!("0x{:08x}", pt.wire.difficulty),
                     nbits_changed,
                     tip_changed,
+                    backend = %backend.health.endpoint,
+                    backend_epoch = backend.epoch,
+                    backend_changed,
+                    chainwork = %backend.health.chainwork,
                     block_target = %hex::encode(pt.block_target),
                     utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
                     "new template"
@@ -528,10 +543,13 @@ async fn main() -> Result<()> {
                     pt: pt.clone(),
                     shared_split,
                     solo_changed,
+                    backend_epoch: backend.epoch,
+                    backend_endpoint: backend.health.endpoint.clone(),
                 })));
                 last_tip = Some(tip);
                 last_template_at = Some(std::time::Instant::now());
                 last_nbits = Some(pt.wire.difficulty);
+                last_backend_epoch = Some(backend.epoch);
             }
         })
     };
@@ -549,7 +567,7 @@ async fn main() -> Result<()> {
             accepted = listener.accept() => accepted?,
         };
         let rx = rx.clone();
-        let rpc = rpc.clone();
+        let backends = backends.clone();
         let ledger = ledger.clone();
         let share_target_copy = share_target_fallback;
         let keys = static_keys.clone();
@@ -576,7 +594,7 @@ async fn main() -> Result<()> {
                 share_target_copy,
                 vardiff_copy,
                 miner_key,
-                rpc,
+                backends,
                 ledger,
                 channel_id,
                 window,
@@ -611,7 +629,7 @@ async fn serve_miner(
     share_target_fallback: [u8; 32],
     vardiff: Option<VardiffConfig>,
     miner_key: MinerKey,
-    rpc: Arc<RpcClient>,
+    backends: Arc<BackendPool>,
     ledger: Arc<Ledger>,
     channel_id: u32,
     window: Arc<Mutex<PplnsWindow>>,
@@ -834,6 +852,12 @@ async fn serve_miner(
 
     let initial = rx.borrow_and_update().clone();
     if let Some(bundle) = initial {
+        debug!(
+            backend = %bundle.backend_endpoint,
+            backend_epoch = bundle.backend_epoch,
+            template_id = bundle.pt.wire.template_id,
+            "installing initial backend job generation"
+        );
         match &reward_mode {
             Some(payout_script) => {
                 if let Some(st) =
@@ -873,6 +897,12 @@ async fn serve_miner(
                 }
                 let maybe_bundle = rx.borrow_and_update().clone();
                 if let Some(bundle) = maybe_bundle {
+                    debug!(
+                        backend = %bundle.backend_endpoint,
+                        backend_epoch = bundle.backend_epoch,
+                        template_id = bundle.pt.wire.template_id,
+                        "observed backend job generation"
+                    );
                     match &reward_mode {
                         None => {
                             // Skip both the push AND the `current` swap
@@ -902,8 +932,13 @@ async fn serve_miner(
                             ) {
                                 push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
                                 current_shared = Some(st);
+                                // Keep the daemon-derived block target paired
+                                // with the exact per-channel template that was
+                                // actually sent. On a failed refresh the miner
+                                // continues its previous job and validation must
+                                // continue using that previous bundle too.
+                                current = Some(bundle);
                             }
-                            current = Some(bundle);
                         }
                     }
                 }
@@ -1031,7 +1066,7 @@ async fn serve_miner(
                                     &mut last_sequence_number,
                                     &mut accepted_in_window,
                                     miner_key,
-                                    rpc.as_ref(),
+                                    backends.as_ref(),
                                     ledger.as_ref(),
                                     &dedup,
                                 )
@@ -1049,7 +1084,7 @@ async fn serve_miner(
                                     &mut last_sequence_number,
                                     &mut accepted_in_window,
                                     &payout_script,
-                                    rpc.as_ref(),
+                                    backends.as_ref(),
                                     ledger.as_ref(),
                                     &window,
                                     &journal,
@@ -1069,7 +1104,7 @@ async fn serve_miner(
                             &mut last_sequence_number,
                             &mut accepted_in_window,
                             miner_key,
-                            rpc.as_ref(),
+                            backends.as_ref(),
                             ledger.as_ref(),
                             &dedup,
                             utreexo_maturity_leaf_height,
@@ -1227,7 +1262,7 @@ async fn handle_share(
     last_sequence_number: &mut u32,
     accepted_in_window: &mut u64,
     miner_key: MinerKey,
-    rpc: &RpcClient,
+    backends: &BackendPool,
     ledger: &Ledger,
     dedup: &Arc<Mutex<ShareDedup>>,
 ) -> Result<()> {
@@ -1262,6 +1297,12 @@ async fn handle_share(
             .await?;
         return Ok(());
     };
+
+    if !job_generation::is_current_job(share.job_id, pt.wire.template_id) {
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, share.sequence_number, "stale-share").await?;
+        return Ok(());
+    }
 
     let hash = HeaderAssembly::hash(&pt.wire, &share);
     let meets_share = hash_meets_target(&hash, &share_target);
@@ -1312,7 +1353,15 @@ async fn handle_share(
 
     if meets_block {
         let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
-        match try_submit_block(&pt.wire, &share, &pt.coinbase_full_hex, &mempool_data, rpc).await {
+        match try_submit_block(
+            &pt.wire,
+            &share,
+            &pt.coinbase_full_hex,
+            &mempool_data,
+            backends,
+        )
+        .await
+        {
             Ok(SubmitBlockResult::Accepted) => {
                 info!(
                     template_id = pt.wire.template_id,
@@ -1342,10 +1391,10 @@ async fn try_submit_block(
     share: &SubmitSharesDinero,
     coinbase_full_hex: &str,
     mempool_tx_data: &[Vec<u8>],
-    rpc: &RpcClient,
+    backends: &BackendPool,
 ) -> Result<SubmitBlockResult> {
     let block_hex = block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
-    rpc.submit_block(&block_hex).await
+    backends.submit_block(&block_hex).await
 }
 
 // =====================================================================
@@ -1366,7 +1415,7 @@ async fn handle_shared_share(
     last_sequence_number: &mut u32,
     accepted_in_window: &mut u64,
     payout_script: &[u8],
-    rpc: &RpcClient,
+    backends: &BackendPool,
     ledger: &Ledger,
     window: &Arc<Mutex<PplnsWindow>>,
     journal: &Arc<Mutex<WindowJournal>>,
@@ -1409,6 +1458,12 @@ async fn handle_shared_share(
         .await?;
         return Ok(());
     };
+
+    if !job_generation::is_current_job(share.job_id, st.wire.template_id) {
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, share.sequence_number, "stale-share").await?;
+        return Ok(());
+    }
 
     let hash = HeaderAssembly::hash(&st.wire, &share);
     let meets_share = hash_meets_target(&hash, &share_target);
@@ -1501,7 +1556,7 @@ async fn handle_shared_share(
         .await?;
 
     if meets_block {
-        match try_submit_block(&st.wire, &share, &st.coinbase_full_hex, &[], rpc).await {
+        match try_submit_block(&st.wire, &share, &st.coinbase_full_hex, &[], backends).await {
             Ok(SubmitBlockResult::Accepted) => {
                 info!(
                     template_id = st.wire.template_id,
@@ -1544,7 +1599,7 @@ async fn handle_extended_share(
     last_sequence_number: &mut u32,
     accepted_in_window: &mut u64,
     miner_key: MinerKey,
-    rpc: &RpcClient,
+    backends: &BackendPool,
     ledger: &Ledger,
     dedup: &Arc<Mutex<ShareDedup>>,
     utreexo_maturity_leaf_height: u32,
@@ -1573,6 +1628,11 @@ async fn handle_extended_share(
         send_share_error(session, channel_id, ext.sequence_number, "no-template").await?;
         return Ok(());
     };
+    if !job_generation::is_current_job(ext.job_id, pt.wire.template_id) {
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "stale-share").await?;
+        return Ok(());
+    }
     let Some(pre_block_state) = pt.utreexo_pre_block.as_ref() else {
         warn!("extended share but no pre-block Utreexo state");
         ledger.reject(miner_key);
@@ -1773,7 +1833,7 @@ async fn handle_extended_share(
         );
         let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
         match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase, &mempool_data) {
-            Ok(block_hex) => match rpc.submit_block(&block_hex).await {
+            Ok(block_hex) => match backends.submit_block(&block_hex).await {
                 Ok(SubmitBlockResult::Accepted) => {
                     info!("★ extended-share block ACCEPTED by dinerod");
                     ledger.credit_block(miner_key);
