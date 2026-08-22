@@ -15,7 +15,7 @@ use dinero_sv2_jd::{
 };
 
 use crate::block::wrap_stripped_with_segwit_witness;
-use crate::mapper::{MempoolTx, PoolTemplate};
+use crate::mapper::PoolTemplate;
 
 /// Pool-assembled template for a shared (non-JD) miner: the pool
 /// builds the whole coinbase itself, so the header roots it emits are
@@ -59,6 +59,7 @@ pub struct SharedTemplate {
 pub fn build_shared_template(
     pt: &PoolTemplate,
     split_outputs: Vec<CoinbaseOutput>,
+    extranonce: Option<u32>,
     utreexo_maturity_leaf_height: u32,
 ) -> Result<SharedTemplate> {
     let value_sum: u64 = split_outputs.iter().map(|o| o.value_una).sum();
@@ -125,8 +126,24 @@ pub fn build_shared_template(
         });
     }
 
+    // Per-channel unique work: splice the channel's extranonce into the
+    // coinbase scriptSig so the coinbase txid — and with it the header
+    // merkle_root and utreexo_root — differ per channel. Without this,
+    // every shared channel grinds the identical header and the pool's
+    // aggregate hashrate collapses to the fastest single miner.
+    let prefix_with_extranonce;
+    let coinbase_prefix: &[u8] = match extranonce {
+        Some(en) => {
+            prefix_with_extranonce =
+                crate::extranonce::inject_scriptsig_extranonce(&pt.coinbase_prefix, en)
+                    .context("injecting coinbase scriptSig extranonce")?;
+            &prefix_with_extranonce
+        }
+        None => &pt.coinbase_prefix,
+    };
+
     let (coinbase_stripped, coinbase_txid) =
-        assemble_stripped_coinbase(&pt.coinbase_prefix, &outputs, &pt.coinbase_suffix);
+        assemble_stripped_coinbase(coinbase_prefix, &outputs, &pt.coinbase_suffix);
 
     let mut state = pre_block.clone();
     for (i, o) in outputs.iter().enumerate() {
@@ -189,7 +206,7 @@ mod tests {
                 script_pubkey: vec![0x51, 0x20, 0x09],
             },
         ];
-        let st = build_shared_template(&pt, outputs.clone(), UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
+        let st = build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
 
         // Value invariant:
         let cb = hex::decode(&st.coinbase_full_hex).unwrap();
@@ -227,6 +244,90 @@ mod tests {
     }
 
     #[test]
+    fn per_channel_extranonce_diverges_headers() {
+        // The whole point of the extranonce: two channels must never be
+        // handed the same header to grind. Distinct extranonces must
+        // produce distinct coinbase txids and therefore distinct
+        // merkle_root AND utreexo_root, while paying out identically.
+        let mut pt = crate::mapper::tests::fixture_pool_template();
+        pt.height = 61_410;
+        let outputs = vec![CoinbaseOutput {
+            value_una: pt.coinbase_value_una,
+            script_pubkey: vec![0x51, 0x20, 0x01],
+        }];
+        let a = build_shared_template(
+            &pt,
+            outputs.clone(),
+            Some(2),
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
+        let b = build_shared_template(
+            &pt,
+            outputs.clone(),
+            Some(3),
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
+        let base =
+            build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
+                .unwrap();
+
+        assert_ne!(a.wire.merkle_root, b.wire.merkle_root);
+        assert_ne!(a.wire.utreexo_root, b.wire.utreexo_root);
+        assert_ne!(a.coinbase_full_hex, b.coinbase_full_hex);
+        assert_ne!(a.wire.merkle_root, base.wire.merkle_root);
+        // Deterministic per extranonce.
+        let a2 = build_shared_template(
+            &pt,
+            outputs.clone(),
+            Some(2),
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
+        assert_eq!(a.wire.merkle_root, a2.wire.merkle_root);
+        assert_eq!(a.wire.utreexo_root, a2.wire.utreexo_root);
+
+        // Non-header fields are untouched: same outputs (payout split,
+        // DNRW/DNRF) and same template metadata.
+        assert_eq!(a.outputs, b.outputs);
+        assert_eq!(a.wire.prev_block_hash, b.wire.prev_block_hash);
+        assert_eq!(a.wire.difficulty, b.wire.difficulty);
+        assert_eq!(a.wire.timestamp, b.wire.timestamp);
+    }
+
+    #[test]
+    fn extranonce_is_spliced_into_coinbase_scriptsig() {
+        // The extranonce must land inside the serialized coinbase as a
+        // trailing scriptSig push (0x04 + LE bytes), growing the
+        // coinbase by exactly 5 bytes vs the extranonce-free build.
+        let pt = crate::mapper::tests::fixture_pool_template();
+        let outputs = vec![CoinbaseOutput {
+            value_una: pt.coinbase_value_una,
+            script_pubkey: vec![0x51, 0x20, 0x01],
+        }];
+        let base =
+            build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
+                .unwrap();
+        let en = build_shared_template(
+            &pt,
+            outputs,
+            Some(0xdead_beef),
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
+        let base_cb = hex::decode(&base.coinbase_full_hex).unwrap();
+        let en_cb = hex::decode(&en.coinbase_full_hex).unwrap();
+        assert_eq!(en_cb.len(), base_cb.len() + 5);
+        let push: &[u8] = &[0x04, 0xef, 0xbe, 0xad, 0xde];
+        assert!(
+            en_cb.windows(5).any(|w| w == push),
+            "pushed LE extranonce not found in coinbase bytes"
+        );
+        assert!(!base_cb.windows(5).any(|w| w == push));
+    }
+
+    #[test]
     fn refresh_selection_builds_template_from_merged_window_split() {
         // Simulates the real template-refresh path: a PPLNS window with
         // entries for two contributors, run through compute_split, then
@@ -255,7 +356,7 @@ mod tests {
         };
         let merged = split::merge_duplicate_outputs(split::compute_split(&weights, &params));
 
-        let st = build_shared_template(&pt, merged.clone(), UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
+        let st = build_shared_template(&pt, merged.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
 
         // The template's leading value outputs (before DNRW/DNRF) must
         // equal the merged compute_split result exactly.
@@ -274,7 +375,7 @@ mod tests {
             value_una: pt.coinbase_value_una - 1,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
+        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
         assert!(err.to_string().contains("split sum"));
     }
 
@@ -286,7 +387,7 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
+        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
         assert!(err.to_string().contains("utreexo pre-block"));
     }
 
@@ -294,7 +395,7 @@ mod tests {
     fn rejects_nonempty_mempool() {
         let mut pt = crate::mapper::tests::fixture_pool_template();
         // Fixture has empty mempool_txs; push a dummy one to trigger rejection.
-        pt.mempool_txs.push(MempoolTx {
+        pt.mempool_txs.push(crate::mapper::MempoolTx {
             data: vec![0x01, 0x02, 0x03], // minimal dummy tx bytes
             txid_raw: [0x42u8; 32],
             inputs: vec![],
@@ -305,7 +406,7 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
+        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
         assert!(err.to_string().contains("coinbase-only"));
     }
 
@@ -327,7 +428,7 @@ mod tests {
                 script_pubkey: vec![0x51, 0x20, 0x09],
             },
         ];
-        let st = build_shared_template(&pt, outputs.clone(), UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
+        let st = build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
 
         // Should have 2 value outputs + DNRF only (no DNRW).
         assert_eq!(st.outputs.len(), 3);

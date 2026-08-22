@@ -6,6 +6,8 @@
 //! accounting without duplicating them.
 
 pub mod accounting;
+pub mod dedup;
+pub mod extranonce;
 pub mod block;
 pub mod journal;
 pub mod mapper;
