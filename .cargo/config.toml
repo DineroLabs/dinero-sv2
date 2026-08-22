@@ -1,0 +1,5 @@
+[resolver]
+# Keep dependency resolution compatible with workspace.package.rust-version.
+# Older Cargo releases ignore this forward-compatible resolver hint; CI still
+# uses the checked-in lockfile, which is verified directly with Rust 1.75.
+incompatible-rust-versions = "fallback"

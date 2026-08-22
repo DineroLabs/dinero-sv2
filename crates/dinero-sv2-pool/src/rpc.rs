@@ -36,6 +36,7 @@ impl Auth {
 }
 
 /// Dinerod JSON-RPC client.
+#[derive(Clone)]
 pub struct RpcClient {
     http: Client,
     url: String,
@@ -60,6 +61,17 @@ pub enum SubmitBlockResult {
 }
 
 impl RpcClient {
+    fn without_embedded_error(method: &str, value: Value) -> Result<Value> {
+        if let Some(error) = value
+            .as_object()
+            .and_then(|object| object.get("error"))
+            .filter(|error| !error.is_null())
+        {
+            return Err(anyhow!("rpc {method} error: {error}"));
+        }
+        Ok(value)
+    }
+
     /// Build a new JSON-RPC client with the default 15s per-request
     /// timeout (right for the pool's own steady-state calls).
     pub fn new(url: String, auth: Auth) -> Result<Self> {
@@ -112,6 +124,42 @@ impl RpcClient {
         Ok(body.get("result").cloned().unwrap_or_else(|| body.clone()))
     }
 
+    /// Human-readable endpoint used in health/failover logs.
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+
+    /// Chain identity, height, header height and cumulative work used by the
+    /// backend selector. Selection is by validated chainwork, never node vote.
+    pub async fn get_blockchain_info(&self) -> Result<Value> {
+        let value = self
+            .call("getblockchaininfo", serde_json::json!([]))
+            .await?;
+        Self::without_embedded_error("getblockchaininfo", value)
+    }
+
+    /// True when this daemon can read the supplied full block. Used to resolve
+    /// the otherwise-ambiguous case where submitblock timed out after the daemon
+    /// had already accepted and stored the block. Header-only knowledge is not
+    /// sufficient evidence of block acceptance.
+    pub async fn has_block(&self, display_hash: &str) -> bool {
+        let value = match self
+            .call("getblock", serde_json::json!([display_hash, 1]))
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let Ok(value) = Self::without_embedded_error("getblock", value) else {
+            return false;
+        };
+        value
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(|hash| hash.eq_ignore_ascii_case(display_hash))
+            .unwrap_or(false)
+    }
+
     /// Current tip hash (display-order hex).
     pub async fn get_best_block_hash(&self) -> Result<String> {
         let v = self.call("getbestblockhash", serde_json::json!([])).await?;
@@ -120,11 +168,13 @@ impl RpcClient {
 
     /// Fetch a block template for the given payout address.
     pub async fn get_block_template(&self, address: &str) -> Result<Value> {
-        self.call(
-            "getblocktemplate",
-            serde_json::json!([{ "address": address }]),
-        )
-        .await
+        let value = self
+            .call(
+                "getblocktemplate",
+                serde_json::json!([{ "address": address }]),
+            )
+            .await?;
+        Self::without_embedded_error("getblocktemplate", value)
     }
 
     /// Fetch the post-tip Utreexo forest state (forest roots + leaf
@@ -145,10 +195,7 @@ impl RpcClient {
     /// if the daemon returns a non-success entry for ANY outpoint —
     /// since a single missing input invalidates the whole post-mempool
     /// utreexo state.
-    pub async fn get_utxo_proofs_batch(
-        &self,
-        outpoints: &[(String, u32)],
-    ) -> Result<Value> {
+    pub async fn get_utxo_proofs_batch(&self, outpoints: &[(String, u32)]) -> Result<Value> {
         let arr: Vec<Value> = outpoints
             .iter()
             .map(|(txid, vout)| serde_json::json!({"txid": txid, "vout": vout}))
@@ -177,14 +224,8 @@ impl RpcClient {
             return Ok(SubmitBlockResult::Rejected(s.to_string()));
         }
         if let Some(obj) = v.as_object() {
-            let has_error = obj
-                .get("error")
-                .map(|e| !e.is_null())
-                .unwrap_or(false);
-            let has_code = obj
-                .get("code")
-                .map(|c| !c.is_null())
-                .unwrap_or(false);
+            let has_error = obj.get("error").map(|e| !e.is_null()).unwrap_or(false);
+            let has_code = obj.get("code").map(|c| !c.is_null()).unwrap_or(false);
             if !has_error && !has_code {
                 return Ok(SubmitBlockResult::Accepted);
             }

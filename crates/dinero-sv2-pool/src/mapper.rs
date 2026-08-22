@@ -392,9 +392,10 @@ fn coinbase_merkle_path(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
 /// and version are skipped — the pool re-emits the daemon's verbatim
 /// `data` bytes for submitblock, so we only need the structured slices
 /// we'll feed to Utreexo apply_deletions / leaf_hash.
-fn parse_segwit_tx_inputs_outputs(
-    bytes: &[u8],
-) -> Result<(Vec<([u8; 32], u32)>, Vec<(u64, Vec<u8>)>)> {
+type ParsedInputs = Vec<([u8; 32], u32)>;
+type ParsedOutputs = Vec<(u64, Vec<u8>)>;
+
+fn parse_segwit_tx_inputs_outputs(bytes: &[u8]) -> Result<(ParsedInputs, ParsedOutputs)> {
     let mut cur = 0usize;
     if bytes.len() < 10 {
         bail!("tx too short ({} bytes)", bytes.len());

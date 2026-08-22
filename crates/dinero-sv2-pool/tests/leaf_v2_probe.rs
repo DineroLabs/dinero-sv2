@@ -12,10 +12,10 @@
 //! This test replays a snapshot captured from the live SJ mainnet
 //! daemon (v8.0.13, height 61403): `getutreexoroots` pre-block forest
 //! + the `getblocktemplate` coinbase. The daemon's own
-//! `utreexocommitment` for that template is the consensus-correct
-//! post-coinbase root, so it pins [`leaf_hash_v2`] to the C++
-//! implementation byte-for-byte. (`utreexocommitment` is a `GetHex()`
-//! display string — byte-reversed relative to the raw commitment.)
+//!   `utreexocommitment` for that template is the consensus-correct
+//!   post-coinbase root, so it pins [`leaf_hash_v2`] to the C++
+//!   implementation byte-for-byte. (`utreexocommitment` is a `GetHex()`
+//!   display string — byte-reversed relative to the raw commitment.)
 
 use dinero_sv2_jd::{
     commitment, leaf_hash, leaf_hash_for_height, UtreexoAccumulatorState,
