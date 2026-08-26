@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::display::{self, celebration_frames, feed_line, Display, FeedKind, FeedWindow};
+use crate::display::{self, celebration_frames, header_story_line, Display, FeedKind, FeedWindow};
 use crate::theme;
 
 /// A real candidate nonce/hash pulled from the miner's current sweep.
@@ -12,6 +12,7 @@ use crate::theme;
 pub struct CandidateSample {
     pub nonce: u32,
     pub hash: [u8; 32],
+    pub header: [u8; 128],
 }
 
 /// Returns a REAL candidate from the miner's current sweep, or None
@@ -142,7 +143,7 @@ impl FxScreen {
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
         let row = match inner.last_sample {
-            Some(s) => feed_line(FeedKind::Share, s.nonce, &s.hash, width, colors),
+            Some(s) => header_story_line(FeedKind::Share, s.nonce, &s.hash, &s.header, width, colors),
             None => theme::paint(theme::BRIGHT_GREEN, "  ▓ SHARE ✓ pool accepted", colors),
         };
         inner.window.push_row(row);
@@ -157,7 +158,7 @@ impl FxScreen {
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
         let row = match inner.last_sample {
-            Some(s) => feed_line(FeedKind::Rejected, s.nonce, &s.hash, width, colors),
+            Some(s) => header_story_line(FeedKind::Rejected, s.nonce, &s.hash, &s.header, width, colors),
             None => theme::paint(theme::RED, "  ✗ rejected", colors),
         };
         inner.window.push_row(row);
@@ -169,7 +170,7 @@ impl FxScreen {
         inner.last_sample = Some(s);
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
-        let row = feed_line(FeedKind::Candidate, s.nonce, &s.hash, width, colors);
+        let row = header_story_line(FeedKind::Candidate, s.nonce, &s.hash, &s.header, width, colors);
         inner.window.push_row(row);
         inner.window.repaint(width, colors)
     }
@@ -372,6 +373,7 @@ mod tests {
             Some(CandidateSample {
                 nonce: 0xabcd0001,
                 hash: [7u8; 32],
+                header: [0u8; 128],
             })
         });
         fx.tick(&sampler);

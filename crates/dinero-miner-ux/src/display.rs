@@ -190,6 +190,58 @@ pub fn feed_line(kind: FeedKind, nonce: u32, hash: &[u8; 32], width: usize, colo
     }
 }
 
+/// One truthful, non-wrapping Dinero header story. Serialized uint256 fields
+/// are reversed for conventional display; `header` remains the exact 128-byte
+/// value used by the miner.
+pub fn header_story_line(
+    kind: FeedKind,
+    nonce: u32,
+    hash: &[u8; 32],
+    header: &[u8; 128],
+    width: usize,
+    colors: bool,
+) -> String {
+    fn hex_forward(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn hex_reverse(bytes: &[u8]) -> String {
+        bytes.iter().rev().map(|b| format!("{b:02x}")).collect()
+    }
+
+    let marker = match kind {
+        FeedKind::Candidate => "✗",
+        FeedKind::Share => "✓",
+        FeedKind::Rejected => "!",
+        FeedKind::Stale => "↻",
+    };
+    let version = u32::from_le_bytes(header[0x00..0x04].try_into().unwrap());
+    let timestamp = u64::from_le_bytes(header[0x64..0x6c].try_into().unwrap());
+    let bits = u32::from_le_bytes(header[0x6c..0x70].try_into().unwrap());
+    let plain_row = format!(
+        "nonce=0x{nonce:08x} hash={} prev={} merkle={} utreexo={} version=0x{version:08x} time={timestamp} bits=0x{bits:08x} reserved={} {marker}",
+        hex_forward(hash),
+        hex_reverse(&header[0x04..0x24]),
+        hex_reverse(&header[0x24..0x44]),
+        hex_reverse(&header[0x44..0x64]),
+        hex_forward(&header[0x74..0x80]),
+    );
+    let truncated = if plain_row.chars().count() > width {
+        match width {
+            0 => String::new(),
+            1 => "…".to_string(),
+            _ => format!("{}…", plain_row.chars().take(width - 1).collect::<String>()),
+        }
+    } else {
+        plain_row
+    };
+    match kind {
+        FeedKind::Candidate => crate::theme::paint(crate::theme::DIM_GREEN, &truncated, colors),
+        FeedKind::Share => crate::theme::paint(crate::theme::BRIGHT_GREEN, &truncated, colors),
+        FeedKind::Rejected => crate::theme::paint(crate::theme::RED, &truncated, colors),
+        FeedKind::Stale => crate::theme::paint(crate::theme::YELLOW, &truncated, colors),
+    }
+}
+
 /// Gold flash frames: █×n, ▓×n, █×n, ▒×n, then "■■■  B L O C K   F O U N D   #<no>  ■■■".
 pub fn celebration_frames(width: usize, block_no: u64, colors: bool) -> Vec<String> {
     let mut frames = Vec::new();
@@ -678,6 +730,32 @@ mod tests {
         // colored share row carries bright green and resets
         let colored = feed_line(FeedKind::Share, 1, &h, 100, true);
         assert!(colored.contains("\x1b[1;92m") && colored.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn header_story_is_complete_ordered_and_non_wrapping() {
+        let mut header = [0u8; 128];
+        header[0x00..0x04].copy_from_slice(&1u32.to_le_bytes());
+        header[0x04..0x24].fill(0x11);
+        header[0x24..0x44].fill(0x22);
+        header[0x44..0x64].fill(0x33);
+        header[0x64..0x6c].copy_from_slice(&1_777_777_777u64.to_le_bytes());
+        header[0x6c..0x70].copy_from_slice(&0x1d00cf7eu32.to_le_bytes());
+        header[0x70..0x74].copy_from_slice(&0xa1b2c3d4u32.to_le_bytes());
+        let line = header_story_line(FeedKind::Candidate, 0xa1b2c3d4, &[0x44; 32], &header, 1000, false);
+        let expected = [
+            "nonce=0xa1b2c3d4", "hash=4444", "prev=1111", "merkle=2222",
+            "utreexo=3333", "version=0x00000001", "time=1777777777",
+            "bits=0x1d00cf7e", "reserved=000000000000000000000000", "✗",
+        ];
+        let mut previous = 0;
+        for field in expected {
+            let position = line.find(field).expect("complete header field");
+            assert!(position >= previous, "field order: {field}");
+            previous = position;
+        }
+        assert!(!line.contains('\n'));
+        assert_eq!(header_story_line(FeedKind::Candidate, 0, &[0; 32], &header, 1, false), "…");
     }
     #[test]
     fn celebration_shape() {
