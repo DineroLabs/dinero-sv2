@@ -624,6 +624,13 @@ impl FeedWindow {
         self.painted = false;
         output
     }
+
+    /// Forget cursor-relative paint state after an external full-screen clear.
+    /// Unlike `clear()`, this emits no cursor motion and is therefore safe when
+    /// a terminal resize may have wrapped old rows onto unknown physical lines.
+    pub fn invalidate_paint(&mut self) {
+        self.painted = false;
+    }
 }
 
 fn theme_line(line: &str, colors: bool) -> String {

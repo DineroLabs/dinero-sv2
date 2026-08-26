@@ -167,18 +167,39 @@ impl FxScreen {
     }
 
     fn push_candidate(inner: &mut Inner, s: CandidateSample) -> String {
+        Self::push_candidate_at_width(inner, s, theme::live_term_width())
+    }
+
+    fn push_candidate_at_width(
+        inner: &mut Inner,
+        s: CandidateSample,
+        live_width: Option<usize>,
+    ) -> String {
         inner.last_sample = Some(s);
         // Apple Terminal can briefly expose its 80-column default while a new
         // session is starting. Refresh from the live PTY on every sampled
         // candidate so startup races and later resizes self-heal immediately.
-        if let Some(width) = theme::live_term_width() {
-            inner.cfg.width = width;
+        let mut reset = String::new();
+        if let Some(width) = live_width {
+            if width != inner.cfg.width {
+                inner.cfg.width = width;
+                if inner.alternate_screen {
+                    // Old rows may have wrapped after a shrink, making their
+                    // physical line count unknowable. Reset only our private
+                    // alternate screen and rebuild from a known origin.
+                    inner.window.invalidate_paint();
+                    reset.push_str("\x1b[2J\x1b[H");
+                    reset.push_str(&display::banner(inner.cfg.colors));
+                    reset.push('\n');
+                }
+            }
         }
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
         let row = header_story_line(FeedKind::Candidate, s.nonce, &s.hash, &s.header, width, colors);
         inner.window.push_row(row);
-        inner.window.repaint(width, colors)
+        reset.push_str(&inner.window.repaint(width, colors));
+        reset
     }
 
     /// Candidate row → repaint.
@@ -388,6 +409,23 @@ mod tests {
         assert!(plain.contains("0xabcd0001"));
         assert!(plain.contains("07070707"), "hash prefix rendered");
         assert!(plain.contains("MH/s"), "status line painted");
+    }
+
+    #[test]
+    fn width_change_resets_alternate_screen_and_redraws_banner() {
+        let (fx, _) = screen_with_buffer();
+        let sample = CandidateSample {
+            nonce: 7,
+            hash: [9u8; 32],
+            header: [0u8; 128],
+        };
+        let mut inner = fx.inner.lock().unwrap();
+        inner.alternate_screen = true;
+        let _ = FxScreen::push_candidate_at_width(&mut inner, sample, Some(80));
+        let resized = FxScreen::push_candidate_at_width(&mut inner, sample, Some(140));
+        assert!(resized.starts_with("\x1b[2J\x1b[H"));
+        assert!(resized.contains("Real Money For Free People"));
+        assert!(resized.contains("nonce=0x00000007"));
     }
 
     #[test]
