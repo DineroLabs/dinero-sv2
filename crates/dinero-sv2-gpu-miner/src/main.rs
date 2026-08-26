@@ -525,9 +525,11 @@ async fn async_main() -> Result<()> {
                 timestamp: job.timestamp + (hint >> 32),
                 version: job.version,
             };
+            let header = HeaderAssembly::bytes(&job, &share);
             Some(dinero_miner_ux::fx::CandidateSample {
                 nonce: hint as u32,
                 hash: HeaderAssembly::hash(&job, &share),
+                header,
             })
         });
         fx.spawn_ticker(sampler, Arc::clone(&stop_flag));
