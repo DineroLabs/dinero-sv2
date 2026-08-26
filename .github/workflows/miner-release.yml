@@ -2,12 +2,8 @@
 # pool/protocol tags). Builds the CPU miner for all five public targets
 # (incl. BOTH macOS architectures — the Intel slice cross-compiles from
 # the arm64 runner), assembles SHA256SUMS, and publishes a GitHub
-# release with every asset.
-#
-# v0.1.0 scope (owner call 2026-08-14): CPU miner only, shared-mode-first
-# distribution. The GPU miner (dinero-sv2-gpu-miner) is code-complete with
-# the same UX; enable the commented `gpu` matrix entries when GPU binaries
-# are ready to ship.
+# release with every CPU and GPU asset. GPU targets cover Metal on both
+# supported macOS architectures and OpenCL on Linux/Windows x86_64.
 #
 # macOS signing/notarization runs LOCALLY, not in CI: after the workflow
 # publishes, sign BOTH darwin assets (aarch64 AND x86_64) on the Mac
@@ -42,27 +38,67 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             ext: ""
+            package: dinero-sv2-miner
+            bin: dinero-sv2-miner
           - target: x86_64-apple-darwin
             os: macos-14
             ext: ""
+            package: dinero-sv2-miner
+            bin: dinero-sv2-miner
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             ext: ""
+            package: dinero-sv2-miner
+            bin: dinero-sv2-miner
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             ext: ""
             use_cross: true
+            package: dinero-sv2-miner
+            bin: dinero-sv2-miner
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             ext: ".exe"
-          # GPU lanes — disabled for miner-v0.1.x (CPU-only release scope).
-          # Re-enable by uncommenting; each also needs `bin: dinero-sv2-gpu-miner`
-          # plumbing in the build/rename steps below.
-          # - target: aarch64-apple-darwin (gpu/metal)
-          # - target: x86_64-unknown-linux-gnu (gpu/opencl)
-          # - target: x86_64-pc-windows-msvc (gpu/opencl)
+            package: dinero-sv2-miner
+            bin: dinero-sv2-miner
+          - target: aarch64-apple-darwin
+            os: macos-14
+            ext: ""
+            package: dinero-sv2-gpu-miner
+            bin: dinero-sv2-gpu-miner
+            gpu: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            ext: ""
+            package: dinero-sv2-gpu-miner
+            bin: dinero-sv2-gpu-miner
+            gpu: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+            package: dinero-sv2-gpu-miner
+            bin: dinero-sv2-gpu-miner
+            gpu: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
+            package: dinero-sv2-gpu-miner
+            bin: dinero-sv2-gpu-miner
+            gpu: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Require release version identity
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#miner-v}"
+          test "$(sed -n 's/^version     = "\([^"]*\)"/\1/p' crates/dinero-sv2-miner/Cargo.toml)" = "$VERSION"
+          test "$(sed -n 's/^version     = "\([^"]*\)"/\1/p' crates/dinero-sv2-gpu-miner/Cargo.toml)" = "$VERSION"
+
+      - name: Require Windows signing identity
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: test '${{ vars.WINDOWS_SIGNING_READY }}' = 'true'
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
@@ -71,20 +107,36 @@ jobs:
         if: ${{ matrix.use_cross == true }}
         run: cargo install cross --locked
 
+      - name: Install Linux OpenCL development library
+        if: ${{ matrix.gpu == true && runner.os == 'Linux' }}
+        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+
+      - name: Install Windows OpenCL import library
+        if: ${{ matrix.gpu == true && runner.os == 'Windows' }}
+        shell: powershell
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencl:x64-windows --no-print-usage
+          $openclRoot = Join-Path $env:RUNNER_TEMP 'opencl-sdk'
+          New-Item (Join-Path $openclRoot 'lib\x64') -ItemType Directory -Force | Out-Null
+          Copy-Item `
+            "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib\OpenCL.lib" `
+            (Join-Path $openclRoot 'lib\x64\OpenCL.lib')
+          "INTELOCLSDKROOT=$openclRoot" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
       - name: Build (cross)
         if: ${{ matrix.use_cross == true }}
-        run: cross build --release --locked -p dinero-sv2-miner --target ${{ matrix.target }}
+        run: cross build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
 
       - name: Build (cargo)
         if: ${{ matrix.use_cross != true }}
-        run: cargo build --release --locked -p dinero-sv2-miner --target ${{ matrix.target }}
+        run: cargo build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
 
       - name: Rename artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/dinero-sv2-miner${{ matrix.ext }}" \
-             "dist/dinero-sv2-miner-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}${{ matrix.ext }}" \
+             "dist/${{ matrix.bin }}-${{ matrix.target }}${{ matrix.ext }}"
 
       # Windows Authenticode signing via Azure Artifact Signing (Trusted
       # Signing). Gated on the WINDOWS_SIGNING_READY repo variable so tags
@@ -92,7 +144,7 @@ jobs:
       # rather than failing. Flip the variable to 'true' once the
       # certificate profile exists.
       - name: Azure login (OIDC)
-        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' && vars.WINDOWS_SIGNING_READY == 'true' }}
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -100,7 +152,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign Windows binary
-        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' && vars.WINDOWS_SIGNING_READY == 'true' }}
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
         uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
@@ -111,7 +163,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dinero-sv2-miner-${{ matrix.target }}
+          name: ${{ matrix.bin }}-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
@@ -128,7 +180,7 @@ jobs:
       - name: SHA256SUMS
         working-directory: assets
         run: |
-          sha256sum dinero-sv2-miner-* > SHA256SUMS
+          sha256sum dinero-sv2-miner-* dinero-sv2-gpu-miner-* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish release
@@ -137,6 +189,7 @@ jobs:
           files: assets/*
           fail_on_unmatched_files: true
           generate_release_notes: false
+          draft: true
           body: |
             One-command install (macOS / Linux / Chromebook Crostini):
 
@@ -168,6 +221,6 @@ jobs:
             to `shared` (previously `solo`). Pass `--reward-mode solo` to
             keep miner-owned all-or-nothing coinbases.
 
-            This release ships the CPU miner. The GPU worker has the same
-            interactive UX and builds from source; prebuilt GPU binaries
-            come in a later release.
+            This release ships both CPU and GPU miners. The GPU binaries use
+            Metal on macOS and OpenCL on Linux/Windows. Both variants share
+            the same authenticated SV2 transport and interactive terminal UX.
