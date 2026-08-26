@@ -83,21 +83,28 @@ fn width_from(columns: Option<String>) -> usize {
     }
 }
 
+/// Current live width, when an explicit override or attached terminal is
+/// available. Callers with long-lived dashboards can poll this cheaply to
+/// respond to terminal resize events and late PTY initialization.
+pub fn live_term_width() -> Option<usize> {
+    if let Ok(cols_str) = std::env::var("COLUMNS") {
+        return Some(width_from(Some(cols_str)));
+    }
+
+    if let Some((terminal_size::Width(width), _)) = terminal_size::terminal_size() {
+        return Some(usize::from(width).max(60));
+    }
+
+    None
+}
+
 /// Explicit COLUMNS override → terminal PTY width → 100. Clamped to >= 60.
 ///
 /// Query the PTY directly instead of spawning `tput`: a child whose output is
 /// captured is not attached to the miner's terminal and commonly reports the
 /// terminfo default of 80 columns even when the real window is much wider.
 pub fn term_width() -> usize {
-    if let Ok(cols_str) = std::env::var("COLUMNS") {
-        return width_from(Some(cols_str));
-    }
-
-    if let Some((terminal_size::Width(width), _)) = terminal_size::terminal_size() {
-        return usize::from(width).max(60);
-    }
-
-    100
+    live_term_width().unwrap_or(100)
 }
 
 #[cfg(test)]

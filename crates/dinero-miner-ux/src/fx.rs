@@ -168,6 +168,12 @@ impl FxScreen {
 
     fn push_candidate(inner: &mut Inner, s: CandidateSample) -> String {
         inner.last_sample = Some(s);
+        // Apple Terminal can briefly expose its 80-column default while a new
+        // session is starting. Refresh from the live PTY on every sampled
+        // candidate so startup races and later resizes self-heal immediately.
+        if let Some(width) = theme::live_term_width() {
+            inner.cfg.width = width;
+        }
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
         let row = header_story_line(FeedKind::Candidate, s.nonce, &s.hash, &s.header, width, colors);
