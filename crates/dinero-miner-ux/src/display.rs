@@ -603,7 +603,11 @@ impl FeedWindow {
             }
             output.push_str("\x1b[K\n");
         }
-        let footer = " ^C STOP │ [S] STATS │ [L] LOG │ [C] COMPACT ";
+        // Only advertise controls that are actually implemented. Ordinary
+        // terminal input is not consumed by the FX renderer; claiming S/L/C
+        // shortcuts caused users to type into the alternate screen and
+        // corrupt its cursor-relative paint state.
+        let footer = " ^C STOP ";
         let footer_fill = "─".repeat(width.saturating_sub(footer.chars().count() + 3));
         output.push_str(&theme_line(&format!("╰─{footer}{footer_fill}╯"), colors));
 
@@ -912,5 +916,15 @@ mod tests {
                 stripped.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn footer_advertises_only_the_working_stop_control() {
+        let mut window = FeedWindow::new();
+        let frame = crate::theme::strip_ansi(&window.repaint(100, false));
+        assert!(frame.contains("^C STOP"));
+        assert!(!frame.contains("[S] STATS"));
+        assert!(!frame.contains("[L] LOG"));
+        assert!(!frame.contains("[C] COMPACT"));
     }
 }
