@@ -83,25 +83,20 @@ fn width_from(columns: Option<String>) -> usize {
     }
 }
 
-/// COLUMNS env → `tput cols` (one spawn) → 100. Clamped to >= 60.
+/// Explicit COLUMNS override → terminal PTY width → 100. Clamped to >= 60.
+///
+/// Query the PTY directly instead of spawning `tput`: a child whose output is
+/// captured is not attached to the miner's terminal and commonly reports the
+/// terminfo default of 80 columns even when the real window is much wider.
 pub fn term_width() -> usize {
-    // Try COLUMNS env var first
     if let Ok(cols_str) = std::env::var("COLUMNS") {
         return width_from(Some(cols_str));
     }
 
-    // Try tput cols
-    if let Ok(output) = std::process::Command::new("tput").arg("cols").output() {
-        if output.status.success() {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(w) = s.trim().parse::<usize>() {
-                    return w.max(60);
-                }
-            }
-        }
+    if let Some((terminal_size::Width(width), _)) = terminal_size::terminal_size() {
+        return usize::from(width).max(60);
     }
 
-    // Fallback
     100
 }
 
