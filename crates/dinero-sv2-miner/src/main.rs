@@ -377,8 +377,12 @@ async fn async_main() -> Result<()> {
                 emitter.emit(
                     "session_end",
                     &serde_json::json!({
+                        // Alternate ({:#}) formatting walks the whole anyhow
+                        // chain — the top context ("connect to pool …") plus
+                        // the underlying cause (the OS "connection refused"
+                        // message) — so a failure is diagnosable from one line.
                         "reason": "error",
-                        "error": err.to_string(),
+                        "error": format!("{err:#}"),
                     }),
                 );
                 if args.reconnect_secs == 0 {
@@ -563,9 +567,26 @@ async fn run_session(
     sampler_state: Arc<SamplerState>,
     emitter: &Emitter,
 ) -> Result<u64> {
-    // `connect(&str)` resolves the hostname per attempt, so a pool DNS
-    // repoint takes effect at the next reconnect without a restart.
-    let tcp = TcpStream::connect(pool).await.context("connect")?;
+    // Resolve explicitly (per attempt, so a pool DNS repoint still takes
+    // effect at the next reconnect without a restart) so a connect failure
+    // can name the address we actually dialed. A hostname that resolves to
+    // an unexpected IP — e.g. a router or captive portal hijacking DNS — is
+    // otherwise invisible: the bare error only says "connection refused".
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(pool)
+        .await
+        .with_context(|| format!("resolve pool address {pool}"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("pool address {pool} resolved to no addresses");
+    }
+    let tcp = TcpStream::connect(addrs.as_slice()).await.with_context(|| {
+        let dialed = addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("connect to pool {pool} (resolved to {dialed})")
+    })?;
     let session = NoiseSession::initiate_nx(tcp, pinned)
         .await
         .context("noise handshake")?;
