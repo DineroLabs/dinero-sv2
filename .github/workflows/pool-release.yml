@@ -1,0 +1,109 @@
+# Pool release pipeline — fires on tags `pool-vX.Y.Z` (kept clear of the
+# `miner-v*` tags the miner pipeline owns).
+#
+# Linux-only on purpose. A pool is a server process that must sit beside
+# a synced `dinerod`, so the realistic deployment surface is a Linux VPS.
+# Shipping macOS/Windows pool binaries would imply a supported topology
+# that nobody runs and that the systemd unit below could not serve.
+name: pool-release
+
+on:
+  push:
+    tags: ["pool-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.use_cross == true }}
+        run: cargo install cross --locked
+
+      - name: Build (cross)
+        if: ${{ matrix.use_cross == true }}
+        run: cross build --release --locked -p dinero-sv2-pool --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ matrix.use_cross != true }}
+        run: cargo build --release --locked -p dinero-sv2-pool --target ${{ matrix.target }}
+
+      - name: Rename artifact
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/dinero-sv2-pool" \
+             "dist/dinero-sv2-pool-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dinero-sv2-pool-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: assemble SHA256SUMS + publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Add installer + unit to the release
+        run: |
+          cp scripts/install-pool.sh assets/
+          cp packaging/systemd/dinero-sv2-pool.service assets/
+
+      - name: SHA256SUMS
+        working-directory: assets
+        run: |
+          sha256sum dinero-sv2-pool-* install-pool.sh dinero-sv2-pool.service > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body: |
+            Run your own Dinero pool.
+
+            **Your miners' coins never pass through you.** The pool pays every
+            contributor directly in the block's coinbase, split by share weight.
+            You cannot lose their funds, and they can verify your fee on-chain.
+
+            Requires a synced `dinerod` on the same host (the pool needs it for
+            block templates and `submitblock`). See
+            [docs/RUN-A-POOL.md](https://github.com/DineroLabs/dinero-sv2/blob/main/docs/RUN-A-POOL.md).
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install-pool.sh \
+              | sudo sh -s -- --payout-address YOUR_DIN1P_ADDRESS
+            ```
+
+            The installer generates your pool's Noise static key and prints its
+            public key. Miners should pin it with `--server-pubkey <yours>`;
+            without it they connect unpinned (trust-on-first-use) and are
+            warned. The miner's built-in default key is deliberately not
+            applied to a custom pool.
+
+            Verify downloads against `SHA256SUMS`.

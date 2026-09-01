@@ -14,8 +14,8 @@
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
 use dinero_sv2_pool::{
-    accounting, backend, block, dedup, job_generation, journal, mapper, rpc, shared_template,
-    split, target,
+    accounting, backend, block, dedup, job_generation, journal, mapper, ops, rpc,
+    shared_template, split, supervisor, target,
 };
 
 use std::net::SocketAddr;
@@ -153,6 +153,16 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     poll_secs: u64,
 
+    /// Kill the process if the template producer stops checking in for
+    /// this many seconds, so systemd restarts it (the unit is
+    /// `Restart=on-failure`). Guards the WEDGE case — a task that is
+    /// still alive but stuck, which the producer-exit path cannot see.
+    /// Deliberately far above worst-case iteration time: the RPC client
+    /// times out at 15s per request, so even several failing calls in a
+    /// row stay well under this. 0 disables.
+    #[arg(long, default_value_t = supervisor::DEFAULT_STALL_SECS)]
+    template_stall_secs: u64,
+
     /// Force-refresh the in-flight template at most this often, even
     /// when the chain tip hasn't changed. Picks up ASERT difficulty
     /// drift while the chain stalls (the daemon's getblocktemplate
@@ -211,6 +221,18 @@ struct Args {
     /// forward (stay credited in the window, just not paid this block).
     #[arg(long, default_value_t = 10_000)]
     shared_dust_una: u64,
+
+    /// Read-only operator status endpoint (`GET /status`, bearer auth).
+    /// Loopback by default: it speaks plain HTTP on purpose, so remote
+    /// access goes through a TLS reverse proxy or an SSH tunnel rather
+    /// than a TLS stack inside the pool binary. Empty disables it.
+    #[arg(long, default_value = "127.0.0.1:4445")]
+    ops_bind: String,
+
+    /// File holding the ops bearer token. A file, not a flag, so the
+    /// token never shows up in `ps` or the systemd unit.
+    #[arg(long, default_value = "/etc/dinero-sv2/ops-token")]
+    ops_token_file: PathBuf,
 
     /// PPLNS window journal path.
     #[arg(long, default_value = "/var/lib/dinero-sv2/pplns-journal.jsonl")]
@@ -307,6 +329,18 @@ async fn main() -> Result<()> {
     // future SetTarget routing can disambiguate miners on the wire.
     let next_channel_id = Arc::new(AtomicU32::new(2));
 
+    /// Decrements the live-miner gauge however the connection task ends
+    /// — clean disconnect, error return, or panic. A plain counter with
+    /// a decrement at the end of the happy path would drift upward on
+    /// every abnormal exit and quietly overstate the pool.
+    struct ConnGauge(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ConnGauge {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let connected_miners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     // PPLNS shared-mode state: a rolling window of recent share credits
     // (14_400s target span) restored from the on-disk journal, plus the
     // journal itself for ongoing appends. Losing the journal only costs
@@ -327,6 +361,10 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = watch::channel::<Option<Arc<TemplateBundle>>>(None);
 
+    // Liveness stamp for the template producer. Monotonic (Instant-based),
+    // so a clock step can neither trip the watchdog nor mask a wedge.
+    let heartbeat = Arc::new(supervisor::Heartbeat::new());
+
     // Template producer task.
     let mut template_producer = {
         let backends = backends.clone();
@@ -344,6 +382,7 @@ async fn main() -> Result<()> {
         let shared_max_outputs = args.shared_max_outputs;
         let shared_dust_una = args.shared_dust_una;
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
+        let heartbeat = heartbeat.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(poll);
             let mut last_tip: Option<String> = None;
@@ -352,7 +391,11 @@ async fn main() -> Result<()> {
             let mut last_backend_epoch: Option<u64> = None;
             let mut template_id: u64 = 0;
             loop {
+                heartbeat.beat(supervisor::Phase::Sleeping);
                 ticker.tick().await;
+                // Upstream folded the tip poll and the template fetch into one
+                // call, so this single await covers what used to be two phases.
+                heartbeat.beat(supervisor::Phase::PollingTip);
                 let (backend, gbt) = match backends.select_template(&payout).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -372,6 +415,8 @@ async fn main() -> Result<()> {
                 if !tip_changed && !stale_same_tip && !backend_changed {
                     continue;
                 }
+                // Past the early-out: from here we actually build and publish.
+                heartbeat.beat(supervisor::Phase::FetchingTemplate);
                 template_id = template_id.wrapping_add(1);
                 let mut pt = match mapper::map_template(&gbt, template_id) {
                     Ok(t) => t,
@@ -546,6 +591,7 @@ async fn main() -> Result<()> {
                     backend_epoch: backend.epoch,
                     backend_endpoint: backend.health.endpoint.clone(),
                 })));
+                heartbeat.beat(supervisor::Phase::Publishing);
                 last_tip = Some(tip);
                 last_template_at = Some(std::time::Instant::now());
                 last_nbits = Some(pt.wire.difficulty);
@@ -554,7 +600,79 @@ async fn main() -> Result<()> {
         })
     };
 
+    // Read-only operator status endpoint. Failing to start it is fatal
+    // rather than a warning: an operator who configured it and got a
+    // silently-dead endpoint would be worse off than one told why.
+    if !args.ops_bind.trim().is_empty() {
+        let token = ops::load_token(&args.ops_token_file)?;
+        let listener = ops::bind(args.ops_bind.trim()).await?;
+        let started = std::time::Instant::now();
+        let ops_window = window.clone();
+        let ops_ledger = ledger.clone();
+        let ops_heartbeat = heartbeat.clone();
+        let ops_connected = connected_miners.clone();
+        let fee_bps = args.shared_fee_bps;
+        let snapshot = Arc::new(move || {
+            let (entries, span, miners) = {
+                let w = ops_window.lock().unwrap();
+                let total = w.total_weight();
+                let span = w
+                    .entries()
+                    .next()
+                    .zip(w.entries().last())
+                    .map(|(f, l)| l.unix_ts.saturating_sub(f.unix_ts))
+                    .unwrap_or(0);
+                let mut per: std::collections::HashMap<Vec<u8>, u128> = Default::default();
+                for e in w.entries() {
+                    *per.entry(e.payout_script.clone()).or_insert(0) += e.weight;
+                }
+                let mut rows: Vec<ops::MinerStatus> = per
+                    .into_iter()
+                    .map(|(script, weight)| ops::MinerStatus {
+                        payout_script_hex: hex::encode(&script),
+                        bps: if total == 0 {
+                            0
+                        } else {
+                            ((weight.saturating_mul(10_000)) / total) as u32
+                        },
+                        window_weight: weight.to_string(),
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b.bps.cmp(&a.bps));
+                (w.len(), span, rows)
+            };
+            let credits = ops_ledger.snapshot();
+            ops::OpsStatus {
+                pool_version: env!("CARGO_PKG_VERSION").to_string(),
+                uptime_secs: started.elapsed().as_secs(),
+                fee_bps,
+                connected_miners: ops_connected.load(Ordering::Relaxed),
+                window_entries: entries,
+                window_span_secs: span,
+                template_heartbeat_age_secs: ops_heartbeat.age_secs(),
+                template_phase: ops_heartbeat.phase().as_str().to_string(),
+                accepted_shares_total: credits.values().map(|c| c.accepted_shares).sum(),
+                rejected_shares_total: credits.values().map(|c| c.rejected_shares).sum(),
+                blocks_found_total: credits.values().map(|c| c.found_blocks).sum(),
+                miners,
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = ops::serve(listener, token, snapshot).await {
+                warn!(error = %e, "ops endpoint stopped");
+            }
+        });
+    }
+
     // Miner acceptor.
+    //
+    // Two independent ways the template producer can stop serving:
+    //   - it EXITS (returns or panics)  -> `&mut template_producer` resolves
+    //   - it WEDGES (alive but stuck)   -> the handle never resolves, so
+    //     only a stale heartbeat can reveal it
+    // Both bail out of main, which exits non-zero so systemd restarts us.
+    let mut stall_check = tokio::time::interval(Duration::from_secs(30));
+    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let (sock, peer) = tokio::select! {
             result = &mut template_producer => {
@@ -564,6 +682,20 @@ async fn main() -> Result<()> {
                         .context("template producer task failed")),
                 }
             }
+            _ = stall_check.tick() => {
+                if args.template_stall_secs > 0
+                    && heartbeat.is_stalled(args.template_stall_secs)
+                {
+                    anyhow::bail!(
+                        "template producer wedged: no heartbeat for {}s (limit {}s, last phase: {}). \
+                         Exiting so systemd restarts the pool rather than serving stale jobs.",
+                        heartbeat.age_secs(),
+                        args.template_stall_secs,
+                        heartbeat.phase().as_str()
+                    );
+                }
+                continue;
+            }
             accepted = listener.accept() => accepted?,
         };
         let rx = rx.clone();
@@ -572,12 +704,15 @@ async fn main() -> Result<()> {
         let share_target_copy = share_target_fallback;
         let keys = static_keys.clone();
         let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
+        let conn_gauge = connected_miners.clone();
         let vardiff_copy = vardiff;
         let window = window.clone();
         let journal = journal.clone();
         let dedup = dedup.clone();
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         tokio::spawn(async move {
+            conn_gauge.fetch_add(1, Ordering::Relaxed);
+            let _gauge = ConnGauge(conn_gauge);
             info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
                 Ok(s) => s,
