@@ -1,6 +1,11 @@
 [package]
 name        = "dinero-sv2-pool"
-version     = { workspace = true }
+# Versioned independently of the workspace, exactly as dinero-sv2-miner is:
+# the pool ships on its own `pool-v*` cadence, and inheriting the workspace
+# 0.1.0 meant pool-v0.1.1 produced a binary whose --version said 0.1.0 —
+# leaving a broken build and its fix indistinguishable to whoever held it.
+# The release workflow now fails if this disagrees with the tag.
+version     = "0.1.2"
 edition     = { workspace = true }
 license     = { workspace = true }
 repository  = { workspace = true }
