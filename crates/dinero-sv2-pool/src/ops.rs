@@ -5,8 +5,21 @@
 //!
 //! Deliberate constraints:
 //!
-//!   * **Read-only.** No route mutates anything. The endpoint cannot
-//!     move funds, change the fee, or touch the PPLNS window.
+//!   * **Read-only by default.** `/status` mutates nothing, and the
+//!     endpoint can never move coins, change the fee rate, or touch the
+//!     PPLNS window.
+//!
+//!     The one exception is opt-in: `POST /payout-address`, enabled only
+//!     by `--ops-allow-payout-change`, retargets the operator's own fee
+//!     output. It is OFF unless an operator turns it on, because enabling
+//!     it upgrades the ops token from a *read* credential to one that can
+//!     redirect the operator's share of every future block. Nothing about
+//!     it can touch a *miner's* payout — contributor outputs come from the
+//!     PPLNS window, which no route reaches.
+//!
+//!     A candidate address is proven against a real `getblocktemplate`
+//!     before it is adopted, so a typo is rejected rather than silently
+//!     killing template production.
 //!   * **Loopback by default.** Binding to `127.0.0.1` means no TLS
 //!     stack inside a binary that handles money. Remote access is a
 //!     reverse proxy's job (nginx/caddy) or an SSH tunnel; both are
@@ -31,6 +44,24 @@ use tracing::{info, warn};
 pub const MAX_HEAD_BYTES: usize = 8 * 1024;
 
 pub const STATUS_PATH: &str = "/status";
+
+/// Mutating route: set the operator's fee/coinbase address at runtime.
+/// Gated behind `Policy::allow_payout_change` — OFF by default, because
+/// reaching it means the ops token can redirect money.
+pub const PAYOUT_PATH: &str = "/payout-address";
+
+/// Cap on a request body. The only body we accept is a one-field JSON
+/// object holding an address, so anything larger is a mistake or an attack.
+pub const MAX_BODY_BYTES: usize = 1024;
+
+/// What the endpoint is permitted to do, decided once at startup from CLI
+/// flags. Defaults to the historical posture: read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Policy {
+    /// `--ops-allow-payout-change`. When false the payout route 403s even
+    /// for a caller holding the correct token.
+    pub allow_payout_change: bool,
+}
 
 /// One contributor's standing in the PPLNS window.
 ///
@@ -57,6 +88,10 @@ pub struct OpsStatus {
     pub uptime_secs: u64,
     /// Operator fee in basis points (1000 = 10%).
     pub fee_bps: u32,
+    /// The address currently receiving the operator fee. Reported so an
+    /// operator can confirm what is live rather than trusting the unit file.
+    /// Not a secret: it appears in the coinbase of every block found.
+    pub payout_address: String,
     pub connected_miners: usize,
     /// PPLNS window depth and the wall-clock span it covers.
     pub window_entries: usize,
@@ -84,6 +119,8 @@ pub enum Decision {
     NotFound,
     MethodNotAllowed,
     BadRequest,
+    /// Authenticated, route exists, but the operator did not enable it.
+    Forbidden,
 }
 
 impl Decision {
@@ -94,6 +131,7 @@ impl Decision {
             Decision::NotFound => "404 Not Found",
             Decision::MethodNotAllowed => "405 Method Not Allowed",
             Decision::BadRequest => "400 Bad Request",
+            Decision::Forbidden => "403 Forbidden",
         }
     }
 }
@@ -145,7 +183,7 @@ pub fn parse_request(head: &str) -> Option<Request> {
 
 /// Authorize and route. Auth is checked BEFORE the path, so an
 /// unauthenticated caller cannot probe which routes exist.
-pub fn decide(req: &Request, expected_token: &str) -> Decision {
+pub fn decide(req: &Request, expected_token: &str, policy: Policy) -> Decision {
     // An empty configured token would otherwise match an empty
     // presented one and authorize the world. Fail closed; the server
     // also refuses to start without a token.
@@ -161,13 +199,81 @@ pub fn decide(req: &Request, expected_token: &str) -> Decision {
     if !authorized {
         return Decision::Unauthorized;
     }
-    if req.path != STATUS_PATH {
-        return Decision::NotFound;
+    match req.path.as_str() {
+        STATUS_PATH => match req.method.as_str() {
+            "GET" | "HEAD" => Decision::Serve,
+            // Enabling the payout route must not make /status writable.
+            _ => Decision::MethodNotAllowed,
+        },
+        PAYOUT_PATH => {
+            // Method before policy: a GET here is wrong regardless of whether
+            // the operator enabled changes, and answering 405 rather than 403
+            // keeps the two mistakes distinguishable in an operator's logs.
+            if req.method != "POST" {
+                return Decision::MethodNotAllowed;
+            }
+            if !policy.allow_payout_change {
+                return Decision::Forbidden;
+            }
+            Decision::Serve
+        }
+        _ => Decision::NotFound,
     }
-    match req.method.as_str() {
-        "GET" | "HEAD" => Decision::Serve,
-        _ => Decision::MethodNotAllowed,
+}
+
+/// Extract the address from a `{"address": "din1p..."}` body.
+pub fn parse_payout_body(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let addr = v.get("address")?.as_str()?.trim();
+    if addr.is_empty() {
+        return None;
     }
+    Some(addr.to_string())
+}
+
+/// Cheap syntactic gate so an obvious typo never costs an RPC round-trip.
+/// Deliberately NOT a full bech32m decode — the authoritative check is the
+/// trial `getblocktemplate`, which is the thing that actually has to succeed.
+pub fn looks_like_payout_address(s: &str) -> bool {
+    // Bech32(m) data charset. Excludes `1`, `b`, `i`, `o` by design, which is
+    // what rejects a stray separator, whitespace, or a second address.
+    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const MIN: usize = 20;
+    const MAX: usize = 90;
+
+    if !s.starts_with("din1p") || s.len() < MIN || s.len() > MAX {
+        return false;
+    }
+    // `din1` is the hrp + separator; everything after must be data charset.
+    s.as_bytes()[4..].iter().all(|b| CHARSET.contains(b))
+}
+
+/// `Content-Length` from a request head, if present and sane.
+pub fn content_length(head: &str) -> Option<usize> {
+    for line in head.split("\r\n") {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            let n: usize = value.trim().parse().ok()?;
+            // Refuse rather than clamp: a caller announcing more than we will
+            // ever accept is not sending something we want to half-read.
+            return (n <= MAX_BODY_BYTES).then_some(n);
+        }
+    }
+    None
+}
+
+/// Split a buffer at the head/body boundary. `read_head` can over-read into
+/// the body, so those bytes must be carried forward rather than dropped.
+pub fn split_head_body(buf: &[u8]) -> Option<(String, Vec<u8>)> {
+    let at = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let split = at + 4;
+    let head = String::from_utf8(buf[..split].to_vec()).ok()?;
+    Some((head, buf[split..].to_vec()))
 }
 
 #[cfg(test)]
@@ -182,22 +288,189 @@ mod tests {
         }
     }
 
+    // ---- payout route: gating ----
+    //
+    // The whole point of the flag is that enabling a money-routing verb is a
+    // deliberate act. Default-constructed Policy must refuse.
+
+    fn open() -> Policy { Policy { allow_payout_change: true } }
+
+    #[test]
+    fn payout_change_is_refused_when_not_enabled() {
+        assert_eq!(
+            decide(&req("POST", PAYOUT_PATH, Some("s3cret")), "s3cret", Policy::default()),
+            Decision::Forbidden
+        );
+    }
+
+    #[test]
+    fn payout_change_is_served_when_enabled() {
+        assert_eq!(
+            decide(&req("POST", PAYOUT_PATH, Some("s3cret")), "s3cret", open()),
+            Decision::Serve
+        );
+    }
+
+    // Auth still comes first: a caller with a bad token must not be able to
+    // tell whether this pool has payout-changing switched on.
+    #[test]
+    fn payout_route_reports_unauthorized_before_forbidden() {
+        assert_eq!(
+            decide(&req("POST", PAYOUT_PATH, Some("wrong")), "s3cret", Policy::default()),
+            Decision::Unauthorized
+        );
+        assert_eq!(
+            decide(&req("POST", PAYOUT_PATH, Some("wrong")), "s3cret", open()),
+            Decision::Unauthorized
+        );
+    }
+
+    // Reading the address is what /status is for; this route only writes.
+    #[test]
+    fn payout_route_rejects_non_post() {
+        for m in ["GET", "HEAD", "PUT", "DELETE"] {
+            assert_eq!(
+                decide(&req(m, PAYOUT_PATH, Some("s3cret")), "s3cret", open()),
+                Decision::MethodNotAllowed,
+                "method {m}"
+            );
+        }
+    }
+
+    // Enabling payout changes must not turn /status into a writable route.
+    #[test]
+    fn enabling_payout_change_does_not_make_status_writable() {
+        assert_eq!(
+            decide(&req("POST", STATUS_PATH, Some("s3cret")), "s3cret", open()),
+            Decision::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn unknown_path_is_still_not_found_when_payout_is_enabled() {
+        assert_eq!(
+            decide(&req("POST", "/withdraw", Some("s3cret")), "s3cret", open()),
+            Decision::NotFound
+        );
+    }
+
+    #[test]
+    fn forbidden_renders_403() {
+        assert_eq!(Decision::Forbidden.status_line(), "403 Forbidden");
+    }
+
+    // ---- body parsing ----
+
+    #[test]
+    fn body_yields_the_address() {
+        assert_eq!(
+            parse_payout_body(r#"{"address":"din1pabc"}"#).as_deref(),
+            Some("din1pabc")
+        );
+    }
+
+    #[test]
+    fn body_tolerates_whitespace_and_ordering() {
+        assert_eq!(
+            parse_payout_body("{ \"note\": \"x\", \"address\" : \"  din1pabc  \" }").as_deref(),
+            Some("din1pabc")
+        );
+    }
+
+    #[test]
+    fn body_without_an_address_is_rejected() {
+        for b in [r#"{}"#, r#"{"addr":"din1pabc"}"#, r#"{"address":null}"#,
+                  r#"{"address":123}"#, r#"{"address":""}"#, r#"{"address":"   "}"#,
+                  "not json", ""] {
+            assert!(parse_payout_body(b).is_none(), "should reject: {b}");
+        }
+    }
+
+    // ---- syntactic address gate ----
+
+    #[test]
+    fn plausible_addresses_pass_the_cheap_gate() {
+        assert!(looks_like_payout_address(
+            "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy"
+        ));
+    }
+
+    #[test]
+    fn obvious_junk_is_rejected_without_an_rpc() {
+        for bad in [
+            "",
+            "din1q0000000000000000000000000000000000000000000000000000000000",  // wrong prefix
+            "din1p",                                                            // too short
+            "bc1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy",   // other chain
+            "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggx!",  // bad charset
+            "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy din1pother", // two
+        ] {
+            assert!(!looks_like_payout_address(bad), "should reject: {bad:?}");
+        }
+    }
+
+    // A dangerously long value must not reach the RPC layer.
+    #[test]
+    fn absurdly_long_address_is_rejected() {
+        let long = format!("din1p{}", "q".repeat(4096));
+        assert!(!looks_like_payout_address(&long));
+    }
+
+    // ---- head/body framing ----
+
+    #[test]
+    fn content_length_is_read_case_insensitively() {
+        assert_eq!(content_length("POST / HTTP/1.1\r\ncontent-length: 22\r\n\r\n"), Some(22));
+        assert_eq!(content_length("POST / HTTP/1.1\r\nContent-Length:  7 \r\n\r\n"), Some(7));
+        assert_eq!(content_length("POST / HTTP/1.1\r\nHost: x\r\n\r\n"), None);
+        assert_eq!(content_length("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn oversize_content_length_is_refused() {
+        let h = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
+        assert_eq!(content_length(&h), None);
+    }
+
+    // read_head reads in 512-byte chunks, so it routinely swallows the first
+    // bytes of the body. Dropping them corrupts every POST.
+    #[test]
+    fn split_carries_over_read_body_bytes_forward() {
+        let raw = b"POST /payout-address HTTP/1.1\r\nContent-Length: 9\r\n\r\n{\"a\":1}!!";
+        let (head, body) = split_head_body(raw).expect("splits");
+        assert!(head.starts_with("POST /payout-address"));
+        assert!(head.ends_with("\r\n\r\n"));
+        assert_eq!(body, b"{\"a\":1}!!");
+    }
+
+    #[test]
+    fn split_returns_empty_body_when_none_was_sent() {
+        let raw = b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (_, body) = split_head_body(raw).expect("splits");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn split_refuses_a_head_with_no_terminator() {
+        assert!(split_head_body(b"GET /status HTTP/1.1\r\nHost: x").is_none());
+    }
+
     // ---- auth ----
 
     #[test]
     fn correct_token_on_the_status_route_is_served() {
-        assert_eq!(decide(&req("GET", STATUS_PATH, Some("s3cret")), "s3cret"), Decision::Serve);
+        assert_eq!(decide(&req("GET", STATUS_PATH, Some("s3cret")), "s3cret", Policy::default()), Decision::Serve);
     }
 
     #[test]
     fn missing_token_is_rejected() {
-        assert_eq!(decide(&req("GET", STATUS_PATH, None), "s3cret"), Decision::Unauthorized);
+        assert_eq!(decide(&req("GET", STATUS_PATH, None), "s3cret", Policy::default()), Decision::Unauthorized);
     }
 
     #[test]
     fn wrong_token_is_rejected() {
         assert_eq!(
-            decide(&req("GET", STATUS_PATH, Some("guess")), "s3cret"),
+            decide(&req("GET", STATUS_PATH, Some("guess")), "s3cret", Policy::default()),
             Decision::Unauthorized
         );
     }
@@ -207,16 +480,16 @@ mod tests {
         // An unauthenticated caller must not learn which paths exist:
         // a bad token on a bogus path must look like a bad token on a
         // real one.
-        assert_eq!(decide(&req("GET", "/nope", Some("guess")), "s3cret"), Decision::Unauthorized);
+        assert_eq!(decide(&req("GET", "/nope", Some("guess")), "s3cret", Policy::default()), Decision::Unauthorized);
         assert_eq!(
-            decide(&req("GET", STATUS_PATH, Some("guess")), "s3cret"),
+            decide(&req("GET", STATUS_PATH, Some("guess")), "s3cret", Policy::default()),
             Decision::Unauthorized
         );
     }
 
     #[test]
     fn authenticated_unknown_route_is_not_found() {
-        assert_eq!(decide(&req("GET", "/nope", Some("s3cret")), "s3cret"), Decision::NotFound);
+        assert_eq!(decide(&req("GET", "/nope", Some("s3cret")), "s3cret", Policy::default()), Decision::NotFound);
     }
 
     #[test]
@@ -224,7 +497,7 @@ mod tests {
         // The endpoint is read-only by contract, not just by omission.
         for m in ["POST", "PUT", "DELETE", "PATCH"] {
             assert_eq!(
-                decide(&req(m, STATUS_PATH, Some("s3cret")), "s3cret"),
+                decide(&req(m, STATUS_PATH, Some("s3cret")), "s3cret", Policy::default()),
                 Decision::MethodNotAllowed,
                 "{m} should be refused"
             );
@@ -233,16 +506,16 @@ mod tests {
 
     #[test]
     fn head_is_treated_as_a_read_and_allowed() {
-        assert_eq!(decide(&req("HEAD", STATUS_PATH, Some("s3cret")), "s3cret"), Decision::Serve);
+        assert_eq!(decide(&req("HEAD", STATUS_PATH, Some("s3cret")), "s3cret", Policy::default()), Decision::Serve);
     }
 
     #[test]
     fn an_empty_configured_token_authorizes_nobody() {
         // Fail closed: an empty token file must not turn into
         // "" == "" and open the endpoint.
-        assert_eq!(decide(&req("GET", STATUS_PATH, Some("")), ""), Decision::Unauthorized);
-        assert_eq!(decide(&req("GET", STATUS_PATH, None), ""), Decision::Unauthorized);
-        assert_eq!(decide(&req("GET", STATUS_PATH, Some("anything")), ""), Decision::Unauthorized);
+        assert_eq!(decide(&req("GET", STATUS_PATH, Some("")), "", Policy::default()), Decision::Unauthorized);
+        assert_eq!(decide(&req("GET", STATUS_PATH, None), "", Policy::default()), Decision::Unauthorized);
+        assert_eq!(decide(&req("GET", STATUS_PATH, Some("anything")), "", Policy::default()), Decision::Unauthorized);
     }
 
     // ---- constant-time compare ----
@@ -302,7 +575,7 @@ mod tests {
 
 /// Read the request head (up to `\r\n\r\n`), refusing anything larger
 /// than `MAX_HEAD_BYTES`. Returns `None` on EOF/oversize/timeout.
-async fn read_head(sock: &mut TcpStream) -> Option<String> {
+async fn read_head(sock: &mut TcpStream) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
     loop {
@@ -319,7 +592,28 @@ async fn read_head(sock: &mut TcpStream) -> Option<String> {
             break;
         }
     }
-    String::from_utf8(buf).ok()
+    Some(buf)
+}
+
+/// Read exactly `want` body bytes, reusing whatever `read_head` over-read.
+async fn read_body(sock: &mut TcpStream, mut have: Vec<u8>, want: usize) -> Option<String> {
+    if want > MAX_BODY_BYTES {
+        return None;
+    }
+    let mut chunk = [0u8; 512];
+    while have.len() < want {
+        let n = match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => return None,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return None,
+        };
+        have.extend_from_slice(&chunk[..n]);
+        if have.len() > MAX_BODY_BYTES {
+            return None;
+        }
+    }
+    have.truncate(want);
+    String::from_utf8(have).ok()
 }
 
 async fn respond(sock: &mut TcpStream, decision: Decision, body: &str, head_only: bool) {
@@ -339,9 +633,17 @@ async fn respond(sock: &mut TcpStream, decision: Decision, body: &str, head_only
 ///
 /// `snapshot` is called only for authorized requests, so an unauthorized
 /// caller cannot make the pool do work.
-pub async fn serve<F>(listener: TcpListener, token: String, snapshot: Arc<F>) -> Result<()>
+pub async fn serve<F, A, Fut>(
+    listener: TcpListener,
+    token: String,
+    policy: Policy,
+    snapshot: Arc<F>,
+    apply_payout: Arc<A>,
+) -> Result<()>
 where
     F: Fn() -> OpsStatus + Send + Sync + 'static,
+    A: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<String, String>> + Send,
 {
     if token.is_empty() {
         anyhow::bail!("ops endpoint refuses to start without a token");
@@ -356,8 +658,13 @@ where
         };
         let token = token.clone();
         let snapshot = snapshot.clone();
+        let apply_payout = apply_payout.clone();
         tokio::spawn(async move {
-            let Some(head) = read_head(&mut sock).await else {
+            let Some(raw) = read_head(&mut sock).await else {
+                respond(&mut sock, Decision::BadRequest, "{\"error\":\"bad request\"}", false).await;
+                return;
+            };
+            let Some((head, body_prefix)) = split_head_body(&raw) else {
                 respond(&mut sock, Decision::BadRequest, "{\"error\":\"bad request\"}", false).await;
                 return;
             };
@@ -366,7 +673,54 @@ where
                 return;
             };
             let head_only = req.method.eq_ignore_ascii_case("HEAD");
-            match decide(&req, &token) {
+            match decide(&req, &token, policy) {
+                Decision::Serve if req.path == PAYOUT_PATH => {
+                    let Some(want) = content_length(&head) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"Content-Length required, and must not exceed 1024\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(body) = read_body(&mut sock, body_prefix, want).await else {
+                        respond(&mut sock, Decision::BadRequest, "{\"error\":\"short body\"}", false)
+                            .await;
+                        return;
+                    };
+                    let Some(addr) = parse_payout_body(&body) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"expected {\\\"address\\\": \\\"din1p...\\\"}\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    // Logged unconditionally: a change of where money goes is
+                    // the one thing an operator must be able to audit later.
+                    info!(%peer, candidate = %addr, "ops payout-address change requested");
+                    match apply_payout(addr).await {
+                        Ok(applied) => {
+                            info!(%peer, address = %applied, "ops payout address CHANGED");
+                            let body = serde_json::json!({
+                                "ok": true,
+                                "payout_address": applied
+                            })
+                            .to_string();
+                            respond(&mut sock, Decision::Serve, &body, false).await;
+                        }
+                        Err(why) => {
+                            warn!(%peer, error = %why, "ops payout-address change REFUSED");
+                            let body =
+                                serde_json::json!({ "ok": false, "error": why }).to_string();
+                            respond(&mut sock, Decision::BadRequest, &body, false).await;
+                        }
+                    }
+                }
                 Decision::Serve => {
                     let body = serde_json::to_string(&snapshot())
                         .unwrap_or_else(|_| "{\"error\":\"encode failed\"}".to_string());

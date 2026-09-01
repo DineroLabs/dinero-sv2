@@ -14,6 +14,7 @@ pub mod job_generation;
 pub mod journal;
 pub mod mapper;
 pub mod ops;
+pub mod payout;
 pub mod rpc;
 pub mod shared_template;
 pub mod supervisor;
