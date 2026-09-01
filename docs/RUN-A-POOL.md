@@ -153,6 +153,54 @@ under it.
 If you see repeated restarts, the node is usually the cause — check that
 `dinerod` is running, synced, and answering RPC.
 
+## Changing your fee address
+
+The address you passed to the installer receives your operator fee. You can
+change it two ways.
+
+**Edit the unit** (always available, needs a restart):
+
+```sh
+sudoedit /etc/systemd/system/dinero-sv2-pool.service   # change --payout-address
+sudo systemctl daemon-reload && sudo systemctl restart dinero-sv2-pool
+```
+
+**From a client such as dinero-qt** (opt-in). This is off unless you asked
+for it at install time:
+
+```sh
+curl -fsSL .../install-pool.sh | sudo sh -s -- \
+  --payout-address din1p... --allow-payout-change
+```
+
+Understand what you are turning on. Your ops token normally only *reads*
+status. With this enabled, anyone holding it can retarget your fee output —
+so treat the token like a key, not a password, and keep the endpoint on
+loopback or behind an SSH tunnel. It cannot touch your **miners'** payouts:
+contributor outputs come from the PPLNS window, which no ops route reaches.
+
+Two safeguards are built in:
+
+* A candidate address is proven against a real `getblocktemplate` before it
+  is adopted. A typo is rejected and your old address keeps mining — without
+  this a bad address would fail every template call and your pool would
+  quietly serve nothing.
+* The new address is written to `/etc/dinero-sv2/payout-address`, which wins
+  over the unit file on the next start. Otherwise a restart would silently
+  revert your fee to the installer's address.
+
+By hand, the same thing:
+
+```sh
+curl -X POST -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"din1pYOURNEWADDRESS"}' \
+  http://127.0.0.1:4445/payout-address
+```
+
+`GET /status` reports `payout_address`, so you can confirm what is actually
+live rather than trusting the unit file.
+
 ## What you actually earn
 
 Your fee is a percentage of blocks **your pool** finds. With no miners,

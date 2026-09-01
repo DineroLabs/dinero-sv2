@@ -19,6 +19,7 @@ BIND="0.0.0.0:4444"
 RPC_URL="http://127.0.0.1:20998"
 COOKIE="/var/lib/dinero/.cookie"
 START="yes"
+ALLOW_PAYOUT_CHANGE="no"
 
 usage() {
   cat <<USAGE
@@ -30,6 +31,10 @@ usage: install-pool.sh --payout-address din1p... [options]
   --rpc-url URL           dinerod RPC (default http://127.0.0.1:20998)
   --cookie PATH           dinerod auth cookie (default /var/lib/dinero/.cookie)
   --no-start              install but do not start the service
+  --allow-payout-change   let the ops endpoint change your fee address at
+                          runtime (e.g. from dinero-qt). OFF by default:
+                          enabling it means your ops token can redirect
+                          YOUR fee output. Miners' payouts are unaffected.
 USAGE
 }
 
@@ -65,6 +70,7 @@ while [ $# -gt 0 ]; do
     --rpc-url)        RPC_URL="${2:?}"; shift 2 ;;
     --cookie)         COOKIE="${2:?}"; shift 2 ;;
     --no-start)       START="no"; shift ;;
+    --allow-payout-change) ALLOW_PAYOUT_CHANGE="yes"; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -142,14 +148,23 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/dinero-sv2-pool --bind __BIND__ --rpc-url __RPC_URL__ --cookie __COOKIE__ --payout-address __PAYOUT_ADDRESS__ --tp-key /etc/dinero-sv2/pool-static.key --pplns-journal /var/lib/dinero-sv2/pplns-journal.jsonl --ops-bind 127.0.0.1:4445 --ops-token-file /etc/dinero-sv2/ops-token --shared-fee-bps __FEE_BPS__
+ExecStart=/usr/local/bin/dinero-sv2-pool --bind __BIND__ --rpc-url __RPC_URL__ --cookie __COOKIE__ --payout-address __PAYOUT_ADDRESS__ --tp-key /etc/dinero-sv2/pool-static.key --pplns-journal /var/lib/dinero-sv2/pplns-journal.jsonl --ops-bind 127.0.0.1:4445 --ops-token-file /etc/dinero-sv2/ops-token --payout-address-file /etc/dinero-sv2/payout-address --shared-fee-bps __FEE_BPS____OPS_ALLOW_PAYOUT_CHANGE__
 Restart=on-failure
 RestartSec=5
 [Install]
 WantedBy=multi-user.target
 FALLBACK
 fi
+# Substituted into the unit as a whole flag, or as nothing. Kept to ONE line
+# with no continuation: a newline in a sed replacement would break the script,
+# and systemd is happy with the flag appended to the last ExecStart line.
+ALLOW_FLAG=""
+if [ "$ALLOW_PAYOUT_CHANGE" = "yes" ]; then
+  ALLOW_FLAG=" --ops-allow-payout-change"
+fi
+
 sed -e "s|__PAYOUT_ADDRESS__|$PAYOUT|g" \
+    -e "s|__OPS_ALLOW_PAYOUT_CHANGE__|$ALLOW_FLAG|g" \
     -e "s|__FEE_BPS__|$FEE_BPS|g" \
     -e "s|__BIND__|$BIND|g" \
     -e "s|__RPC_URL__|$RPC_URL|g" \
@@ -191,6 +206,18 @@ cat <<DONE
   Your operator fee is ${FEE_BPS} bps ($(( FEE_BPS / 100 ))%), paid to
   $PAYOUT as an output in every block your pool finds. Your miners can
   verify it on-chain — you never hold their coins.
+
+  Fee address changes made at runtime are saved to
+  /etc/dinero-sv2/payout-address, which wins over the unit on restart.
+$(if [ "$ALLOW_PAYOUT_CHANGE" = "yes" ]; then
+printf '%s\n' "" \
+  "  NOTE: --allow-payout-change is ON. Anyone holding your ops token can" \
+  "  retarget your fee address. Treat that token like a key, not a password."
+else
+printf '%s\n' "" \
+  "  Changing the fee address from a client (dinero-qt) is OFF. Re-run this" \
+  "  installer with --allow-payout-change to enable it."
+fi)
 
   Operator status (loopback only, plain HTTP by design):
 

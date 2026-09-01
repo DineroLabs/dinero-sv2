@@ -7,6 +7,11 @@
 #
 # Installed by scripts/install-pool.sh, which fills in the payout address
 # and generates the Noise key + ops token referenced below.
+#
+# --payout-address is the INITIAL fee destination. If an operator later
+# changes it at runtime, the choice is persisted to
+# /etc/dinero-sv2/payout-address, which takes precedence on the next start —
+# otherwise a restart would quietly revert the fee to the address below.
 [Unit]
 Description=Dinero SV2 Pool Server
 Documentation=https://github.com/DineroLabs/dinero-sv2/blob/main/docs/RUN-A-POOL.md
@@ -28,7 +33,8 @@ ExecStart=/usr/local/bin/dinero-sv2-pool \
   --pplns-journal /var/lib/dinero-sv2/pplns-journal.jsonl \
   --ops-bind 127.0.0.1:4445 \
   --ops-token-file /etc/dinero-sv2/ops-token \
-  --shared-fee-bps __FEE_BPS__
+  --payout-address-file /etc/dinero-sv2/payout-address \
+  --shared-fee-bps __FEE_BPS____OPS_ALLOW_PAYOUT_CHANGE__
 
 Restart=on-failure
 RestartSec=5

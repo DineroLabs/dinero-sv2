@@ -68,6 +68,7 @@ use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry
 use crate::backend::BackendPool;
 use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
+use dinero_sv2_pool::payout;
 use crate::mapper::PoolTemplate;
 use crate::rpc::{Auth, RpcClient, SubmitBlockResult};
 use crate::shared_template::SharedTemplate;
@@ -146,8 +147,28 @@ struct Args {
 
     /// Payout address for getblocktemplate (pool-built coinbase; miners
     /// don't alter outputs in Phase 4).
+    ///
+    /// This is the INITIAL value. If `--payout-address-file` holds a
+    /// plausible address, that wins — it is what the operator last chose at
+    /// runtime, and silently reverting it on restart would pay the wrong
+    /// destination for however long nobody noticed.
     #[arg(long)]
     payout_address: String,
+
+    /// Where a runtime-set payout address is persisted, so it survives a
+    /// restart. Read at startup in preference to `--payout-address`.
+    #[arg(long, default_value = dinero_sv2_pool::payout::DEFAULT_PATH)]
+    payout_address_file: PathBuf,
+
+    /// Allow `POST /payout-address` on the ops endpoint, letting an operator
+    /// retarget their own fee output from a client such as dinero-qt.
+    ///
+    /// OFF by default, and deliberately so: turning it on upgrades the ops
+    /// token from a read credential into one that can redirect the operator's
+    /// share of every future block. It cannot touch miners' payouts — those
+    /// come from the PPLNS window, which no ops route reaches.
+    #[arg(long, default_value_t = false)]
+    ops_allow_payout_change: bool,
 
     /// Tip-poll interval.
     #[arg(long, default_value_t = 2)]
@@ -359,6 +380,20 @@ async fn main() -> Result<()> {
         WindowJournal::open(&args.pplns_journal).context("opening PPLNS journal")?,
     ));
 
+    // Payout address: file beats flag (see payout.rs). Held in a watch so the
+    // template producer picks up a runtime change on its next iteration —
+    // no restart, and no chance of a half-applied swap.
+    let (payout_addr_str, from_file) =
+        payout::resolve_startup(&args.payout_address, &args.payout_address_file);
+    if from_file {
+        info!(
+            address = %payout_addr_str,
+            path = %args.payout_address_file.display(),
+            "payout address restored from disk (overrides --payout-address)"
+        );
+    }
+    let (payout_tx, payout_rx) = watch::channel::<String>(payout_addr_str);
+
     let (tx, rx) = watch::channel::<Option<Arc<TemplateBundle>>>(None);
 
     // Liveness stamp for the template producer. Monotonic (Instant-based),
@@ -368,7 +403,7 @@ async fn main() -> Result<()> {
     // Template producer task.
     let mut template_producer = {
         let backends = backends.clone();
-        let payout = args.payout_address.clone();
+        let payout_rx = payout_rx.clone();
         let poll = Duration::from_secs(args.poll_secs);
         let refresh_same_tip = if args.refresh_same_tip_secs == 0 {
             None
@@ -396,6 +431,9 @@ async fn main() -> Result<()> {
                 // Upstream folded the tip poll and the template fetch into one
                 // call, so this single await covers what used to be two phases.
                 heartbeat.beat(supervisor::Phase::PollingTip);
+                // Re-read every iteration so a runtime change lands on the
+                // very next template rather than waiting for a restart.
+                let payout = payout_rx.borrow().clone();
                 let (backend, gbt) = match backends.select_template(&payout).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -612,6 +650,7 @@ async fn main() -> Result<()> {
         let ops_heartbeat = heartbeat.clone();
         let ops_connected = connected_miners.clone();
         let fee_bps = args.shared_fee_bps;
+        let ops_payout_rx = payout_rx.clone();
         let snapshot = Arc::new(move || {
             let (entries, span, miners) = {
                 let w = ops_window.lock().unwrap();
@@ -643,6 +682,7 @@ async fn main() -> Result<()> {
             };
             let credits = ops_ledger.snapshot();
             ops::OpsStatus {
+                payout_address: ops_payout_rx.borrow().clone(),
                 pool_version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime_secs: started.elapsed().as_secs(),
                 fee_bps,
@@ -657,8 +697,49 @@ async fn main() -> Result<()> {
                 miners,
             }
         });
+        let policy = ops::Policy {
+            allow_payout_change: args.ops_allow_payout_change,
+        };
+        if policy.allow_payout_change {
+            warn!(
+                "ops endpoint accepts payout-address changes: the ops token can \
+                 now redirect YOUR fee output (miners' payouts are unaffected)"
+            );
+        }
+        let apply_backends = backends.clone();
+        let apply_path = args.payout_address_file.clone();
+        let apply_tx = Arc::new(payout_tx);
+        let apply_payout = Arc::new(move |candidate: String| {
+            let backends = apply_backends.clone();
+            let path = apply_path.clone();
+            let tx = apply_tx.clone();
+            async move {
+                // 1. Cheap syntactic gate, so an obvious typo costs no RPC.
+                if !ops::looks_like_payout_address(&candidate) {
+                    return Err("not a plausible din1p... address".to_string());
+                }
+                // 2. Authoritative check. A well-formed but wrong address makes
+                //    getblocktemplate fail, which would mean zero templates and
+                //    a dead pool — so prove it produces one BEFORE adopting it.
+                //    On failure the old address is still live and miners never
+                //    see a gap.
+                if let Err(e) = backends.select_template(&candidate).await {
+                    return Err(format!("node refused a template for that address: {e}"));
+                }
+                // 3. Persist before swapping. If the write fails we must not
+                //    end up live on an address that a restart would revert.
+                if let Err(e) = payout::store(&path, &candidate) {
+                    return Err(format!("could not persist the address: {e}"));
+                }
+                // 4. Swap. The producer picks this up on its next iteration.
+                if tx.send(candidate.clone()).is_err() {
+                    return Err("template producer is gone".to_string());
+                }
+                Ok(candidate)
+            }
+        });
         tokio::spawn(async move {
-            if let Err(e) = ops::serve(listener, token, snapshot).await {
+            if let Err(e) = ops::serve(listener, token, policy, snapshot, apply_payout).await {
                 warn!(error = %e, "ops endpoint stopped");
             }
         });
