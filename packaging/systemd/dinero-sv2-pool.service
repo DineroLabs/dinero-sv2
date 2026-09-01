@@ -1,0 +1,50 @@
+# Dinero SV2 pool.
+#
+# Restart=on-failure is load-bearing, not boilerplate: the pool exits
+# non-zero when its template producer dies OR wedges (see
+# --template-stall-secs). Without a restart policy those exits leave you
+# with a stopped pool instead of a recovered one.
+#
+# Installed by scripts/install-pool.sh, which fills in the payout address
+# and generates the Noise key + ops token referenced below.
+[Unit]
+Description=Dinero SV2 Pool Server
+Documentation=https://github.com/DineroLabs/dinero-sv2/blob/main/docs/RUN-A-POOL.md
+# The pool is useless without a node to serve templates, but it does not
+# hard-require the unit: a pool that outlives a node restart should keep
+# running and reconnect rather than being torn down with it.
+After=network-online.target dinero.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/dinero-sv2-pool \
+  --bind 0.0.0.0:4444 \
+  --rpc-url http://127.0.0.1:20998 \
+  --cookie /var/lib/dinero/.cookie \
+  --payout-address __PAYOUT_ADDRESS__ \
+  --tp-key /etc/dinero-sv2/pool-static.key \
+  --pplns-journal /var/lib/dinero-sv2/pplns-journal.jsonl \
+  --ops-bind 127.0.0.1:4445 \
+  --ops-token-file /etc/dinero-sv2/ops-token \
+  --shared-fee-bps __FEE_BPS__
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Modest hardening. Deliberately NOT ProtectSystem=strict: the pool must
+# read the node's cookie under /var/lib/dinero and write its own PPLNS
+# journal, and a stricter sandbox that silently breaks either one would
+# cost share credit.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
