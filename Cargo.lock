@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "dinero-sv2-pool"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
