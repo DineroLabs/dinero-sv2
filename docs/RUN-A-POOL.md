@@ -21,7 +21,8 @@ suits pools of tens of miners, not thousands.
 - A Linux server (x86_64 or aarch64) with a public IP
 - **A `dinerod` node on the same host.** This is not optional — the pool
   gets block templates from it and submits found blocks through it. A
-  pool operator is necessarily a node operator.
+  pool operator is necessarily a node operator. **Budget real time for
+  the first sync** — see below.
 - A `din1p…` Taproot address for your fee
 - One open inbound port (4444 by default)
 
@@ -31,8 +32,20 @@ Get `dinerod` from <https://dinerolabs.org> and start it with RPC
 enabled.
 
 A fresh node bootstraps from the published AssumeUTXO snapshot rather
-than replaying the chain, so this is minutes rather than hours. Confirm
-you are near the tip before continuing:
+than replaying the whole chain from genesis.
+
+**Be realistic about how long the rest takes.** The snapshot shipped with
+the release is not the newest one the fleet publishes — the release
+carries an anchor at height 84131, while the automated publisher is
+around 99677 — so a fresh node still replays the ~15,000 blocks between
+them. Measured on a 2-core VPS: **about 8–9 blocks a minute, roughly 30
+hours to reach the tip.** It is unattended, but it is not a coffee break.
+
+(This gap is a packaging problem, not a property of the chain. Once a
+release ships an anchor near the publisher's current height, the same
+install lands minutes from the tip.)
+
+Confirm you are near the tip before continuing:
 
 ```sh
 dinero-cli getblockcount
