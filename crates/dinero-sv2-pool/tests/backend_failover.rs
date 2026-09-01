@@ -149,9 +149,13 @@ async fn spawn_backend(
     (state, client)
 }
 
+/// `work` is bare hex; the fake serves it 0x-PREFIXED because that is what a
+/// real dinerod's getblockchaininfo returns. Serving bare hex here is what let
+/// a parser that rejected the prefix ship green — the pool then treated every
+/// live backend as unusable and produced no templates at all.
 fn state(work: &str, hash: &str, ready: bool) -> FakeState {
     FakeState {
-        chainwork: work.into(),
+        chainwork: format!("0x{work}"),
         best_hash: hash.into(),
         template_ready: ready,
         record_submitted_block: true,

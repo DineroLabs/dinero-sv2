@@ -214,10 +214,19 @@ impl BackendPool {
 }
 
 fn normalize_chainwork(input: &str) -> Option<String> {
-    if input.is_empty() || !input.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // dinerod reports chainwork 0x-prefixed ("0x0000...3f68"), Bitcoin-style
+    // RPCs report it bare. Accept both: rejecting the prefixed form made every
+    // real backend look unusable, so the pool produced no templates at all.
+    // Strip before trimming zeros, so "0x0000ab" and "0000ab" normalise alike
+    // and compare_chainwork (which is length-first) cannot rank them wrongly.
+    let digits = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+        .unwrap_or(input);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let normalized = input.trim_start_matches('0').to_ascii_lowercase();
+    let normalized = digits.trim_start_matches('0').to_ascii_lowercase();
     Some(if normalized.is_empty() {
         "0".into()
     } else {
@@ -312,6 +321,41 @@ mod tests {
         assert_eq!(normalize_chainwork("0000AB"), Some("ab".into()));
         assert_eq!(normalize_chainwork("000"), Some("0".into()));
         assert_eq!(normalize_chainwork("xyz"), None);
+    }
+
+    #[test]
+    fn chainwork_parser_accepts_the_form_dinerod_actually_emits() {
+        // dinerod's getblockchaininfo returns chainwork 0x-PREFIXED. Every
+        // fixture here used bare hex, so the parser rejected every real
+        // backend as "invalid chainwork" and the pool served no templates
+        // at all — while the suite stayed green.
+        let real = "0x00000000000000000000000000000000000000000000000000003f6855a7bb73";
+        assert_eq!(
+            normalize_chainwork(real),
+            Some("3f6855a7bb73".into()),
+            "0x-prefixed chainwork from a live dinerod must parse"
+        );
+        assert_eq!(normalize_chainwork("0X0000AB"), Some("ab".into()));
+        // Bare hex must keep working: both forms are valid input.
+        assert_eq!(normalize_chainwork("00003f6855a7bb73"), Some("3f6855a7bb73".into()));
+    }
+
+    #[test]
+    fn chainwork_parser_rejects_a_bare_prefix() {
+        // "0x" with no digits is not zero work, it is malformed.
+        assert_eq!(normalize_chainwork("0x"), None);
+        assert_eq!(normalize_chainwork("0X"), None);
+        // ...but a prefixed zero is legitimately zero.
+        assert_eq!(normalize_chainwork("0x0"), Some("0".into()));
+    }
+
+    #[test]
+    fn prefixed_and_bare_chainwork_compare_equal() {
+        // Failing to normalise the prefix away would also corrupt failover:
+        // the longer string would look like more work.
+        let a = normalize_chainwork("0x0100").unwrap();
+        let b = normalize_chainwork("0100").unwrap();
+        assert_eq!(compare_chainwork(&a, &b), Ordering::Equal);
     }
 
     #[test]
