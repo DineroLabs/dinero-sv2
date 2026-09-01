@@ -152,8 +152,13 @@ struct Args {
     /// plausible address, that wins — it is what the operator last chose at
     /// runtime, and silently reverting it on restart would pay the wrong
     /// destination for however long nobody noticed.
-    #[arg(long)]
-    payout_address: String,
+    ///
+    /// Required to RUN the pool, but not to `--print-pubkey`: making clap
+    /// demand it there meant the installer's bare `--print-pubkey` exited 2
+    /// with empty stdout, so operators were never shown the key their miners
+    /// must pin.
+    #[arg(long, required_unless_present = "print_pubkey")]
+    payout_address: Option<String>,
 
     /// Where a runtime-set payout address is persisted, so it survives a
     /// restart. Read at startup in preference to `--payout-address`.
@@ -383,8 +388,13 @@ async fn main() -> Result<()> {
     // Payout address: file beats flag (see payout.rs). Held in a watch so the
     // template producer picks up a runtime change on its next iteration —
     // no restart, and no chance of a half-applied swap.
+    // `required_unless_present` guarantees this past the --print-pubkey exit.
+    let payout_flag = args
+        .payout_address
+        .clone()
+        .context("--payout-address is required to run the pool")?;
     let (payout_addr_str, from_file) =
-        payout::resolve_startup(&args.payout_address, &args.payout_address_file);
+        payout::resolve_startup(&payout_flag, &args.payout_address_file);
     if from_file {
         info!(
             address = %payout_addr_str,
@@ -2223,4 +2233,38 @@ async fn apply_mempool_to_pre_coinbase(
         }
     }
     Ok(state)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Args;
+    use clap::Parser;
+
+    // The installer calls `--print-pubkey` on its own to show operators the key
+    // their miners must pin. When clap demanded --payout-address here, that
+    // call exited 2 with empty stdout and the banner printed a placeholder.
+    #[test]
+    fn print_pubkey_does_not_require_a_payout_address() {
+        let a = Args::try_parse_from(["pool", "--print-pubkey", "--tp-key", "/tmp/k"])
+            .expect("--print-pubkey must stand alone");
+        assert!(a.print_pubkey);
+        assert!(a.payout_address.is_none());
+    }
+
+    // ...but running the pool without one must still be refused, not defaulted.
+    #[test]
+    fn running_the_pool_still_requires_a_payout_address() {
+        assert!(Args::try_parse_from(["pool", "--bind", "127.0.0.1:4444"]).is_err());
+    }
+
+    #[test]
+    fn payout_change_is_off_unless_asked_for() {
+        let a = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
+        assert!(!a.ops_allow_payout_change, "must default OFF");
+        let b = Args::try_parse_from([
+            "pool", "--payout-address", "din1pxx", "--ops-allow-payout-change",
+        ])
+        .unwrap();
+        assert!(b.ops_allow_payout_change);
+    }
 }

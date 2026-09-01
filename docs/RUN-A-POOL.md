@@ -69,7 +69,7 @@ Defaults worth knowing:
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--fee-bps` | `1000` (10%) | Your cut of each block your pool finds |
+| `--fee-bps` | `1000` (10%) | Your cut of each block your pool finds. Any value 0–10000 (0–100%) is accepted; 10% is the installer's default, not a cap. Operators compete on this, and miners verify it from the block's coinbase rather than trusting you. |
 | `--bind` | `0.0.0.0:4444` | Miner-facing port |
 | `--cookie` | `/var/lib/dinero/.cookie` | Node auth — no password in the unit |
 
