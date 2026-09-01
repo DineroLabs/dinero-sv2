@@ -224,3 +224,26 @@ jobs:
             This release ships both CPU and GPU miners. The GPU binaries use
             Metal on macOS and OpenCL on Linux/Windows. Both variants share
             the same authenticated SV2 transport and interactive terminal UX.
+
+            GPU install (separate script, installs alongside the CPU miner
+            rather than replacing it):
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install-gpu.sh | sh
+            ```
+
+            ```powershell
+            irm https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install-gpu.ps1 | iex
+            ```
+
+            Then start shared GPU mining. Note this is NOT the CPU command:
+            the GPU miner has no `--threads`. It takes `--backend`, defaulting
+            to `auto` (Metal on macOS, else CUDA when present, else OpenCL).
+
+            ```sh
+            cd "$HOME/.local/bin" && ./dinero-gpu-miner --address "YOUR_DIN1_ADDRESS" --reward-mode shared
+            ```
+
+            There is no GPU binary for Linux aarch64; that platform is
+            CPU-only and the installer says so rather than failing on a
+            missing download.
