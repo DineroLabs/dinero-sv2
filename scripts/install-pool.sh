@@ -33,6 +33,30 @@ usage: install-pool.sh --payout-address din1p... [options]
 USAGE
 }
 
+# The pool's Noise static key is created on first touch; --print-pubkey both
+# creates and reads it. Operators must publish this so miners can pin it.
+derive_pubkey() { # <binary> <key-path> <payout-address>
+  # --payout-address is a REQUIRED arg on the binary, so clap rejects a bare
+  # --print-pubkey with exit 2 and an empty stdout. Pass it even though
+  # printing a key ignores it, or the operator never sees their pubkey.
+  "$1" --print-pubkey --tp-key "$2" --payout-address "$3" 2>/dev/null | tr -d '\r\n '
+}
+
+# Host string printed in the miner command line.
+pool_host() {
+  # `hostname -f` EXITS 0 with a bare label (e.g. "DineroTX") when the box has
+  # no domain, so the `||` fallback never fires and miners are handed a name
+  # they cannot resolve. Require a dot before trusting it.
+  _h=$(hostname -f 2>/dev/null || true)
+  case "$_h" in
+    *.*) echo "$_h" ;;
+    *)   echo "YOUR_HOST" ;;
+  esac
+}
+
+# Sourced by tests to reach the functions above without running the install.
+[ "${INSTALL_POOL_LIB_ONLY:-}" = "1" ] && return 0 2>/dev/null || :
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --payout-address) PAYOUT="${2:?}"; shift 2 ;;
@@ -103,7 +127,7 @@ fi
 # --- Noise static key ------------------------------------------------------
 # The pool generates this itself on first touch; --print-pubkey is how we
 # both create and read it. Miners must pin the pubkey.
-PUBKEY=$(/usr/local/bin/dinero-sv2-pool --print-pubkey --tp-key /etc/dinero-sv2/pool-static.key 2>/dev/null | tr -d '\r\n ' || true)
+PUBKEY=$(derive_pubkey /usr/local/bin/dinero-sv2-pool /etc/dinero-sv2/pool-static.key "$PAYOUT" || true)
 chmod 600 /etc/dinero-sv2/pool-static.key 2>/dev/null || true
 
 # --- unit ------------------------------------------------------------------
@@ -152,12 +176,12 @@ cat <<DONE
 
   Your pool's public key (miners MUST pin this):
 
-      ${PUBKEY:-<run: dinero-sv2-pool --print-pubkey --tp-key /etc/dinero-sv2/pool-static.key>}
+      ${PUBKEY:-<run: dinero-sv2-pool --print-pubkey --tp-key /etc/dinero-sv2/pool-static.key --payout-address $PAYOUT>}
 
   Miners connect with:
 
       dinero-miner --address <their din1p...> --reward-mode shared \\
-        --pool $(hostname -f 2>/dev/null || echo YOUR_HOST):${BIND##*:} \\
+        --pool $(pool_host):${BIND##*:} \\
         --server-pubkey ${PUBKEY:-YOUR_POOL_PUBKEY}
 
   Without --server-pubkey they still connect, but unpinned
@@ -175,7 +199,7 @@ cat <<DONE
 
   Expose it remotely ONLY behind a TLS reverse proxy or an SSH tunnel:
 
-      ssh -N -L 4445:127.0.0.1:4445 root@$(hostname -f 2>/dev/null || echo YOUR_HOST)
+      ssh -N -L 4445:127.0.0.1:4445 root@$(pool_host)
 
   Open port ${BIND##*:} to miners.   Logs: journalctl -fu dinero-sv2-pool
 ──────────────────────────────────────────────────────────────────────
