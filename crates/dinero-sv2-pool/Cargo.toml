@@ -5,7 +5,7 @@ name        = "dinero-sv2-pool"
 # 0.1.0 meant pool-v0.1.1 produced a binary whose --version said 0.1.0 —
 # leaving a broken build and its fix indistinguishable to whoever held it.
 # The release workflow now fails if this disagrees with the tag.
-version     = "0.1.2"
+version     = "0.1.3"
 edition     = { workspace = true }
 license     = { workspace = true }
 repository  = { workspace = true }
