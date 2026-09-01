@@ -28,6 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pool-v0.1.1 shipped a binary whose --version said 0.1.0, because the
+      # crate version was never bumped with the tag. That makes a broken build
+      # and its fix indistinguishable to whoever is holding the binary. The
+      # miner pipeline has always had this guard; the pool pipeline did not.
+      - name: Require release version identity
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#pool-v}"
+          ACTUAL="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' crates/dinero-sv2-pool/Cargo.toml | head -1)"
+          echo "tag=$VERSION crate=$ACTUAL"
+          test "$ACTUAL" = "$VERSION"
+
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
