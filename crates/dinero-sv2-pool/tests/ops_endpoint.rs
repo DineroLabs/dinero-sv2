@@ -60,8 +60,17 @@ async fn start_with(policy: ops::Policy) -> String {
             Ok(a)
         }
     });
+    let apply_fee = Arc::new(|fee: u32| async move { Ok(fee) });
     tokio::spawn(async move {
-        let _ = ops::serve(listener, "tok-abc".to_string(), policy, snapshot, apply).await;
+        let _ = ops::serve(
+            listener,
+            "tok-abc".to_string(),
+            policy,
+            snapshot,
+            apply,
+            apply_fee,
+        )
+        .await;
     });
     addr
 }
@@ -73,6 +82,15 @@ async fn start() -> String {
 async fn start_open() -> String {
     start_with(ops::Policy {
         allow_payout_change: true,
+        ..ops::Policy::default()
+    })
+    .await
+}
+
+async fn start_fee_open() -> String {
+    start_with(ops::Policy {
+        allow_fee_change: true,
+        ..ops::Policy::default()
     })
     .await
 }
@@ -205,6 +223,7 @@ async fn serve_refuses_to_start_without_a_token() {
         ops::Policy::default(),
         Arc::new(canned),
         Arc::new(|a: String| async move { Ok(a) }),
+        Arc::new(|fee: u32| async move { Ok(fee) }),
     )
     .await
     .unwrap_err();
@@ -338,4 +357,34 @@ async fn status_reports_the_live_payout_address() {
     .await;
     assert!(resp.contains("payout_address"), "got: {resp}");
     assert!(resp.contains(GOOD), "got: {resp}");
+}
+#[tokio::test]
+async fn fee_route_applies_and_echoes_exact_reviewed_basis_points() {
+    let addr = start_fee_open().await;
+    let body = r#"{"fee_bps":750}"#;
+    let response = raw(
+        &addr,
+        &format!(
+            "POST /fee-bps HTTP/1.1\r\nAuthorization: Bearer tok-abc\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains(r#""fee_bps":750"#), "{response}");
+}
+
+#[tokio::test]
+async fn fee_route_is_forbidden_by_default() {
+    let addr = start().await;
+    let body = r#"{"fee_bps":500}"#;
+    let response = raw(
+        &addr,
+        &format!(
+            "POST /fee-bps HTTP/1.1\r\nAuthorization: Bearer tok-abc\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
 }

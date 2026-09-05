@@ -20,6 +20,7 @@ RPC_URL="http://127.0.0.1:20998"
 COOKIE="/var/lib/dinero/.cookie"
 START="yes"
 ALLOW_PAYOUT_CHANGE="no"
+ALLOW_FEE_CHANGE="no"
 
 usage() {
   cat <<USAGE
@@ -35,6 +36,8 @@ usage: install-pool.sh --payout-address din1p... [options]
                           runtime (e.g. from dinero-qt). OFF by default:
                           enabling it means your ops token can redirect
                           YOUR fee output. Miners' payouts are unaffected.
+  --allow-fee-change      let the ops endpoint change your operator fee at
+                          runtime. OFF by default; treat the ops token as a key.
 USAGE
 }
 
@@ -71,6 +74,7 @@ while [ $# -gt 0 ]; do
     --cookie)         COOKIE="${2:?}"; shift 2 ;;
     --no-start)       START="no"; shift ;;
     --allow-payout-change) ALLOW_PAYOUT_CHANGE="yes"; shift ;;
+    --allow-fee-change)    ALLOW_FEE_CHANGE="yes"; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -79,6 +83,8 @@ done
 [ "$(id -u)" = "0" ] || { echo "run as root (writes /etc, /var/lib, systemd)" >&2; exit 1; }
 [ -n "$PAYOUT" ] || { echo "--payout-address is required" >&2; usage; exit 2; }
 case "$PAYOUT" in din1p*) ;; *) echo "payout address must be a din1p... Taproot address" >&2; exit 2 ;; esac
+case "$FEE_BPS" in ''|*[!0-9]*) echo "--fee-bps must be an integer from 0 through 10000" >&2; exit 2 ;; esac
+[ "$FEE_BPS" -le 10000 ] || { echo "--fee-bps must be from 0 through 10000" >&2; exit 2; }
 command -v systemctl >/dev/null 2>&1 || { echo "systemd required" >&2; exit 1; }
 
 # --- the node prerequisite -------------------------------------------------
@@ -148,7 +154,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/dinero-sv2-pool --bind __BIND__ --rpc-url __RPC_URL__ --cookie __COOKIE__ --payout-address __PAYOUT_ADDRESS__ --tp-key /etc/dinero-sv2/pool-static.key --pplns-journal /var/lib/dinero-sv2/pplns-journal.jsonl --ops-bind 127.0.0.1:4445 --ops-token-file /etc/dinero-sv2/ops-token --payout-address-file /etc/dinero-sv2/payout-address --shared-fee-bps __FEE_BPS____OPS_ALLOW_PAYOUT_CHANGE__
+ExecStart=/usr/local/bin/dinero-sv2-pool --bind __BIND__ --rpc-url __RPC_URL__ --cookie __COOKIE__ --payout-address __PAYOUT_ADDRESS__ --tp-key /etc/dinero-sv2/pool-static.key --pplns-journal /var/lib/dinero-sv2/pplns-journal.jsonl --ops-bind 127.0.0.1:4445 --ops-token-file /etc/dinero-sv2/ops-token --payout-address-file /etc/dinero-sv2/payout-address --shared-fee-bps-file /etc/dinero-sv2/shared-fee-bps --shared-fee-bps __FEE_BPS____OPS_ALLOW_PAYOUT_CHANGE____OPS_ALLOW_FEE_CHANGE__
 Restart=on-failure
 RestartSec=5
 [Install]
@@ -162,9 +168,14 @@ ALLOW_FLAG=""
 if [ "$ALLOW_PAYOUT_CHANGE" = "yes" ]; then
   ALLOW_FLAG=" --ops-allow-payout-change"
 fi
+ALLOW_FEE_FLAG=""
+if [ "$ALLOW_FEE_CHANGE" = "yes" ]; then
+  ALLOW_FEE_FLAG=" --ops-allow-fee-change"
+fi
 
 sed -e "s|__PAYOUT_ADDRESS__|$PAYOUT|g" \
     -e "s|__OPS_ALLOW_PAYOUT_CHANGE__|$ALLOW_FLAG|g" \
+    -e "s|__OPS_ALLOW_FEE_CHANGE__|$ALLOW_FEE_FLAG|g" \
     -e "s|__FEE_BPS__|$FEE_BPS|g" \
     -e "s|__BIND__|$BIND|g" \
     -e "s|__RPC_URL__|$RPC_URL|g" \

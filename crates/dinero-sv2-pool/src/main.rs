@@ -72,7 +72,7 @@ use crate::mapper::PoolTemplate;
 use crate::rpc::{Auth, RpcClient, SubmitBlockResult};
 use crate::shared_template::SharedTemplate;
 use crate::target::{hash_meets_target, leading_zero_bits_target, target_for_hashrate};
-use dinero_sv2_pool::payout;
+use dinero_sv2_pool::{fee, payout};
 
 /// Bundle of the daemon-sourced solo template and (if it could be
 /// built this refresh) the pool-owned shared-mode variant. Sent as a
@@ -174,6 +174,14 @@ struct Args {
     /// come from the PPLNS window, which no ops route reaches.
     #[arg(long, default_value_t = false)]
     ops_allow_payout_change: bool,
+
+    /// Where a runtime-set operator fee is persisted across restarts.
+    #[arg(long, default_value = dinero_sv2_pool::fee::DEFAULT_PATH)]
+    shared_fee_bps_file: PathBuf,
+
+    /// Allow authenticated `POST /fee-bps` runtime fee changes. OFF by default.
+    #[arg(long, default_value_t = false)]
+    ops_allow_fee_change: bool,
 
     /// Tip-poll interval.
     #[arg(long, default_value_t = 2)]
@@ -403,6 +411,19 @@ async fn main() -> Result<()> {
         );
     }
     let (payout_tx, payout_rx) = watch::channel::<String>(payout_addr_str);
+    if args.shared_fee_bps > fee::MAX_BPS {
+        anyhow::bail!("--shared-fee-bps must be between 0 and 10000");
+    }
+    let (shared_fee_bps, fee_from_file) =
+        fee::resolve_startup(args.shared_fee_bps, &args.shared_fee_bps_file);
+    if fee_from_file {
+        info!(
+            fee_bps = shared_fee_bps,
+            path = %args.shared_fee_bps_file.display(),
+            "operator fee restored from disk (overrides --shared-fee-bps)"
+        );
+    }
+    let (fee_tx, fee_rx) = watch::channel::<u32>(shared_fee_bps);
 
     let (tx, rx) = watch::channel::<Option<Arc<TemplateBundle>>>(None);
 
@@ -414,6 +435,7 @@ async fn main() -> Result<()> {
     let mut template_producer = {
         let backends = backends.clone();
         let payout_rx = payout_rx.clone();
+        let fee_rx = fee_rx.clone();
         let poll = Duration::from_secs(args.poll_secs);
         let refresh_same_tip = if args.refresh_same_tip_secs == 0 {
             None
@@ -423,7 +445,6 @@ async fn main() -> Result<()> {
         // Renamed (not `window`) to avoid shadowing the `refresh_same_tip`
         // match arm's `window: Duration` binding a few lines below.
         let pplns_window = window.clone();
-        let shared_fee_bps = args.shared_fee_bps;
         let shared_max_outputs = args.shared_max_outputs;
         let shared_dust_una = args.shared_dust_una;
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
@@ -594,7 +615,7 @@ async fn main() -> Result<()> {
                         };
                         let params = split::SplitParams {
                             reward_una: pt.coinbase_value_una,
-                            fee_bps: shared_fee_bps,
+                            fee_bps: *fee_rx.borrow(),
                             fee_script: &fee_script,
                             max_outputs: shared_max_outputs,
                             dust_una: shared_dust_una,
@@ -669,7 +690,7 @@ async fn main() -> Result<()> {
         let ops_connected = connected_miners.clone();
         let ops_templates = rx.clone();
         let stratum_bind = args.bind.to_string();
-        let fee_bps = args.shared_fee_bps;
+        let ops_fee_rx = fee_rx.clone();
         let ops_payout_rx = payout_rx.clone();
         let snapshot = Arc::new(move || {
             let (entries, span, miners) = {
@@ -712,7 +733,7 @@ async fn main() -> Result<()> {
                 payout_address: ops_payout_rx.borrow().clone(),
                 pool_version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime_secs: started.elapsed().as_secs(),
-                fee_bps,
+                fee_bps: *ops_fee_rx.borrow(),
                 connected_miners: ops_connected.load(Ordering::Relaxed),
                 window_entries: entries,
                 window_span_secs: span,
@@ -739,11 +760,17 @@ async fn main() -> Result<()> {
         });
         let policy = ops::Policy {
             allow_payout_change: args.ops_allow_payout_change,
+            allow_fee_change: args.ops_allow_fee_change,
         };
         if policy.allow_payout_change {
             warn!(
                 "ops endpoint accepts payout-address changes: the ops token can \
                  now redirect YOUR fee output (miners' payouts are unaffected)"
+            );
+        }
+        if policy.allow_fee_change {
+            warn!(
+                "ops endpoint accepts operator-fee changes: the ops token can alter YOUR fee percentage for future templates"
             );
         }
         let apply_backends = backends.clone();
@@ -778,8 +805,28 @@ async fn main() -> Result<()> {
                 Ok(candidate)
             }
         });
+        let apply_fee_path = args.shared_fee_bps_file.clone();
+        let apply_fee_tx = Arc::new(fee_tx);
+        let apply_fee = Arc::new(move |candidate: u32| {
+            let path = apply_fee_path.clone();
+            let tx = apply_fee_tx.clone();
+            async move {
+                if candidate > fee::MAX_BPS {
+                    return Err("operator fee must be between 0 and 10000 basis points".to_string());
+                }
+                if let Err(error) = fee::store(&path, candidate) {
+                    return Err(format!("could not persist the operator fee: {error}"));
+                }
+                if tx.send(candidate).is_err() {
+                    return Err("template producer is gone".to_string());
+                }
+                Ok(candidate)
+            }
+        });
         tokio::spawn(async move {
-            if let Err(e) = ops::serve(listener, token, policy, snapshot, apply_payout).await {
+            if let Err(e) =
+                ops::serve(listener, token, policy, snapshot, apply_payout, apply_fee).await
+            {
                 warn!(error = %e, "ops endpoint stopped");
             }
         });
@@ -2331,5 +2378,19 @@ mod cli_tests {
         ])
         .unwrap();
         assert!(b.ops_allow_payout_change);
+    }
+
+    #[test]
+    fn fee_change_is_off_unless_asked_for() {
+        let a = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
+        assert!(!a.ops_allow_fee_change, "must default OFF");
+        let b = Args::try_parse_from([
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--ops-allow-fee-change",
+        ])
+        .unwrap();
+        assert!(b.ops_allow_fee_change);
     }
 }
