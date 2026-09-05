@@ -4,6 +4,7 @@
 //! reading, status lines, and that an unauthorized caller never gets
 //! a body.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dinero_sv2_pool::ops::{self, MinerStatus, OpsStatus};
@@ -12,6 +13,8 @@ use tokio::net::TcpStream;
 
 fn canned() -> OpsStatus {
     OpsStatus {
+        schema_version: 2,
+        generated_at_unix: 1_700_000_000,
         payout_address: "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy".into(),
         pool_version: "test".into(),
         uptime_secs: 42,
@@ -29,6 +32,18 @@ fn canned() -> OpsStatus {
             bps: 5000,
             window_weight: "12345".into(),
         }],
+        stratum_bind: "127.0.0.1:4444".into(),
+        daemon_connected: true,
+        daemon_endpoint: "http://127.0.0.1:20998".into(),
+        daemon_blocks: 100,
+        daemon_headers: 100,
+        template_height: 101,
+        template_id: 9,
+        template_prev_hash: "00aa".into(),
+        last_template_at_unix: 1_700_000_000,
+        last_share: None,
+        last_block: None,
+        rejection_reasons: BTreeMap::new(),
     }
 }
 
@@ -56,7 +71,10 @@ async fn start() -> String {
 }
 
 async fn start_open() -> String {
-    start_with(ops::Policy { allow_payout_change: true }).await
+    start_with(ops::Policy {
+        allow_payout_change: true,
+    })
+    .await
 }
 
 async fn raw(addr: &str, request: &str) -> String {
@@ -82,6 +100,9 @@ async fn authorized_status_returns_json() {
     assert_eq!(parsed, canned());
     assert_eq!(parsed.fee_bps, 1000);
     assert_eq!(parsed.connected_miners, 3);
+    assert_eq!(parsed.schema_version, 2);
+    assert!(parsed.daemon_connected);
+    assert_eq!(parsed.template_height, 101);
 }
 
 #[tokio::test]
@@ -95,7 +116,10 @@ async fn wrong_token_is_401_and_leaks_no_data() {
     assert!(resp.starts_with("HTTP/1.1 401 Unauthorized"), "got: {resp}");
     // Nothing about the pool may appear in a refused response.
     for leak in ["fee_bps", "connected_miners", "5120aa", "window_entries"] {
-        assert!(!resp.contains(leak), "refused response leaked {leak}: {resp}");
+        assert!(
+            !resp.contains(leak),
+            "refused response leaked {leak}: {resp}"
+        );
     }
 }
 
@@ -114,7 +138,10 @@ async fn writes_are_refused_over_the_wire() {
         "POST /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\nContent-Length: 0\r\n\r\n",
     )
     .await;
-    assert!(resp.starts_with("HTTP/1.1 405 Method Not Allowed"), "got: {resp}");
+    assert!(
+        resp.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "got: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -179,8 +206,8 @@ async fn serve_refuses_to_start_without_a_token() {
         Arc::new(canned),
         Arc::new(|a: String| async move { Ok(a) }),
     )
-        .await
-        .unwrap_err();
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("without a token"), "got: {err}");
 }
 
@@ -204,16 +231,27 @@ fn post(body: &str, token: &str) -> String {
 #[tokio::test]
 async fn payout_change_is_403_when_the_operator_did_not_enable_it() {
     let addr = start().await; // default policy
-    let resp = raw(&addr, &post(&format!(r#"{{"address":"{GOOD}"}}"#), "tok-abc")).await;
+    let resp = raw(
+        &addr,
+        &post(&format!(r#"{{"address":"{GOOD}"}}"#), "tok-abc"),
+    )
+    .await;
     assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "got: {resp}");
 }
 
 #[tokio::test]
 async fn payout_change_succeeds_when_enabled() {
     let addr = start_open().await;
-    let resp = raw(&addr, &post(&format!(r#"{{"address":"{GOOD}"}}"#), "tok-abc")).await;
+    let resp = raw(
+        &addr,
+        &post(&format!(r#"{{"address":"{GOOD}"}}"#), "tok-abc"),
+    )
+    .await;
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
-    assert!(resp.contains(GOOD), "should echo the applied address: {resp}");
+    assert!(
+        resp.contains(GOOD),
+        "should echo the applied address: {resp}"
+    );
     assert!(resp.contains("\"ok\":true"), "got: {resp}");
 }
 
@@ -240,7 +278,10 @@ async fn a_malformed_body_is_rejected() {
     let addr = start_open().await;
     for body in ["{}", "not json", r#"{"addr":"din1pxx"}"#] {
         let resp = raw(&addr, &post(body, "tok-abc")).await;
-        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "body {body:?} -> {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "body {body:?} -> {resp}"
+        );
     }
 }
 
@@ -279,14 +320,22 @@ async fn a_body_larger_than_the_cap_is_refused() {
 #[tokio::test]
 async fn status_stays_read_only_when_payout_change_is_enabled() {
     let addr = start_open().await;
-    let resp = raw(&addr, &post(r#"{"address":"x"}"#, "tok-abc").replace("/payout-address", "/status")).await;
+    let resp = raw(
+        &addr,
+        &post(r#"{"address":"x"}"#, "tok-abc").replace("/payout-address", "/status"),
+    )
+    .await;
     assert!(resp.starts_with("HTTP/1.1 405"), "got: {resp}");
 }
 
 #[tokio::test]
 async fn status_reports_the_live_payout_address() {
     let addr = start().await;
-    let resp = raw(&addr, "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\n\r\n").await;
+    let resp = raw(
+        &addr,
+        "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\n\r\n",
+    )
+    .await;
     assert!(resp.contains("payout_address"), "got: {resp}");
     assert!(resp.contains(GOOD), "got: {resp}");
 }

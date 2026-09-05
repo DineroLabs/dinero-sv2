@@ -119,9 +119,14 @@ curl -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
   http://127.0.0.1:4445/status
 ```
 
-Reports connected miners, PPLNS window depth and span, the template
-producer's heartbeat, pool-wide share counters, and each contributor's
-share of the next block in basis points.
+The response is a versioned contract. `schema_version: 2` reports connected
+Stratum sessions separately from PPLNS contributors, daemon block/header
+height, template identity and freshness, accepted/rejected share counters,
+the last accepted share, the last block-submission result, and rejection
+counts grouped by reason. Each contributor's next-block share remains in
+basis points. Fields are additive; v1 cockpit clients can continue reading
+their original fields, while v2 clients must reject missing or ill-typed v2
+health fields instead of displaying false zeroes.
 
 It is **loopback-only and plain HTTP by design** — a pool binary that
 handles money should not also carry a TLS stack. For remote access, use
