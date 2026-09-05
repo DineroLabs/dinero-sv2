@@ -50,6 +50,8 @@ pub const STATUS_PATH: &str = "/status";
 /// Gated behind `Policy::allow_payout_change` — OFF by default, because
 /// reaching it means the ops token can redirect money.
 pub const PAYOUT_PATH: &str = "/payout-address";
+/// Mutating route: set the operator fee for future templates.
+pub const FEE_PATH: &str = "/fee-bps";
 
 /// Cap on a request body. The only body we accept is a one-field JSON
 /// object holding an address, so anything larger is a mistake or an attack.
@@ -62,6 +64,8 @@ pub struct Policy {
     /// `--ops-allow-payout-change`. When false the payout route 403s even
     /// for a caller holding the correct token.
     pub allow_payout_change: bool,
+    /// `--ops-allow-fee-change`. Also OFF by default.
+    pub allow_fee_change: bool,
 }
 
 /// One contributor's standing in the PPLNS window.
@@ -349,6 +353,15 @@ pub fn decide(req: &Request, expected_token: &str, policy: Policy) -> Decision {
             }
             Decision::Serve
         }
+        FEE_PATH => {
+            if req.method != "POST" {
+                return Decision::MethodNotAllowed;
+            }
+            if !policy.allow_fee_change {
+                return Decision::Forbidden;
+            }
+            Decision::Serve
+        }
         _ => Decision::NotFound,
     }
 }
@@ -361,6 +374,15 @@ pub fn parse_payout_body(body: &str) -> Option<String> {
         return None;
     }
     Some(addr.to_string())
+}
+
+/// Extract an exact integral basis-point value from `{"fee_bps": 500}`.
+pub fn parse_fee_body(body: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let fee = value.get("fee_bps")?.as_u64()?;
+    u32::try_from(fee)
+        .ok()
+        .filter(|fee| *fee <= crate::fee::MAX_BPS)
 }
 
 /// Cheap syntactic gate so an obvious typo never costs an RPC round-trip.
@@ -428,6 +450,7 @@ mod tests {
     fn open() -> Policy {
         Policy {
             allow_payout_change: true,
+            ..Policy::default()
         }
     }
 
@@ -478,6 +501,63 @@ mod tests {
                 Decision::MethodNotAllowed,
                 "method {m}"
             );
+        }
+    }
+
+    #[test]
+    fn fee_route_is_authenticated_opt_in_and_post_only() {
+        let post = req("POST", FEE_PATH, Some("secret"));
+        assert_eq!(
+            decide(&post, "secret", Policy::default()),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(
+                &post,
+                "different",
+                Policy {
+                    allow_fee_change: true,
+                    ..Policy::default()
+                }
+            ),
+            Decision::Unauthorized
+        );
+        assert_eq!(
+            decide(
+                &req("GET", FEE_PATH, Some("secret")),
+                "secret",
+                Policy {
+                    allow_fee_change: true,
+                    ..Policy::default()
+                }
+            ),
+            Decision::MethodNotAllowed
+        );
+        assert_eq!(
+            decide(
+                &post,
+                "secret",
+                Policy {
+                    allow_fee_change: true,
+                    ..Policy::default()
+                }
+            ),
+            Decision::Serve
+        );
+    }
+
+    #[test]
+    fn fee_body_requires_exact_bounded_integer_basis_points() {
+        assert_eq!(parse_fee_body(r#"{"fee_bps":500}"#), Some(500));
+        assert_eq!(parse_fee_body(r#"{"fee_bps":0}"#), Some(0));
+        assert_eq!(parse_fee_body(r#"{"fee_bps":10000}"#), Some(10000));
+        for body in [
+            r#"{"fee_bps":10001}"#,
+            r#"{"fee_bps":5.5}"#,
+            r#"{"fee_bps":"500"}"#,
+            r#"{"fee":500}"#,
+        ] {
+            assert_eq!(parse_fee_body(body), None, "accepted {body}");
         }
     }
 
@@ -876,17 +956,20 @@ async fn respond(sock: &mut TcpStream, decision: Decision, body: &str, head_only
 ///
 /// `snapshot` is called only for authorized requests, so an unauthorized
 /// caller cannot make the pool do work.
-pub async fn serve<F, A, Fut>(
+pub async fn serve<F, A, AFut, B, BFut>(
     listener: TcpListener,
     token: String,
     policy: Policy,
     snapshot: Arc<F>,
     apply_payout: Arc<A>,
+    apply_fee: Arc<B>,
 ) -> Result<()>
 where
     F: Fn() -> OpsStatus + Send + Sync + 'static,
-    A: Fn(String) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = std::result::Result<String, String>> + Send,
+    A: Fn(String) -> AFut + Send + Sync + 'static,
+    AFut: std::future::Future<Output = std::result::Result<String, String>> + Send,
+    B: Fn(u32) -> BFut + Send + Sync + 'static,
+    BFut: std::future::Future<Output = std::result::Result<u32, String>> + Send,
 {
     if token.is_empty() {
         anyhow::bail!("ops endpoint refuses to start without a token");
@@ -902,6 +985,7 @@ where
         let token = token.clone();
         let snapshot = snapshot.clone();
         let apply_payout = apply_payout.clone();
+        let apply_fee = apply_fee.clone();
         tokio::spawn(async move {
             let Some(raw) = read_head(&mut sock).await else {
                 respond(
@@ -982,6 +1066,52 @@ where
                         Err(why) => {
                             warn!(%peer, error = %why, "ops payout-address change REFUSED");
                             let body = serde_json::json!({ "ok": false, "error": why }).to_string();
+                            respond(&mut sock, Decision::BadRequest, &body, false).await;
+                        }
+                    }
+                }
+                Decision::Serve if req.path == FEE_PATH => {
+                    let Some(want) = content_length(&head) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"Content-Length required, and must not exceed 1024\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(body) = read_body(&mut sock, body_prefix, want).await else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"short body\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(candidate) = parse_fee_body(&body) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"expected integral fee_bps from 0 through 10000\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    info!(%peer, fee_bps = candidate, "ops operator-fee change requested");
+                    match apply_fee(candidate).await {
+                        Ok(applied) => {
+                            info!(%peer, fee_bps = applied, "ops operator fee CHANGED");
+                            let body =
+                                serde_json::json!({"ok": true, "fee_bps": applied}).to_string();
+                            respond(&mut sock, Decision::Serve, &body, false).await;
+                        }
+                        Err(why) => {
+                            warn!(%peer, error = %why, "ops operator-fee change REFUSED");
+                            let body = serde_json::json!({"ok": false, "error": why}).to_string();
                             respond(&mut sock, Decision::BadRequest, &body, false).await;
                         }
                     }
