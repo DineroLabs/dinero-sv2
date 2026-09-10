@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use dinero_sv2_pool::bans::{BanList, MAX_BAN_SECS};
 use dinero_sv2_pool::ops::{self, MinerStatus, OpsStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -44,10 +45,25 @@ fn canned() -> OpsStatus {
         last_share: None,
         last_block: None,
         rejection_reasons: BTreeMap::new(),
+        bans: Vec::new(),
     }
 }
 
 async fn start_with(policy: ops::Policy) -> String {
+    start_with_bans(policy, Arc::new(BanList::default()))
+        .await
+        .0
+}
+
+/// Serves with a ban list the caller keeps a handle on, so a test can
+/// check that a ban placed over HTTP is visible to the enforcement path
+/// — that shared handle is the wiring most likely to break.
+async fn start_with_bans(policy: ops::Policy, bans: Arc<BanList>) -> (String, Arc<BanList>) {
+    let addr = spawn_server(policy, bans.clone()).await;
+    (addr, bans)
+}
+
+async fn spawn_server(policy: ops::Policy, bans: Arc<BanList>) -> String {
     let listener = ops::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let snapshot = Arc::new(canned);
@@ -61,6 +77,14 @@ async fn start_with(policy: ops::Policy) -> String {
         }
     });
     let apply_fee = Arc::new(|fee: u32| async move { Ok(fee) });
+    // The status closure reads the same list the routes write, so /status
+    // reflects a ban the moment it is placed.
+    let status_bans = bans.clone();
+    let snapshot = Arc::new(move || {
+        let mut status = snapshot();
+        status.bans = status_bans.active(now_unix());
+        status
+    });
     tokio::spawn(async move {
         let _ = ops::serve(
             listener,
@@ -69,10 +93,136 @@ async fn start_with(policy: ops::Policy) -> String {
             snapshot,
             apply,
             apply_fee,
+            bans,
         )
         .await;
     });
     addr
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn start_ban_open() -> (String, Arc<BanList>) {
+    start_with_bans(
+        ops::Policy {
+            allow_ban: true,
+            ..ops::Policy::default()
+        },
+        Arc::new(BanList::default()),
+    )
+    .await
+}
+
+async fn post_json(addr: &str, path: &str, body: &str) -> String {
+    raw(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await
+}
+
+// ---- bans over the wire ----
+
+#[tokio::test]
+async fn a_ban_is_refused_unless_the_operator_enabled_it() {
+    let addr = start().await;
+    let resp = post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":3600}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+}
+
+#[tokio::test]
+async fn a_ban_takes_effect_and_shows_up_in_status() {
+    let (addr, bans) = start_ban_open().await;
+    let target = vec![0x51, 0x20, 0xaa];
+
+    assert!(!bans.is_banned(&target, now_unix()));
+
+    let resp = post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":3600}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+    let body = resp.split("\r\n\r\n").nth(1).unwrap();
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["expires_in_secs"], 3600);
+
+    // The enforcement path consults this same list.
+    assert!(bans.is_banned(&target, now_unix()));
+
+    let status = raw(
+        &addr,
+        "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\n\r\n",
+    )
+    .await;
+    let parsed: OpsStatus = serde_json::from_str(status.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(parsed.bans.len(), 1);
+    assert_eq!(parsed.bans[0].target_hex, "5120aa");
+    assert!(parsed.bans[0].expires_in_secs > 3590);
+}
+
+#[tokio::test]
+async fn unban_lifts_it_and_says_whether_there_was_one() {
+    let (addr, bans) = start_ban_open().await;
+    let target = vec![0x51, 0x20, 0xaa];
+    post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":3600}"#).await;
+
+    let resp = post_json(&addr, "/unban", r#"{"target":"5120aa"}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+    let json: serde_json::Value =
+        serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["lifted"], true);
+    assert!(!bans.is_banned(&target, now_unix()));
+
+    // A second unban found nothing. Reported honestly rather than as a
+    // success, because it usually means a mistyped target.
+    let again = post_json(&addr, "/unban", r#"{"target":"5120aa"}"#).await;
+    let json: serde_json::Value =
+        serde_json::from_str(again.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["lifted"], false);
+}
+
+// A duration is mandatory, and the two bounds are refused with messages
+// that say which one was crossed.
+#[tokio::test]
+async fn a_ban_without_a_valid_duration_is_refused() {
+    let (addr, bans) = start_ban_open().await;
+
+    let no_duration = post_json(&addr, "/ban", r#"{"target":"5120aa"}"#).await;
+    assert!(
+        no_duration.starts_with("HTTP/1.1 400"),
+        "got: {no_duration}"
+    );
+
+    let zero = post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":0}"#).await;
+    assert!(zero.starts_with("HTTP/1.1 400"), "got: {zero}");
+    assert!(zero.contains("/unban"), "should point at the right route");
+
+    let too_long = post_json(
+        &addr,
+        "/ban",
+        &format!(r#"{{"target":"5120aa","seconds":{}}}"#, MAX_BAN_SECS + 1),
+    )
+    .await;
+    assert!(too_long.starts_with("HTTP/1.1 400"), "got: {too_long}");
+    assert!(too_long.contains("temporary"), "got: {too_long}");
+
+    assert!(
+        !bans.is_banned(&[0x51, 0x20, 0xaa], now_unix()),
+        "no refused request may leave a ban behind"
+    );
+}
+
+#[tokio::test]
+async fn a_ban_target_that_is_not_hex_is_refused() {
+    let (addr, _bans) = start_ban_open().await;
+    let resp = post_json(&addr, "/ban", r#"{"target":"nothex","seconds":60}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
 }
 
 async fn start() -> String {
@@ -224,6 +374,7 @@ async fn serve_refuses_to_start_without_a_token() {
         Arc::new(canned),
         Arc::new(|a: String| async move { Ok(a) }),
         Arc::new(|fee: u32| async move { Ok(fee) }),
+        Arc::new(BanList::default()),
     )
     .await
     .unwrap_err();

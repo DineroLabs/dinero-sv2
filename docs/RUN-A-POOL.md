@@ -72,6 +72,7 @@ Defaults worth knowing:
 | `--fee-bps` | `1000` (10%) | Your cut of each block your pool finds. Any value 0–10000 (0–100%) is accepted; 10% is the installer's default, not a cap. Operators compete on this, and miners verify it from the block's coinbase rather than trusting you. |
 | `--bind` | `0.0.0.0:4444` | Miner-facing port |
 | `--cookie` | `/var/lib/dinero/.cookie` | Node auth — no password in the unit |
+| `--allow-ban` | off | Lets you stop serving one payout script for up to 24h. See [When a miner is a problem](#when-a-miner-is-a-problem). |
 
 ## 3. Give miners your public key
 
@@ -223,6 +224,63 @@ curl -X POST -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
 The new value is atomically persisted in `/etc/dinero-sv2/shared-fee-bps`,
 reported by `GET /status`, and used only when the next template is built.
 Already-issued templates are never rewritten.
+
+## When a miner is a problem
+
+You are running the server, so you can stop serving someone. This is off
+unless you asked for it at install time:
+
+```sh
+curl -fsSL .../install-pool.sh | sudo sh -s -- \
+  --payout-address din1p... --allow-ban
+```
+
+Then, by hand or from a client:
+
+```sh
+curl -X POST -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"<payout_script_hex>","seconds":3600}' \
+  http://127.0.0.1:4445/ban
+```
+
+The target is the `payout_script_hex` from that contributor's row in
+`GET /status`. Lift it early with the same shape against `/unban`, and
+`GET /status` lists what is currently banned with the seconds left on
+each, so you are never guessing what you blocked an hour ago.
+
+**Every ban expires.** A duration is required — there is no default —
+and the pool refuses anything longer than 24 hours. That is deliberate:
+a ban is you stopping something happening now, not a sentence. If it
+still needs to be banned tomorrow, ban it again tomorrow, on purpose.
+A duration of `0` is refused rather than treated as an unban, so a
+mistyped number cannot quietly release someone.
+
+**A ban declines future work. It never takes shares already earned.**
+The banned miner's entries stay in the PPLNS window and are still paid
+in the next block your pool finds. Refusing to serve someone and taking
+what they already earned are different acts, and only the first is
+yours to make — the whole reason miners can pool with you without
+trusting you is that you *cannot* do the second.
+
+### What it is good for, and what it is not
+
+The realistic case is a miner spamming rejects, flooding connections, or
+withholding blocks. It is not a payment dispute: there are none to have.
+
+A banned miner can generate a new payout address and reconnect — but not
+for free. Your PPLNS window is keyed by payout script, so a new address
+starts at zero weight and has to ramp again from nothing. On a
+four-hour window that is four hours of accrual thrown away per evasion,
+and it compounds each time you ban the new address. That is what makes a
+temporary ban worth having even though it can be worked around.
+
+Two limits worth knowing:
+
+* Bans apply to **shared-mode** miners, identified by payout script.
+  Solo channels have no payout script and are not covered.
+* Bans are held in memory, so a pool restart clears them. For something
+  that lasts a day at most, that is usually fine.
 
 ## What you actually earn
 

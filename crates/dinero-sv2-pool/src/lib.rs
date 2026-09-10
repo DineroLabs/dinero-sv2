@@ -7,6 +7,7 @@
 
 pub mod accounting;
 pub mod backend;
+pub mod bans;
 pub mod block;
 pub mod dedup;
 pub mod extranonce;

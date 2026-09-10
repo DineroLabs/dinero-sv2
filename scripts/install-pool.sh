@@ -20,6 +20,7 @@ RPC_URL="http://127.0.0.1:20998"
 COOKIE="/var/lib/dinero/.cookie"
 START="yes"
 ALLOW_PAYOUT_CHANGE="no"
+ALLOW_BAN="no"
 ALLOW_FEE_CHANGE="no"
 
 usage() {
@@ -36,6 +37,10 @@ usage: install-pool.sh --payout-address din1p... [options]
                           runtime (e.g. from dinero-qt). OFF by default:
                           enabling it means your ops token can redirect
                           YOUR fee output. Miners' payouts are unaffected.
+  --allow-ban             let the ops endpoint stop serving work to one
+                          payout script for up to 24 hours. OFF by default.
+                          A ban declines FUTURE work only — shares already
+                          in the payout window are still paid.
   --allow-fee-change      let the ops endpoint change your operator fee at
                           runtime. OFF by default; treat the ops token as a key.
 USAGE
@@ -74,6 +79,7 @@ while [ $# -gt 0 ]; do
     --cookie)         COOKIE="${2:?}"; shift 2 ;;
     --no-start)       START="no"; shift ;;
     --allow-payout-change) ALLOW_PAYOUT_CHANGE="yes"; shift ;;
+    --allow-ban)      ALLOW_BAN="yes"; shift ;;
     --allow-fee-change)    ALLOW_FEE_CHANGE="yes"; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -168,6 +174,10 @@ ALLOW_FLAG=""
 if [ "$ALLOW_PAYOUT_CHANGE" = "yes" ]; then
   ALLOW_FLAG=" --ops-allow-payout-change"
 fi
+BAN_FLAG=""
+if [ "$ALLOW_BAN" = "yes" ]; then
+  BAN_FLAG=" --ops-allow-ban"
+fi
 ALLOW_FEE_FLAG=""
 if [ "$ALLOW_FEE_CHANGE" = "yes" ]; then
   ALLOW_FEE_FLAG=" --ops-allow-fee-change"
@@ -175,6 +185,7 @@ fi
 
 sed -e "s|__PAYOUT_ADDRESS__|$PAYOUT|g" \
     -e "s|__OPS_ALLOW_PAYOUT_CHANGE__|$ALLOW_FLAG|g" \
+    -e "s|__OPS_ALLOW_BAN__|$BAN_FLAG|g" \
     -e "s|__OPS_ALLOW_FEE_CHANGE__|$ALLOW_FEE_FLAG|g" \
     -e "s|__FEE_BPS__|$FEE_BPS|g" \
     -e "s|__BIND__|$BIND|g" \
@@ -228,6 +239,16 @@ else
 printf '%s\n' "" \
   "  Changing the fee address from a client (dinero-qt) is OFF. Re-run this" \
   "  installer with --allow-payout-change to enable it."
+fi)
+$(if [ "$ALLOW_BAN" = "yes" ]; then
+printf '%s\n' "" \
+  "  Temporary bans are ON. Anyone holding your ops token can stop a payout" \
+  "  script receiving work for up to 24 hours. It cannot take shares already" \
+  "  earned — those are still paid from the payout window."
+else
+printf '%s\n' "" \
+  "  Temporary bans are OFF. Re-run with --allow-ban if you want to be able" \
+  "  to stop serving an abusive miner without a firewall rule."
 fi)
 
   Operator status (loopback only, plain HTTP by design):

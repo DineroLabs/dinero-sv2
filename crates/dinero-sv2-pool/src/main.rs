@@ -14,8 +14,8 @@
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
 use dinero_sv2_pool::{
-    accounting, backend, block, dedup, job_generation, journal, mapper, ops, rpc, shared_template,
-    split, supervisor, target,
+    accounting, backend, bans, block, dedup, job_generation, journal, mapper, ops, rpc,
+    shared_template, split, supervisor, target,
 };
 
 use std::net::SocketAddr;
@@ -66,6 +66,7 @@ use tracing::{debug, info, warn};
 
 use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry};
 use crate::backend::BackendPool;
+use crate::bans::BanList;
 use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
 use crate::mapper::PoolTemplate;
@@ -182,6 +183,17 @@ struct Args {
     /// Allow authenticated `POST /fee-bps` runtime fee changes. OFF by default.
     #[arg(long, default_value_t = false)]
     ops_allow_fee_change: bool,
+
+    /// Allow authenticated `POST /ban` and `POST /unban`, letting an operator
+    /// stop serving work to one payout script for up to a day.
+    ///
+    /// OFF by default: a token that reads status should not silently be able
+    /// to stop a miner earning. A ban declines FUTURE work only — shares
+    /// already in the PPLNS window stay there and are still paid on the next
+    /// block, because refusing to serve someone and confiscating what they
+    /// already earned are different acts.
+    #[arg(long, default_value_t = false)]
+    ops_allow_ban: bool,
 
     /// Tip-poll interval.
     #[arg(long, default_value_t = 2)]
@@ -356,6 +368,10 @@ async fn main() -> Result<()> {
         "share difficulty policy"
     );
     let ledger = Arc::new(Ledger::default());
+    // In-memory, like the ledger: bans last at most a day, so surviving a
+    // restart matters less than never outliving the operator's memory of
+    // why they were set.
+    let bans = Arc::new(BanList::default());
     // Pool-wide accepted-share dedup: a header hash is credited at most
     // once, across ALL channels. Rejects both same-channel resubmission
     // (PPLNS weight farming) and identical work found twice. 65_536
@@ -687,6 +703,7 @@ async fn main() -> Result<()> {
         let started = std::time::Instant::now();
         let ops_window = window.clone();
         let ops_ledger = ledger.clone();
+        let ops_bans = bans.clone();
         let ops_heartbeat = heartbeat.clone();
         let ops_connected = connected_miners.clone();
         let ops_templates = rx.clone();
@@ -757,11 +774,18 @@ async fn main() -> Result<()> {
                 last_share: telemetry.last_share,
                 last_block: telemetry.last_block,
                 rejection_reasons: telemetry.rejection_reasons,
+                bans: ops_bans.active(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
             }
         });
         let policy = ops::Policy {
             allow_payout_change: args.ops_allow_payout_change,
             allow_fee_change: args.ops_allow_fee_change,
+            allow_ban: args.ops_allow_ban,
         };
         if policy.allow_payout_change {
             warn!(
@@ -824,9 +848,18 @@ async fn main() -> Result<()> {
                 Ok(candidate)
             }
         });
+        let serve_bans = bans.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                ops::serve(listener, token, policy, snapshot, apply_payout, apply_fee).await
+            if let Err(e) = ops::serve(
+                listener,
+                token,
+                policy,
+                snapshot,
+                apply_payout,
+                apply_fee,
+                serve_bans,
+            )
+            .await
             {
                 warn!(error = %e, "ops endpoint stopped");
             }
@@ -870,6 +903,7 @@ async fn main() -> Result<()> {
         let rx = rx.clone();
         let backends = backends.clone();
         let ledger = ledger.clone();
+        let conn_bans = bans.clone();
         let share_target_copy = share_target_fallback;
         let keys = static_keys.clone();
         let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
@@ -900,6 +934,7 @@ async fn main() -> Result<()> {
                 miner_key,
                 backends,
                 ledger,
+                conn_bans,
                 channel_id,
                 window,
                 journal,
@@ -935,6 +970,7 @@ async fn serve_miner(
     miner_key: MinerKey,
     backends: Arc<BackendPool>,
     ledger: Arc<Ledger>,
+    bans: Arc<BanList>,
     channel_id: u32,
     window: Arc<Mutex<PplnsWindow>>,
     journal: Arc<Mutex<WindowJournal>>,
@@ -1390,6 +1426,7 @@ async fn serve_miner(
                                     &payout_script,
                                     backends.as_ref(),
                                     ledger.as_ref(),
+                                    bans.as_ref(),
                                     &window,
                                     &journal,
                                     &dedup,
@@ -1738,11 +1775,34 @@ async fn handle_shared_share(
     payout_script: &[u8],
     backends: &BackendPool,
     ledger: &Ledger,
+    bans: &BanList,
     window: &Arc<Mutex<PplnsWindow>>,
     journal: &Arc<Mutex<WindowJournal>>,
     dedup: &Arc<Mutex<ShareDedup>>,
 ) -> Result<()> {
     let miner_key = miner_key_for_payout_script(payout_script);
+
+    // Enforcement lives here rather than at the point a miner declares
+    // shared mode, because `reward_mode` is set on two separate paths and
+    // a session already open when the ban lands would bypass a check made
+    // only at declaration. This is the single choke point every credited
+    // share passes through.
+    //
+    // Refused BEFORE the share is decoded or validated: a banned miner
+    // should not consume the pool's verification work either. Nothing
+    // already in the PPLNS window is touched — the ban declines future
+    // work, it does not revoke past credit.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(code) = bans::share_refusal(bans, payout_script, now) {
+        debug!(payout = %hex::encode(payout_script), "share from banned payout script refused");
+        ledger.reject(miner_key);
+        ops::telemetry().record_rejection(code);
+        send_share_error(session, channel_id, *last_sequence_number, code).await?;
+        return Ok(());
+    }
 
     let share = match decode_submit_shares(payload) {
         Ok(s) => s,
@@ -2353,6 +2413,22 @@ mod cli_tests {
     #[test]
     fn running_the_pool_still_requires_a_payout_address() {
         assert!(Args::try_parse_from(["pool", "--bind", "127.0.0.1:4444"]).is_err());
+    }
+
+    // Enforcement is opt-in for the same reason money routing is: the
+    // ops token is handed out for reading status, and picking up the
+    // power to stop a miner earning must be a deliberate act.
+    #[test]
+    fn banning_is_off_unless_asked_for() {
+        let a = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
+        assert!(!a.ops_allow_ban, "must default OFF");
+        let b = Args::try_parse_from(["pool", "--payout-address", "din1pxx", "--ops-allow-ban"])
+            .unwrap();
+        assert!(b.ops_allow_ban);
+        assert!(
+            !b.ops_allow_payout_change && !b.ops_allow_fee_change,
+            "enabling bans must not enable the money-routing verbs"
+        );
     }
 
     #[test]
