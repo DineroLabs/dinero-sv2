@@ -1109,7 +1109,9 @@ async fn solo_miner_preserves_dnrs_through_pool() -> Result<()> { run_solo_miner
 async fn solo_gpu_miner_preserves_dnrs_through_pool() -> Result<()> { run_solo_miner(true).await }
 
 async fn run_solo_miner(gpu: bool) -> Result<()> {
-    let daemon = RegtestDaemon::spawn_at_dnrs(29985, 2)?;
+    // CPU and GPU cases may run concurrently in the ignored-test suite.
+    let (rpc_port, pool_port) = if gpu { (29987, 29988) } else { (29985, 29986) };
+    let daemon = RegtestDaemon::spawn_at_dnrs(rpc_port, 2)?;
     daemon.wait_for_cookie()?;
     let rpc = RpcClient::new(daemon.rpc_url.clone(), Auth::Cookie(daemon.cookie_path.display().to_string()))?;
     let create = rpc.call_raw("wallet.createhd", serde_json::json!(["solo", "", false])).await?;
@@ -1120,7 +1122,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let key_path = dir.path().join("pool.key");
     let keys = dinero_sv2_transport::StaticKeys::load_or_generate(&key_path)?;
-    let pool = PoolProcess::spawn("127.0.0.1:29986".parse()?, &daemon.rpc_url,
+    let pool = PoolProcess::spawn(format!("127.0.0.1:{pool_port}").parse()?, &daemon.rpc_url,
         &daemon.cookie_path, address, &dir.path().join("journal"), &key_path, dir.path().join("pool.log"))?;
     pool.wait_ready().await?;
     struct Miner(std::process::Child);
@@ -1128,7 +1130,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
     let miner_bin = std::env::var(if gpu { "DINEROGPUMINER_BIN" } else { "DINEROMINER_BIN" }).context("set miner binary path")?;
     let script = payout_script(0x71);
     let mut miner = Miner(Command::new(miner_bin)
-        .args(["--pool", "127.0.0.1:29986", "--reward-mode", "solo", "--no-save", "--plain"])
+        .args(["--pool", &format!("127.0.0.1:{pool_port}"), "--reward-mode", "solo", "--no-save", "--plain"])
         .args(if gpu { vec!["--batch-size", "4096"] } else { vec!["--threads", "1"] })
         .arg("--server-pubkey").arg(keys.public_hex())
         .arg("--payout-script-hex").arg(hex::encode(&script))
