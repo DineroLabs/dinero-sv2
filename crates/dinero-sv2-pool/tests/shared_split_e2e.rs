@@ -1132,7 +1132,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
         .args(if gpu { vec!["--batch-size", "4096"] } else { vec!["--threads", "1"] })
         .arg("--server-pubkey").arg(keys.public_hex())
         .arg("--payout-script-hex").arg(hex::encode(&script))
-        .stdin(Stdio::null()).stdout(Stdio::null())
+        .stdin(Stdio::null()).stdout(std::fs::File::create(dir.path().join("miner-output.log"))?)
         .stderr(std::fs::File::create(dir.path().join("miner.log"))?).spawn()?);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1145,6 +1145,12 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let output = std::fs::read_to_string(dir.path().join("miner-output.log"))?;
+    let version_line = output.lines().find(|line| line.starts_with("[software_versions] "))
+        .context("miner must report negotiated software versions")?;
+    let versions: serde_json::Value = serde_json::from_str(version_line.trim_start_matches("[software_versions] "))?;
+    assert_eq!(versions["pool_version"], env!("CARGO_PKG_VERSION"));
+    assert!(versions["miner_version"].as_str().is_some_and(|s| !s.is_empty()));
     let hash = rpc.call_raw("getblockhash", serde_json::json!([2])).await?;
     let raw = rpc.call_raw("getblock", serde_json::json!([hash, 0])).await?;
     let outputs = parse_coinbase_only_block_outputs(raw.as_str().context("raw block")?)?;

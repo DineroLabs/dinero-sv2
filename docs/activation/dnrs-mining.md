@@ -82,3 +82,20 @@ clients. A local executable named `~/.local/bin/dinero-miner` may actually be an
 SV2 client: inspect `--help`/`--version`, not only the filename. Direct core RPC
 CPU/Metal GPU binaries were separately verified mining enforced DNRS blocks and
 retaining identical tip/shielded state after daemon restart.
+
+## Terminal software identity
+
+The CPU and GPU mining terminal headers display separate miner and pool software
+versions. Miner 0.2.10 requests the Dinero `FLAG_POOL_VERSION` capability (bit 31)
+in SetupConnection. Pool 0.1.5 acknowledges it and appends a STR0_255 version to
+SetupConnectionSuccess. Without the request, the pool sends the unchanged
+six-byte response. Updated miners accept legacy responses and display
+`Pool not reported`; they never substitute their own version for the server's.
+The version is bounded to 64 ASCII alphanumeric, dot, hyphen or plus characters.
+Truncation, trailing bytes and terminal control characters are rejected.
+
+The reported pool version is a software identity claim received through Noise,
+not proof of source provenance. Existing Noise key pinning still applies.
+Disconnect/reconnect clears the displayed server version. Local miner installation
+does not upgrade the remote pool; SJ will show `not reported` until its coordinated
+pool rollout is complete.

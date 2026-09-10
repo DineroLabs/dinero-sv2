@@ -115,6 +115,13 @@ impl FxScreen {
         Self::write_flush(&mut inner, &out);
     }
 
+    /// Update identity without repainting before the permanent banner is installed.
+    pub fn set_software_versions(&self, miner: &str, pool: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.window.miner_version = miner.to_string();
+        inner.window.pool_version = pool.to_string();
+    }
+
     pub fn set_backend(&self, backend: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.window.backend = Some(backend.to_string());

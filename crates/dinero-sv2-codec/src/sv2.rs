@@ -26,6 +26,9 @@ const STR0_255_MAX: usize = 255;
 /// Pass-B/5 codec errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Sv2CodecError {
+    /// Invalid printable software version in the negotiated pool identity.
+    #[error("invalid pool software version")]
+    InvalidPoolVersion,
     /// Not enough input bytes to finish decoding.
     #[error("short frame at offset {at}, need {need} more bytes")]
     Short {
@@ -107,6 +110,51 @@ pub fn decode_setup_connection_success(
         used_version,
         flags,
     })
+}
+
+/// Dinero capability: request a pool software version in SetupConnectionSuccess.
+/// Legacy peers continue to exchange the original six-byte response.
+pub const FLAG_POOL_VERSION: u32 = 1 << 31;
+
+fn valid_pool_version(version: &[u8]) -> bool {
+    !version.is_empty() && version.len() <= 64 && version.iter().all(|b|
+        b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-' | b'+'))
+}
+
+/// Add software identity only when explicitly requested by the miner.
+pub fn encode_setup_success_with_pool_version(
+    msg: &SetupConnectionSuccess, requested_flags: u32, version: &str,
+) -> Result<Vec<u8>, Sv2CodecError> {
+    let mut response = msg.clone();
+    response.flags &= !FLAG_POOL_VERSION;
+    if requested_flags & FLAG_POOL_VERSION == 0 {
+        return Ok(encode_setup_connection_success(&response));
+    }
+    if !valid_pool_version(version.as_bytes()) {
+        return Err(Sv2CodecError::InvalidPoolVersion);
+    }
+    response.flags |= FLAG_POOL_VERSION;
+    let mut out = encode_setup_connection_success(&response);
+    write_str0_255(&mut out, version.as_bytes())?;
+    Ok(out)
+}
+
+/// Read a negotiated version, or None from an older pool. Reject control
+/// characters so untrusted server identity cannot inject terminal escapes.
+pub fn decode_setup_success_with_pool_version(
+    buf: &[u8],
+) -> Result<(SetupConnectionSuccess, Option<String>), Sv2CodecError> {
+    let mut cur = Cursor::new(buf);
+    let response = SetupConnectionSuccess {
+        used_version: cur.read_u16()?, flags: cur.read_u32()?,
+    };
+    let version = if response.flags & FLAG_POOL_VERSION != 0 {
+        let bytes = cur.read_str0_255()?;
+        if !valid_pool_version(bytes) { return Err(Sv2CodecError::InvalidPoolVersion); }
+        Some(String::from_utf8(bytes.to_vec()).map_err(|_| Sv2CodecError::InvalidPoolVersion)?)
+    } else { None };
+    cur.finish()?;
+    Ok((response, version))
 }
 
 /// Encode a [`SetupConnectionError`] message.
@@ -729,6 +777,29 @@ mod tests {
         };
         let bytes = encode_setup_connection_success(&m);
         assert_eq!(m, decode_setup_connection_success(&bytes).unwrap());
+    }
+
+    #[test]
+    fn pool_version_negotiation_and_legacy_compatibility() {
+        let base = SetupConnectionSuccess { used_version: PROTOCOL_VERSION, flags: 0 };
+        let legacy = encode_setup_success_with_pool_version(&base, 0, "0.1.5").unwrap();
+        assert_eq!(legacy, encode_setup_connection_success(&base));
+        assert_eq!(decode_setup_connection_success(&legacy).unwrap(), base);
+        assert_eq!(decode_setup_success_with_pool_version(&legacy).unwrap(), (base.clone(), None));
+        let extended = encode_setup_success_with_pool_version(&base, FLAG_POOL_VERSION, "0.1.5-rc.1+abc").unwrap();
+        let (response, version) = decode_setup_success_with_pool_version(&extended).unwrap();
+        assert_eq!(response.flags, FLAG_POOL_VERSION);
+        assert_eq!(version.as_deref(), Some("0.1.5-rc.1+abc"));
+        for end in 0..extended.len() {
+            assert!(decode_setup_success_with_pool_version(&extended[..end]).is_err());
+        }
+        let mut trailing = extended.clone(); trailing.push(0);
+        assert!(decode_setup_success_with_pool_version(&trailing).is_err());
+        let mut injection = extended; injection[7] = 0x1b;
+        assert_eq!(decode_setup_success_with_pool_version(&injection), Err(Sv2CodecError::InvalidPoolVersion));
+        for bad in ["", "0.1.5\n", "\x1b[2J", &"a".repeat(65)] {
+            assert!(encode_setup_success_with_pool_version(&base, FLAG_POOL_VERSION, bad).is_err());
+        }
     }
 
     #[test]

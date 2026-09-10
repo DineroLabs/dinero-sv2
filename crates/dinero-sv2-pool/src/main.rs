@@ -31,7 +31,7 @@ use dinero_sv2_codec::{
     decode_submit_shares_extended, encode_coinbase_context, encode_new_template,
     encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
     encode_set_new_prev_hash, encode_set_target, encode_setup_connection_error,
-    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
+    encode_submit_shares_error, encode_submit_shares_success,
     sv2::{decode_set_reward_mode, encode_window_status},
 };
 use dinero_sv2_common::{
@@ -927,10 +927,10 @@ async fn serve_miner(
     session
         .write_frame(
             MSG_SETUP_CONNECTION_SUCCESS,
-            &encode_setup_connection_success(&SetupConnectionSuccess {
+            &dinero_sv2_codec::sv2::encode_setup_success_with_pool_version(&SetupConnectionSuccess {
                 used_version: PROTOCOL_VERSION,
                 flags: 0,
-            }),
+            }, setup.flags, env!("CARGO_PKG_VERSION"))?,
         )
         .await?;
     info!(

@@ -364,6 +364,8 @@ impl Display {
 }
 
 pub struct FeedWindow {
+    pub miner_version: String,
+    pub pool_version: String,
     pub stats: SessionStats,
     pub backend: Option<String>,
     pub last_block: Option<String>,
@@ -393,6 +395,8 @@ impl FeedWindow {
     pub fn with_session(pool: String, reward_mode: String, threads: usize, pinned: bool,
                         reward_address: String) -> Self {
         FeedWindow {
+            miner_version: "unknown".into(),
+            pool_version: "pending".into(),
             stats: SessionStats::default(),
             backend: None,
             last_block: None,
@@ -546,7 +550,9 @@ impl FeedWindow {
             output.push_str(&format!("\x1b[{}F\x1b[J", REGION_LINES - 1));
         }
 
-        let top_title = " DINERO // SV2 MINING TERMINAL ";
+        let heading = if width >= 95 { "DINERO // SV2 MINING TERMINAL" } else { "MINING TERMINAL" };
+        let top_title = fit_plain(&format!(" {heading} · Miner {} · Pool {} ",
+            self.miner_version, self.pool_version), width.saturating_sub(3));
         let top_fill = "─".repeat(width.saturating_sub(top_title.chars().count() + 3));
         output.push_str(&theme_line(&format!("╭─{top_title}{top_fill}╮"), colors));
         output.push_str("\x1b[K\n");
@@ -697,6 +703,17 @@ mod tests {
     fn hashrate_units_never_show_mantissa_1000() {
         assert_eq!(Display::fmt_hashrate(999_999.0), "1.00 MH/s");
         assert_eq!(Display::fmt_hashrate(999_999_900.0), "1.00 GH/s");
+    }
+
+    #[test]
+    fn terminal_title_identifies_miner_and_reported_pool() {
+        let mut window = FeedWindow::new();
+        window.miner_version = "0.2.10".into();
+        window.pool_version = "0.1.5".into();
+        let frame = window.repaint(120, false);
+        assert!(frame.lines().next().unwrap().contains("MINING TERMINAL · Miner 0.2.10 · Pool 0.1.5"));
+        window.pool_version = "not reported".into();
+        assert!(window.repaint(120, false).contains("Pool not reported"));
     }
 
     #[test]

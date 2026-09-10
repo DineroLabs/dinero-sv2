@@ -13,7 +13,7 @@ use clap::{Parser, ValueEnum};
 use dinero_sv2_codec::sv2::{decode_window_status, encode_set_reward_mode};
 use dinero_sv2_codec::{
     decode_coinbase_context, decode_new_template, decode_open_standard_mining_channel_success,
-    decode_set_new_prev_hash, decode_set_target, decode_setup_connection_success,
+    decode_set_new_prev_hash, decode_set_target,
     decode_submit_shares_error, decode_submit_shares_success, encode_open_standard_mining_channel,
     encode_setup_connection, encode_submit_shares, encode_submit_shares_extended,
 };
@@ -290,6 +290,8 @@ async fn async_main() -> Result<()> {
                 reward_address,
             },
         );
+
+        fx.set_software_versions(env!("CARGO_PKG_VERSION"), "pending");
 
         // Establish the alternate screen and permanent logo before the ticker
         // can paint its first dashboard frame. Reversing these two operations
@@ -611,13 +613,17 @@ async fn run_session(
         protocol: PROTOCOL_MINING,
         min_version: PROTOCOL_VERSION,
         max_version: PROTOCOL_VERSION,
-        flags: 0,
+        flags: dinero_sv2_codec::sv2::FLAG_POOL_VERSION,
         user_agent: args.user_agent.as_bytes().to_vec(),
     };
     writer
         .write_frame(MSG_SETUP_CONNECTION, &encode_setup_connection(&setup)?)
         .await?;
-    expect_setup_success(&mut reader).await?;
+    let pool_version = expect_setup_success(&mut reader).await?;
+    emitter.emit("software_versions", &serde_json::json!({
+        "miner_version": env!("CARGO_PKG_VERSION"),
+        "pool_version": pool_version,
+    }));
 
     // ---- OpenStandardMiningChannel ----
     // Report the rolling measured hashrate from the previous session.
@@ -929,15 +935,15 @@ async fn run_session(
 
 async fn expect_setup_success<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut NoiseReader<R>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let f = reader
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("EOF after SetupConnection"))?;
     match f.msg_type {
         MSG_SETUP_CONNECTION_SUCCESS => {
-            let _succ = decode_setup_connection_success(&f.payload)?;
-            Ok(())
+            let (_, version) = dinero_sv2_codec::sv2::decode_setup_success_with_pool_version(&f.payload)?;
+            Ok(version)
         }
         MSG_SETUP_CONNECTION_ERROR => bail!(
             "SetupConnection.Error: {}",
@@ -1396,6 +1402,8 @@ impl Emitter {
             }
             OutputMode::Human(state) => emit_human(state, event, data),
             OutputMode::Fx(fx) => match event {
+                "software_versions" => fx.set_software_versions(env!("CARGO_PKG_VERSION"),
+                    data.get("pool_version").and_then(|v| v.as_str()).unwrap_or("not reported")),
                 "hashrate" => { if let Some(mhs) = data.get("mhs").and_then(|v| v.as_f64()) { fx.on_hashrate(mhs); } }
                 "share_accepted" => fx.on_share_ok(data.get("accepted_count").and_then(|v| v.as_u64()).unwrap_or(1)),
                 "share_rejected" => fx.on_share_rejected(),
@@ -1412,14 +1420,20 @@ impl Emitter {
                         fx.on_block(data.get("hash").and_then(|v| v.as_str()).unwrap_or(""), &now_hms());
                     }
                 }
-                "connected" => fx.lifecycle_state(&lifecycle_line(event, data), Some("ONLINE"), None, None, false),
+                "connected" => {
+                    fx.set_software_versions(env!("CARGO_PKG_VERSION"), "pending");
+                    fx.lifecycle_state(&lifecycle_line(event, data), Some("ONLINE"), None, None, false);
+                },
                 "channel_open" => fx.lifecycle_state(
                     &lifecycle_line(event, data), Some("ONLINE"),
                     data.get("channel_id").and_then(|v| v.as_u64()), None, false),
                 "set_target" => fx.lifecycle_state(
                     &lifecycle_line(event, data), None, None,
                     data.get("max_target").and_then(|v| v.as_str()).map(str::to_string), false),
-                "session_end" => fx.lifecycle_state(&lifecycle_line(event, data), Some("OFFLINE"), None, None, false),
+                "session_end" => {
+                    fx.set_software_versions(env!("CARGO_PKG_VERSION"), "disconnected");
+                    fx.lifecycle_state(&lifecycle_line(event, data), Some("OFFLINE"), None, None, false);
+                },
                 "reconnect_wait" => fx.lifecycle_state(&lifecycle_line(event, data), Some("RECONNECTING"), None, None, true),
                 _ => fx.lifecycle(&lifecycle_line(event, data)),
             },
