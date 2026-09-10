@@ -263,6 +263,22 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_height_preserves_job_and_rejects_wrong_lengths() {
+        let job = sample_tmpl();
+        let old = encode_job_height(&job, None);
+        assert_eq!(old, encode_new_template(&job));
+        assert_eq!(decode_job_height(&old, false).unwrap().1, None);
+        let new = encode_job_height(&job, Some(111000));
+        assert_eq!(&new[..NEW_TEMPLATE_DINERO_SIZE], &old);
+        assert_eq!(decode_job_height(&new, true).unwrap(), (job, Some(111000)));
+        assert!(decode_job_height(&old, true).is_err());
+        assert!(decode_job_height(&new, false).is_err());
+        for len in 0..new.len() { assert!(decode_job_height(&new[..len], true).is_err()); }
+        let mut extra = new; extra.push(0);
+        assert!(decode_job_height(&extra, true).is_err());
+    }
+
+    #[test]
     fn new_template_roundtrip() {
         let msg = sample_tmpl();
         let buf = encode_new_template(&msg);
@@ -367,4 +383,21 @@ mod tests {
             prop_assert_eq!(m, back);
         }
     }
+}
+
+/// Encode optional negotiated job height without changing hashed header bytes.
+pub fn encode_job_height(msg: &NewTemplateDinero, height: Option<u32>) -> Vec<u8> {
+    let mut bytes = encode_new_template(msg).to_vec();
+    if let Some(height) = height { bytes.extend_from_slice(&height.to_le_bytes()); }
+    bytes
+}
+
+/// Decode a job using the capability agreed for this connection.
+pub fn decode_job_height(bytes: &[u8], negotiated: bool) -> Result<(NewTemplateDinero, Option<u32>), CodecError> {
+    let expected = NEW_TEMPLATE_DINERO_SIZE + if negotiated { 4 } else { 0 };
+    if bytes.len() < expected { return Err(CodecError::ShortFrame { expected, got: bytes.len() }); }
+    if bytes.len() > expected { return Err(CodecError::TrailingBytes { expected, got: bytes.len() }); }
+    let job = decode_new_template(&bytes[..NEW_TEMPLATE_DINERO_SIZE])?;
+    let height = negotiated.then(|| u32::from_le_bytes(bytes[NEW_TEMPLATE_DINERO_SIZE..].try_into().unwrap()));
+    Ok((job, height))
 }

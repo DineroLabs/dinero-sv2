@@ -26,6 +26,9 @@ const STR0_255_MAX: usize = 255;
 /// Pass-B/5 codec errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Sv2CodecError {
+    /// Invalid printable software version in the negotiated pool identity.
+    #[error("invalid pool software version")]
+    InvalidPoolVersion,
     /// Not enough input bytes to finish decoding.
     #[error("short frame at offset {at}, need {need} more bytes")]
     Short {
@@ -107,6 +110,53 @@ pub fn decode_setup_connection_success(
         used_version,
         flags,
     })
+}
+
+/// Negotiate a u32 mining-height trailer on each job.
+pub const FLAG_JOB_HEIGHT: u32 = 1 << 30;
+
+/// Request a pool software version; legacy peers retain the six-byte response.
+pub const FLAG_POOL_VERSION: u32 = 1 << 31;
+
+fn valid_pool_version(version: &[u8]) -> bool {
+    !version.is_empty() && version.len() <= 64 && version.iter().all(|b|
+        b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-' | b'+'))
+}
+
+/// Add software identity only when explicitly requested by the miner.
+pub fn encode_setup_success_with_pool_version(
+    msg: &SetupConnectionSuccess, requested_flags: u32, version: &str,
+) -> Result<Vec<u8>, Sv2CodecError> {
+    let mut response = msg.clone();
+    response.flags &= !FLAG_POOL_VERSION;
+    if requested_flags & FLAG_POOL_VERSION == 0 {
+        return Ok(encode_setup_connection_success(&response));
+    }
+    if !valid_pool_version(version.as_bytes()) {
+        return Err(Sv2CodecError::InvalidPoolVersion);
+    }
+    response.flags |= FLAG_POOL_VERSION;
+    let mut out = encode_setup_connection_success(&response);
+    write_str0_255(&mut out, version.as_bytes())?;
+    Ok(out)
+}
+
+/// Read a negotiated version, or None from an older pool. Reject control
+/// characters so untrusted server identity cannot inject terminal escapes.
+pub fn decode_setup_success_with_pool_version(
+    buf: &[u8],
+) -> Result<(SetupConnectionSuccess, Option<String>), Sv2CodecError> {
+    let mut cur = Cursor::new(buf);
+    let response = SetupConnectionSuccess {
+        used_version: cur.read_u16()?, flags: cur.read_u32()?,
+    };
+    let version = if response.flags & FLAG_POOL_VERSION != 0 {
+        let bytes = cur.read_str0_255()?;
+        if !valid_pool_version(bytes) { return Err(Sv2CodecError::InvalidPoolVersion); }
+        Some(String::from_utf8(bytes.to_vec()).map_err(|_| Sv2CodecError::InvalidPoolVersion)?)
+    } else { None };
+    cur.finish()?;
+    Ok((response, version))
 }
 
 /// Encode a [`SetupConnectionError`] message.
@@ -314,6 +364,9 @@ pub fn encode_coinbase_context(msg: &CoinbaseContext) -> Result<Vec<u8>, Sv2Code
     }
     out.extend_from_slice(&msg.height.to_le_bytes());
     out.extend_from_slice(&msg.coinbase_value_una.to_le_bytes());
+    if let Some(root) = msg.state_commitment_root {
+        out.extend_from_slice(&root);
+    }
     Ok(out)
 }
 
@@ -357,6 +410,7 @@ pub fn decode_coinbase_context(buf: &[u8]) -> Result<CoinbaseContext, Sv2CodecEr
 
     let height = cur.read_u32()?;
     let coinbase_value_una = cur.read_u64()?;
+    let state_commitment_root = if cur.remaining() == 0 { None } else { Some(cur.read_array32()?) };
     cur.finish()?;
     Ok(CoinbaseContext {
         channel_id,
@@ -365,6 +419,7 @@ pub fn decode_coinbase_context(buf: &[u8]) -> Result<CoinbaseContext, Sv2CodecEr
         merkle_path,
         height,
         coinbase_value_una,
+        state_commitment_root,
     })
 }
 
@@ -727,6 +782,29 @@ mod tests {
     }
 
     #[test]
+    fn pool_version_negotiation_and_legacy_compatibility() {
+        let base = SetupConnectionSuccess { used_version: PROTOCOL_VERSION, flags: 0 };
+        let legacy = encode_setup_success_with_pool_version(&base, 0, "0.1.5").unwrap();
+        assert_eq!(legacy, encode_setup_connection_success(&base));
+        assert_eq!(decode_setup_connection_success(&legacy).unwrap(), base);
+        assert_eq!(decode_setup_success_with_pool_version(&legacy).unwrap(), (base.clone(), None));
+        let extended = encode_setup_success_with_pool_version(&base, FLAG_POOL_VERSION, "0.1.5-rc.1+abc").unwrap();
+        let (response, version) = decode_setup_success_with_pool_version(&extended).unwrap();
+        assert_eq!(response.flags, FLAG_POOL_VERSION);
+        assert_eq!(version.as_deref(), Some("0.1.5-rc.1+abc"));
+        for end in 0..extended.len() {
+            assert!(decode_setup_success_with_pool_version(&extended[..end]).is_err());
+        }
+        let mut trailing = extended.clone(); trailing.push(0);
+        assert!(decode_setup_success_with_pool_version(&trailing).is_err());
+        let mut injection = extended; injection[7] = 0x1b;
+        assert_eq!(decode_setup_success_with_pool_version(&injection), Err(Sv2CodecError::InvalidPoolVersion));
+        for bad in ["", "0.1.5\n", "\x1b[2J", &"a".repeat(65)] {
+            assert!(encode_setup_success_with_pool_version(&base, FLAG_POOL_VERSION, bad).is_err());
+        }
+    }
+
+    #[test]
     fn setup_connection_error_roundtrip() {
         let m = SetupConnectionError {
             flags: 0,
@@ -842,6 +920,7 @@ mod tests {
     #[test]
     fn coinbase_context_roundtrip() {
         let m = CoinbaseContext {
+            state_commitment_root: None,
             channel_id: 1,
             coinbase_prefix: vec![1, 2, 3, 4, 5],
             coinbase_suffix: vec![0, 0, 0, 0],
@@ -854,8 +933,27 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_context_dnrs_extension_is_exact_and_bounded() {
+        let mut m = CoinbaseContext {
+            state_commitment_root: None, channel_id: 1,
+            coinbase_prefix: vec![], coinbase_suffix: vec![], merkle_path: vec![],
+            height: 111000, coinbase_value_una: 10,
+        };
+        let old = encode_coinbase_context(&m).unwrap();
+        m.state_commitment_root = Some([0x42; 32]);
+        let bytes = encode_coinbase_context(&m).unwrap();
+        assert_eq!(&bytes[..old.len()], &old);
+        assert_eq!(bytes.len(), old.len() + 32);
+        assert_eq!(decode_coinbase_context(&bytes).unwrap(), m);
+        for end in old.len()+1..bytes.len() { assert!(decode_coinbase_context(&bytes[..end]).is_err()); }
+        let mut trailing = bytes; trailing.push(0);
+        assert!(decode_coinbase_context(&trailing).is_err());
+    }
+
+    #[test]
     fn coinbase_context_empty_merkle_path_roundtrip() {
         let m = CoinbaseContext {
+            state_commitment_root: None,
             channel_id: 7,
             coinbase_prefix: b"prefix".to_vec(),
             coinbase_suffix: b"sfx".to_vec(),

@@ -15,8 +15,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use dinero_sv2_codec::sv2::{decode_window_status, encode_set_reward_mode};
 use dinero_sv2_codec::{
-    decode_coinbase_context, decode_new_template, decode_open_standard_mining_channel_success,
-    decode_set_new_prev_hash, decode_set_target, decode_setup_connection_success,
+    decode_coinbase_context, decode_open_standard_mining_channel_success,
+    decode_set_new_prev_hash, decode_set_target,
     decode_submit_shares_error, decode_submit_shares_success, encode_open_standard_mining_channel,
     encode_setup_connection, encode_submit_shares, encode_submit_shares_extended,
 };
@@ -510,6 +510,7 @@ async fn async_main() -> Result<()> {
 
         // Establish the alternate screen and permanent logo before the ticker
         // can paint its first dashboard frame.
+        fx.set_software_versions(env!("CARGO_PKG_VERSION"), "pending");
         fx.print_banner();
 
         // Build the real-hash sampler and spawn the ticker below the logo.
@@ -796,13 +797,17 @@ async fn run_session(
         protocol: PROTOCOL_MINING,
         min_version: PROTOCOL_VERSION,
         max_version: PROTOCOL_VERSION,
-        flags: 0,
+        flags: dinero_sv2_codec::sv2::FLAG_POOL_VERSION | dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
         user_agent: args.user_agent.as_bytes().to_vec(),
     };
     writer
         .write_frame(MSG_SETUP_CONNECTION, &encode_setup_connection(&setup)?)
         .await?;
-    expect_setup_success(&mut reader).await?;
+    let (pool_version, height_enabled) = expect_setup_success(&mut reader).await?;
+    emitter.emit("software_versions", &serde_json::json!({
+        "miner_version": env!("CARGO_PKG_VERSION"),
+        "pool_version": pool_version,
+    }));
 
     // Use the rolling measured rate from the previous session for the
     // SV2 channel-open declaration; first connect (atomic still 0)
@@ -930,7 +935,8 @@ async fn run_session(
                         coinbase_ctx = Some(ctx);
                     }
                     MSG_NEW_MINING_JOB => {
-                        let tmpl = decode_new_template(&frame.payload)?;
+                        let (tmpl, height) = dinero_sv2_codec::decode_job_height(&frame.payload, height_enabled)?;
+                        emitter.emit("job_height", &serde_json::json!({"height": height}));
                         if reward_mode == RewardModeChoice::Shared {
                             if shared_mode_confirmed {
                                 pending_shared_template = None;
@@ -1145,15 +1151,15 @@ async fn run_session(
 
 async fn expect_setup_success<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut NoiseReader<R>,
-) -> Result<()> {
+) -> Result<(Option<String>, bool)> {
     let f = reader
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("EOF after SetupConnection"))?;
     match f.msg_type {
         MSG_SETUP_CONNECTION_SUCCESS => {
-            let _succ = decode_setup_connection_success(&f.payload)?;
-            Ok(())
+            let (response, version) = dinero_sv2_codec::sv2::decode_setup_success_with_pool_version(&f.payload)?;
+            Ok((version, response.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0))
         }
         MSG_SETUP_CONNECTION_ERROR => bail!(
             "SetupConnection.Error: {}",
@@ -1256,6 +1262,9 @@ fn start_hashing_gpu(
             value_una: 0,
             script_pubkey: dnrf_script,
         });
+    }
+    if let Some(root) = ctx.state_commitment_root {
+        miner_outputs.push(dinero_sv2_jd::coinbase::state_commitment_output(root));
     }
     let (_coinbase_bytes, coinbase_txid) =
         assemble_stripped_coinbase(&ctx.coinbase_prefix, &miner_outputs, &ctx.coinbase_suffix);
@@ -1604,6 +1613,17 @@ impl Emitter {
             }
             OutputMode::Human(state) => emit_human(state, event, data),
             OutputMode::Fx(fx) => match event {
+                "session_end" => {
+                    fx.set_mining_height(None);
+                    fx.set_software_versions(env!("CARGO_PKG_VERSION"), "disconnected");
+                    fx.lifecycle(&lifecycle_line(event, data));
+                },
+                "software_versions" => fx.set_software_versions(env!("CARGO_PKG_VERSION"),
+                    data.get("pool_version").and_then(|v| v.as_str()).unwrap_or("not reported")),
+                "connected" => {
+                    fx.set_software_versions(env!("CARGO_PKG_VERSION"), "pending");
+                    fx.lifecycle(&lifecycle_line(event, data));
+                },
                 "gpu_ready" => {
                     if let Some(b) = data.get("backend").and_then(|v| v.as_str()) {
                         fx.set_backend(b);
@@ -1614,7 +1634,9 @@ impl Emitter {
                 "share_accepted" => fx.on_share_ok(data.get("accepted_count").and_then(|v| v.as_u64()).unwrap_or(1)),
                 "share_rejected" => fx.on_share_rejected(),
                 "window_status" => { if let Some(bps) = data.get("window_bps").and_then(|v| v.as_u64()) { fx.on_window(bps); } }
+                "job_height" => fx.set_mining_height(data.get("height").and_then(|v| v.as_u64())),
                 "new_job" => {
+                    if let Some(height) = data.get("height").and_then(|v| v.as_u64()) { fx.set_mining_height(Some(height)); }
                     // Solo templates carry the exact coinbase value for the DIN total.
                     if let Some(una) = data.get("coinbase_value_una").and_then(|v| v.as_u64()) { fx.on_solo_job_value(una); }
                     // deliberately NOT surfaced as a lifecycle line — job churn would

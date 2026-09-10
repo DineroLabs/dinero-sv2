@@ -1,5 +1,5 @@
 //! Pool-owned template for shared-mode miners: the pool assembles the
-//! entire coinbase (PPLNS split + DNRW + DNRF) and computes the header
+//! entire coinbase (PPLNS split + DNRS + DNRW + DNRF) and computes the header
 //! roots itself. Shared miners grind the header verbatim.
 
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +22,7 @@ use crate::mapper::PoolTemplate;
 /// final — the miner grinds nonce/timestamp/version only.
 #[derive(Debug)]
 pub struct SharedTemplate {
+    pub height: u32,
     /// Miner-facing wire message: `merkle_root` + `utreexo_root` are
     /// the pool's own recomputation over the split coinbase, not the
     /// daemon's original template values.
@@ -30,7 +31,7 @@ pub struct SharedTemplate {
     /// splice into a block for `submitblock`.
     pub coinbase_full_hex: String,
     /// Full output list as assembled: the caller's value outputs
-    /// (contributors + fee), then DNRW (if mandatory at this height),
+    /// (contributors + fee), daemon DNRS when present, then DNRW (if mandatory at this height),
     /// then DNRF (if mandatory at this height). Kept for logs/audit
     /// and so callers can independently recompute the Utreexo root.
     pub outputs: Vec<CoinbaseOutput>,
@@ -78,7 +79,11 @@ pub fn build_shared_template(
         .as_ref()
         .ok_or_else(|| anyhow!("template lacks utreexo pre-block state"))?;
 
+    anyhow::ensure!(split_outputs.iter().all(|o| o.script_pubkey.first() != Some(&0x6a)), "split must contain payout outputs only");
     let mut outputs = split_outputs;
+    if let Some(root) = crate::mapper::state_commitment_root(&pt.coinbase_full_hex)? {
+        outputs.push(dinero_sv2_jd::coinbase::state_commitment_output(root));
+    }
 
     // DNRW (coinbase-only constant): witness merkle root is fixed at
     // sha256d(64 zero bytes) because a coinbase-only block's witness
@@ -177,6 +182,7 @@ pub fn build_shared_template(
     };
 
     Ok(SharedTemplate {
+        height: pt.height,
         wire,
         coinbase_full_hex: hex::encode(full_coinbase),
         outputs,
@@ -187,6 +193,27 @@ pub fn build_shared_template(
 mod tests {
     use super::*;
     use dinero_sv2_jd::UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET;
+
+    #[test]
+    fn shared_dnrs_preserves_daemon_root_and_rejects_bad_candidates() {
+        let mut pt = crate::mapper::tests::fixture_pool_template();
+        let pay = CoinbaseOutput { value_una: pt.coinbase_value_una, script_pubkey: vec![0x51] };
+        let dnrs = dinero_sv2_jd::coinbase::state_commitment_output([0x35; 32]);
+        for bad in 0..4 {
+            let mut source = vec![pay.clone(), dnrs.clone()];
+            if bad == 1 { source.push(dnrs.clone()); }
+            if bad == 2 { source[1].script_pubkey[6] = 2; }
+            if bad == 3 { source[1].value_una = 1; }
+            let (raw, _) = assemble_stripped_coinbase(&pt.coinbase_prefix, &source, &pt.coinbase_suffix);
+            pt.coinbase_full_hex = hex::encode(raw);
+            let result = build_shared_template(&pt, vec![pay.clone()], None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET);
+            if bad == 0 {
+                let built = result.unwrap();
+                assert_eq!(crate::mapper::state_commitment_root(&built.coinbase_full_hex).unwrap(), Some([0x35;32]));
+                assert_eq!(built.outputs.iter().filter(|o| **o == dnrs).count(), 1);
+            } else { assert!(result.is_err()); }
+        }
+    }
 
     #[test]
     fn shared_template_coinbase_and_roots_are_consistent() {

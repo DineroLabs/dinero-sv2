@@ -83,7 +83,7 @@ pub fn share_weight(share_target: &[u8; 32]) -> u128 {
     u128::MAX / hi.saturating_add(1)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowEntry {
     pub payout_script: Vec<u8>,
     pub weight: u128,
@@ -108,9 +108,8 @@ impl PplnsWindow {
     }
 
     pub fn restore(entries: Vec<WindowEntry>, target_secs: u64) -> Self {
-        let mut w = Self { entries: entries.into(), target_secs };
-        w.evict();
-        w
+        // A checkpoint is already the exact live window; do not evict twice.
+        Self { entries: entries.into(), target_secs }
     }
 
     pub fn record(&mut self, payout_script: Vec<u8>, weight: u128, unix_ts: u64) {

@@ -56,6 +56,10 @@ pub struct FxScreen {
 }
 
 impl FxScreen {
+    pub fn set_mining_height(&self, height: Option<u64>) {
+        self.inner.lock().unwrap().window.mining_height = height;
+    }
+
     pub fn new(out: Box<dyn Write + Send>, cfg: FxConfig) -> Self {
         let mut window = FeedWindow::with_session(
             cfg.pool.clone(), cfg.reward_mode.clone(), cfg.threads, cfg.pinned,
@@ -113,6 +117,13 @@ impl FxScreen {
         let colors = inner.cfg.colors;
         let out = inner.window.repaint(width, colors);
         Self::write_flush(&mut inner, &out);
+    }
+
+    /// Update identity without repainting before the permanent banner is installed.
+    pub fn set_software_versions(&self, miner: &str, pool: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.window.miner_version = miner.to_string();
+        inner.window.pool_version = pool.to_string();
     }
 
     pub fn set_backend(&self, backend: &str) {

@@ -167,6 +167,9 @@ pub struct CoinbaseContext {
     pub height: u32,
     /// Total coinbase output value in `una` (block reward + fees).
     pub coinbase_value_una: u64,
+    /// Exact daemon post-block shielded root. Optional 32-byte wire extension;
+    /// old decoders reject its trailing bytes instead of mining without DNRS.
+    pub state_commitment_root: Option<[u8; 32]>,
 }
 
 /// Miner → pool: Job-Declaration share submission (Phase 5, Dinero

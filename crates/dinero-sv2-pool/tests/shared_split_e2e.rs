@@ -122,7 +122,9 @@ impl RegtestDaemon {
     /// this file (and the datadir path folds in the port too) so two
     /// scenarios can run in the same `cargo test -- --ignored` process
     /// without colliding on a bind address or on-disk state.
-    fn spawn(port: u16) -> Result<Self> {
+    fn spawn(port: u16) -> Result<Self> { Self::spawn_at_dnrs(port, 26) }
+
+    fn spawn_at_dnrs(port: u16, dnrs_height: u32) -> Result<Self> {
         let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/src/dinero/build/dinerod")
@@ -148,6 +150,8 @@ impl RegtestDaemon {
 
         let child = Command::new(&binary)
             .arg("--regtest")
+            .arg(format!("--consensus-state-commitment-height={dnrs_height}"))
+            .arg(format!("--wallet-socket-port={}", port + 10))
             .arg(format!("--datadir={}", datadir.display()))
             .arg("--rpc")
             .arg(format!("--rpcport={port}"))
@@ -216,6 +220,7 @@ impl PoolProcess {
             std::fs::File::create(&stderr_log).context("creating pool stderr log")?;
 
         let child = Command::new(binary)
+            .arg("--ops-bind=")
             .arg("--bind")
             .arg(bind.to_string())
             .arg("--rpc-url")
@@ -224,6 +229,8 @@ impl PoolProcess {
             .arg(cookie_path.display().to_string())
             .arg("--payout-address")
             .arg(payout_address)
+            .arg("--state-commitment-height")
+            .arg("1")
             .arg("--poll-secs")
             .arg("1")
             .arg("--refresh-same-tip-secs")
@@ -504,7 +511,7 @@ impl MinerConn {
             let share = SubmitSharesDinero {
                 channel_id: self.channel_id,
                 sequence_number: 0,
-                job_id: 0,
+                job_id: self.wire.template_id as u32,
                 nonce,
                 timestamp: self.wire.timestamp,
                 version: self.wire.version,
@@ -560,7 +567,7 @@ impl MinerConn {
             let share = SubmitSharesDinero {
                 channel_id: self.channel_id,
                 sequence_number: 0,
-                job_id: 0,
+                job_id: self.wire.template_id as u32,
                 nonce,
                 timestamp: self.wire.timestamp,
                 version: self.wire.version,
@@ -986,6 +993,15 @@ async fn run_shared_split_scenario(
         "coinbase is missing the DNRF filter commitment output"
     );
 
+    // The first pooled block crosses the DNRS boundary (setup height 25).
+    // Compare to the independently fetched daemon template, then require the
+    // actual pool submission to have connected under daemon enforcement.
+    let expected_root = dinero_sv2_pool::mapper::state_commitment_root(coinbase_hex)?;
+    assert!(expected_root.is_some(), "daemon template must contain DNRS at activation");
+    let expected = dinero_sv2_jd::coinbase::state_commitment_output(expected_root.unwrap());
+    assert_eq!(outputs.iter().filter(|(_, s)| s.len() >= 6 && &s[2..6] == b"DNRS").count(), 1);
+    assert!(outputs.iter().any(|(v,s)| *v == 0 && *s == expected.script_pubkey));
+
     // Every value output sums exactly to the block reward.
     let total: u64 = outputs.iter().map(|(v, _)| *v).sum();
     assert_eq!(total, expected_reward_una, "coinbase output sum != block reward");
@@ -1079,5 +1095,73 @@ async fn shared_block_at_dnrw_mandatory_height_includes_witness_commitment() -> 
         outcome.outputs.iter().map(|(v, s)| format!("{}:{}", hex::encode(s), v)).collect::<Vec<_>>()
     );
 
+    Ok(())
+}
+
+/// The actual CPU miner must consume the extended CoinbaseContext and submit
+/// a valid miner-owned coinbase through the live pool's extended-share path.
+#[tokio::test]
+#[ignore = "requires DINEROD_BIN and DINEROMINER_BIN; starts real isolated processes"]
+async fn solo_miner_preserves_dnrs_through_pool() -> Result<()> { run_solo_miner(false).await }
+
+#[tokio::test]
+#[ignore = "requires an actual GPU and DINEROGPUMINER_BIN"]
+async fn solo_gpu_miner_preserves_dnrs_through_pool() -> Result<()> { run_solo_miner(true).await }
+
+async fn run_solo_miner(gpu: bool) -> Result<()> {
+    // CPU and GPU cases may run concurrently in the ignored-test suite.
+    let (rpc_port, pool_port) = if gpu { (29987, 29988) } else { (29985, 29986) };
+    let daemon = RegtestDaemon::spawn_at_dnrs(rpc_port, 2)?;
+    daemon.wait_for_cookie()?;
+    let rpc = RpcClient::new(daemon.rpc_url.clone(), Auth::Cookie(daemon.cookie_path.display().to_string()))?;
+    let create = rpc.call_raw("wallet.createhd", serde_json::json!(["solo", "", false])).await?;
+    let address = create["first_address"].as_str().context("wallet address")?;
+    mine_blocks(&rpc, address, 1).await?;
+    let gbt = rpc.get_block_template(address).await?;
+    let expected = mapper::state_commitment_root(gbt["coinbasetxn"]["data"].as_str().context("coinbase")?)?.context("DNRS")?;
+    let dir = tempfile::tempdir()?;
+    let key_path = dir.path().join("pool.key");
+    let keys = dinero_sv2_transport::StaticKeys::load_or_generate(&key_path)?;
+    let pool = PoolProcess::spawn(format!("127.0.0.1:{pool_port}").parse()?, &daemon.rpc_url,
+        &daemon.cookie_path, address, &dir.path().join("journal"), &key_path, dir.path().join("pool.log"))?;
+    pool.wait_ready().await?;
+    struct Miner(std::process::Child);
+    impl Drop for Miner { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    let miner_bin = std::env::var(if gpu { "DINEROGPUMINER_BIN" } else { "DINEROMINER_BIN" }).context("set miner binary path")?;
+    let script = payout_script(0x71);
+    let mut miner = Miner(Command::new(miner_bin)
+        .args(["--pool", &format!("127.0.0.1:{pool_port}"), "--reward-mode", "solo", "--no-save", "--plain"])
+        .args(if gpu { vec!["--batch-size", "4096"] } else { vec!["--threads", "1"] })
+        .arg("--server-pubkey").arg(keys.public_hex())
+        .arg("--payout-script-hex").arg(hex::encode(&script))
+        .stdin(Stdio::null()).stdout(std::fs::File::create(dir.path().join("miner-output.log"))?)
+        .stderr(std::fs::File::create(dir.path().join("miner.log"))?).spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let height = rpc.call_raw("getblockcount", serde_json::json!([])).await?.as_u64().unwrap_or(0);
+        if height >= 2 { break; }
+        if Instant::now() >= deadline || miner.0.try_wait()?.is_some() {
+            bail!("solo miner did not connect a block; miner={} pool={}",
+                std::fs::read_to_string(dir.path().join("miner.log"))?,
+                std::fs::read_to_string(dir.path().join("pool.log"))?);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let output = std::fs::read_to_string(dir.path().join("miner-output.log"))?;
+    let version_line = output.lines().find(|line| line.starts_with("[software_versions] "))
+        .context("miner must report negotiated software versions")?;
+    let versions: serde_json::Value = serde_json::from_str(version_line.trim_start_matches("[software_versions] "))?;
+    assert_eq!(versions["pool_version"], env!("CARGO_PKG_VERSION"));
+    assert!(output.lines().filter_map(|line| line.strip_prefix("[job_height] "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|job| job["height"] == 2), "miner must receive the real mining height");
+    assert!(versions["miner_version"].as_str().is_some_and(|s| !s.is_empty()));
+    let hash = rpc.call_raw("getblockhash", serde_json::json!([2])).await?;
+    let raw = rpc.call_raw("getblock", serde_json::json!([hash, 0])).await?;
+    let outputs = parse_coinbase_only_block_outputs(raw.as_str().context("raw block")?)?;
+    let dnrs = dinero_sv2_jd::coinbase::state_commitment_output(expected);
+    assert!(outputs.iter().any(|(v,s)| *v == 0 && *s == dnrs.script_pubkey));
+    assert!(outputs.iter().any(|(v,s)| *v > 0 && *s == script));
+    eprintln!("solo miner (gpu={gpu}) -> pool -> daemon: accepted DNRS block {hash}");
     Ok(())
 }

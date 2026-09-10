@@ -28,10 +28,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
     decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
-    decode_submit_shares_extended, encode_coinbase_context, encode_new_template,
+    decode_submit_shares_extended, encode_coinbase_context,
     encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
     encode_set_new_prev_hash, encode_set_target, encode_setup_connection_error,
-    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
+    encode_submit_shares_error, encode_submit_shares_success,
     sv2::{decode_set_reward_mode, encode_window_status},
 };
 use dinero_sv2_common::{
@@ -283,6 +283,10 @@ struct Args {
     /// rejects with `bad-utreexo-root`.
     #[arg(long, default_value_t = UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)]
     utreexo_maturity_leaf_height: u32,
+
+    /// DNRS activation: mainnet 111000; regtest 1; dormant testnet 4294967295.
+    #[arg(long, default_value_t = 111000)]
+    state_commitment_height: u32,
 }
 
 #[tokio::main]
@@ -377,21 +381,15 @@ async fn main() -> Result<()> {
 
     // PPLNS shared-mode state: a rolling window of recent share credits
     // (14_400s target span) restored from the on-disk journal, plus the
-    // journal itself for ongoing appends. Losing the journal only costs
-    // unpaid share *credit* — never funds (see journal.rs).
-    let window = Arc::new(Mutex::new(PplnsWindow::restore(
-        WindowJournal::load(&args.pplns_journal).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                "PPLNS journal unreadable — starting with an empty window"
-            );
-            Vec::new()
-        }),
-        14_400,
-    )));
-    let journal = Arc::new(Mutex::new(
-        WindowJournal::open(&args.pplns_journal).context("opening PPLNS journal")?,
-    ));
+    // journal itself for ongoing appends. Recovery errors must not silently
+    // discard unpaid contribution credits.
+    let recovered = WindowJournal::recover(&args.pplns_journal, 14_400)
+        .context("recovering PPLNS journal; refusing to discard credits")?;
+    let mut recovered_journal = WindowJournal::open(&args.pplns_journal)?;
+    // Establish an explicit checkpoint before accepting any new shares.
+    recovered_journal.compact(&recovered.entries().cloned().collect::<Vec<_>>())?;
+    let window = Arc::new(Mutex::new(recovered));
+    let journal = Arc::new(Mutex::new(recovered_journal));
 
     // Payout address: file beats flag (see payout.rs). Held in a watch so the
     // template producer picks up a runtime change on its next iteration —
@@ -447,6 +445,7 @@ async fn main() -> Result<()> {
         let pplns_window = window.clone();
         let shared_max_outputs = args.shared_max_outputs;
         let shared_dust_una = args.shared_dust_una;
+        let state_commitment_height = args.state_commitment_height;
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         let heartbeat = heartbeat.clone();
         tokio::spawn(async move {
@@ -511,13 +510,21 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                match mapper::state_commitment_root(&pt.coinbase_full_hex) {
+                    Ok(root) if root.is_some() || pt.height < state_commitment_height => {},
+                    other => {
+                        warn!(height = pt.height, result = ?other, "refusing template with missing or invalid DNRS; upgrade backend");
+                        continue;
+                    }
+                }
+
                 // Phase 6 mempool inclusion: apply mempool tx
                 // deletions+additions to the chain-tip pre-block state
                 // to derive the pre-coinbase state. Without this, JD
                 // miners can't reconstruct the right utreexo_root when
                 // mempool txs are in the block. If anything fails here
-                // we drop the mempool txs and fall back to a coinbase-
-                // only template (the pool stays alive).
+                // we refuse this template and retry; dropping transactions
+                // would invalidate the daemon-owned commitments.
                 if !pt.mempool_txs.is_empty() {
                     if let Some(pre_block) = pt.utreexo_pre_block.as_ref().cloned() {
                         match apply_mempool_to_pre_coinbase(
@@ -543,18 +550,12 @@ async fn main() -> Result<()> {
                                     error = %e,
                                     mempool_tx_count = pt.mempool_txs.len(),
                                     "post-mempool utreexo derivation failed — \
-                                     dropping mempool txs from this template"
+                                     refusing this template"
                                 );
-                                // Coinbase-only fallback: drop the
-                                // mempool tx list, restore the merkle
-                                // root to the bare coinbase txid (the
-                                // header leaf for a single-tx block),
-                                // and let JD miners build their own
-                                // coinbase on the unmodified
-                                // pre-block utreexo state.
-                                pt.mempool_txs.clear();
-                                pt.merkle_path.clear();
-                                pt.wire.merkle_root = pt.coinbase_txid_raw;
+                                // The coinbase commits to the original transaction set
+                                // (DNRS, witness and fees). Never drop transactions
+                                // while retaining that coinbase: retry a fresh template.
+                                continue;
                             }
                         }
                     }
@@ -997,10 +998,10 @@ async fn serve_miner(
     session
         .write_frame(
             MSG_SETUP_CONNECTION_SUCCESS,
-            &encode_setup_connection_success(&SetupConnectionSuccess {
+            &dinero_sv2_codec::sv2::encode_setup_success_with_pool_version(&SetupConnectionSuccess {
                 used_version: PROTOCOL_VERSION,
-                flags: 0,
-            }),
+                flags: setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
+            }, setup.flags, env!("CARGO_PKG_VERSION"))?,
         )
         .await?;
     info!(
@@ -1166,11 +1167,11 @@ async fn serve_miner(
                 if let Some(st) =
                     derive_channel_shared(&bundle, channel_id, utreexo_maturity_leaf_height)
                 {
-                    push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
+                    push_shared_job(&mut session, channel_id, &st, &window, payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                     current_shared = Some(st);
                 }
             }
-            None => push_job(&mut session, channel_id, &bundle.pt).await?,
+            None => push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?,
         }
         current = Some(bundle);
     }
@@ -1219,7 +1220,7 @@ async fn serve_miner(
                             // the old merkle_root/mempool set), silently
                             // failing valid — even block-worthy — shares.
                             if bundle.solo_changed {
-                                push_job(&mut session, channel_id, &bundle.pt).await?;
+                                push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                 current = Some(bundle);
                             }
                         }
@@ -1233,7 +1234,7 @@ async fn serve_miner(
                                 channel_id,
                                 utreexo_maturity_leaf_height,
                             ) {
-                                push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
+                                push_shared_job(&mut session, channel_id, &st, &window, payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                 current_shared = Some(st);
                                 // Keep the daemon-derived block target paired
                                 // with the exact per-channel template that was
@@ -1342,7 +1343,7 @@ async fn serve_miner(
                                             channel_id,
                                             utreexo_maturity_leaf_height,
                                         ) {
-                                            push_shared_job(&mut session, channel_id, &st, &window, &m.payout_script).await?;
+                                            push_shared_job(&mut session, channel_id, &st, &window, &m.payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                             current_shared = Some(st);
                                         }
                                     }
@@ -1466,6 +1467,7 @@ async fn push_job(
     session: &mut NoiseSession<TcpStream>,
     channel_id: u32,
     pt: &PoolTemplate,
+    height_enabled: bool,
 ) -> Result<()> {
     let snph = SetNewPrevHash {
         channel_id,
@@ -1493,13 +1495,14 @@ async fn push_job(
             merkle_path: pt.merkle_path.clone(),
             height: pt.height,
             coinbase_value_una: pt.coinbase_value_una,
+            state_commitment_root: mapper::state_commitment_root(&pt.coinbase_full_hex)?,
         };
         let payload = encode_coinbase_context(&ctx)
             .map_err(|e| anyhow::anyhow!("coinbase context encode: {e}"))?;
         session.write_frame(MSG_COINBASE_CONTEXT, &payload).await?;
     }
 
-    let payload = encode_new_template(&pt.wire);
+    let payload = dinero_sv2_codec::encode_job_height(&pt.wire, height_enabled.then_some(pt.height));
     session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
     debug!(
         template_id = pt.wire.template_id,
@@ -1521,6 +1524,7 @@ async fn push_shared_job(
     st: &SharedTemplate,
     window: &Arc<Mutex<PplnsWindow>>,
     payout_script: &[u8],
+    height_enabled: bool,
 ) -> Result<()> {
     let snph = SetNewPrevHash {
         channel_id,
@@ -1532,7 +1536,7 @@ async fn push_shared_job(
         .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
         .await?;
     session
-        .write_frame(MSG_NEW_MINING_JOB, &encode_new_template(&st.wire))
+        .write_frame(MSG_NEW_MINING_JOB, &dinero_sv2_codec::encode_job_height(&st.wire, height_enabled.then_some(st.height)))
         .await?;
     let (bps, shares) = {
         let w = window.lock().expect("pplns window mutex");
@@ -1816,10 +1820,6 @@ async fn handle_shared_share(
         return Ok(());
     }
 
-    ledger.credit_share(miner_key);
-    ops::telemetry().record_accepted_share("shared", hex::encode(hash));
-    *accepted_in_window += 1;
-
     // Credit the PPLNS window + journal (amendment 5: SystemTime::now()
     // is fine in the pool binary).
     let weight = share_weight(&share_target);
@@ -1828,37 +1828,17 @@ async fn handle_shared_share(
         .unwrap_or_default()
         .as_secs();
     {
-        let mut w = window.lock().expect("pplns window mutex");
-        w.record(payout_script.to_vec(), weight, ts);
-    }
-    {
-        // Separate lock scope from `window` above: `journal.compact`
-        // used to take its own fresh `window` lock internally, so holding
-        // the first guard across this block would deadlock (std::sync::
-        // Mutex is not reentrant). It now takes a snapshot of entries
-        // instead (see below), so the window lock is only ever held
-        // briefly to clone the snapshot — never across the compact I/O
-        // (serialize + flush + rename of up to 50k entries), which would
-        // otherwise stall the template producer's own window lock and
-        // block SOLO job production.
+        // Serialize credit order with journal order. Keep the journal guard
+        // through compaction, but release the window guard before disk I/O.
         let mut j = journal.lock().expect("pplns journal mutex");
-        if let Err(e) = j.append(&WindowEntry {
-            payout_script: payout_script.to_vec(),
-            weight,
-            unix_ts: ts,
-        }) {
-            warn!(error = %e, "pplns journal append failed — window credit still live in memory");
-        }
-        if j.should_compact() {
-            let entries: Vec<WindowEntry> = {
-                let w = window.lock().expect("pplns window mutex");
-                w.entries().cloned().collect()
-            };
-            if let Err(e) = j.compact(&entries) {
-                warn!(error = %e, "pplns journal compact failed");
-            }
-        }
+        j.credit(window, &WindowEntry {
+            payout_script: payout_script.to_vec(), weight, unix_ts: ts,
+        }).context("persisting share credit")?;
     }
+
+    ledger.credit_share(miner_key);
+    ops::telemetry().record_accepted_share("shared", hex::encode(hash));
+    *accepted_in_window += 1;
 
     info!(
         hash = %hex::encode(hash),
@@ -2039,6 +2019,15 @@ async fn handle_extended_share(
             send_share_error(session, channel_id, ext.sequence_number, "missing-dnrw").await?;
             return Ok(());
         }
+    }
+
+    let expected_dnrs = mapper::state_commitment_root(&pt.coinbase_full_hex)?;
+    let dnrs_valid = mapper::valid_state_commitment_outputs(expected_dnrs,
+        ext.coinbase_outputs.iter().map(|o| (o.value_una, o.script_pubkey.as_slice())));
+    if !dnrs_valid {
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "bad-dnrs-upgrade-miner").await?;
+        return Ok(());
     }
 
     // 2. Reassemble the stripped coinbase using pool's prefix/suffix

@@ -8,7 +8,7 @@ pub const EVENT_HEIGHT: usize = 4;
 /// Fixed dashboard below the permanent four-line logo. Titles and blank
 /// placeholders are present from frame one so no live update can change the
 /// physical height, wrap upward, or erase the DINERO header.
-pub const REGION_LINES: usize = 1 + 4 + 1 + FEED_HEIGHT + 1 + 4 + 1 + EVENT_HEIGHT + 1;
+pub const REGION_LINES: usize = 1 + 5 + 1 + FEED_HEIGHT + 1 + 4 + 1 + EVENT_HEIGHT + 1;
 
 /// Verified from dinero-v8/src/consensus/consensus.hpp:
 /// `static constexpr int64_t COIN = 100'000'000;  // 1 DIN = 100,000,000 units (8 decimals)`
@@ -364,6 +364,9 @@ impl Display {
 }
 
 pub struct FeedWindow {
+    pub miner_version: String,
+    pub pool_version: String,
+    pub mining_height: Option<u64>,
     pub stats: SessionStats,
     pub backend: Option<String>,
     pub last_block: Option<String>,
@@ -393,6 +396,9 @@ impl FeedWindow {
     pub fn with_session(pool: String, reward_mode: String, threads: usize, pinned: bool,
                         reward_address: String) -> Self {
         FeedWindow {
+            miner_version: "unknown".into(),
+            pool_version: "pending".into(),
+            mining_height: None,
             stats: SessionStats::default(),
             backend: None,
             last_block: None,
@@ -546,7 +552,9 @@ impl FeedWindow {
             output.push_str(&format!("\x1b[{}F\x1b[J", REGION_LINES - 1));
         }
 
-        let top_title = " DINERO // SV2 MINING TERMINAL ";
+        let heading = if width >= 95 { "DINERO // SV2 MINING TERMINAL" } else { "MINING TERMINAL" };
+        let top_title = fit_plain(&format!(" {heading} · Miner {} · Pool {} ",
+            self.miner_version, self.pool_version), width.saturating_sub(3));
         let top_fill = "─".repeat(width.saturating_sub(top_title.chars().count() + 3));
         output.push_str(&theme_line(&format!("╭─{top_title}{top_fill}╮"), colors));
         output.push_str("\x1b[K\n");
@@ -560,6 +568,7 @@ impl FeedWindow {
             box_split(&format!(" MODE  {} · PPLNS", self.reward_mode.to_uppercase()),
                       &format!(" WORKER  {worker} · {} threads", self.threads), width),
             box_split(&format!(" CHAN  {channel}"), &format!(" UPTIME  {uptime}"), width),
+            box_split("", &format!(" MINING HEIGHT  {}", self.mining_height.map(|h| h.to_string()).unwrap_or_else(|| "unavailable".into())), width),
         ] {
             output.push_str(&theme_line(&row, colors));
             output.push_str("\x1b[K\n");
@@ -697,6 +706,32 @@ mod tests {
     fn hashrate_units_never_show_mantissa_1000() {
         assert_eq!(Display::fmt_hashrate(999_999.0), "1.00 MH/s");
         assert_eq!(Display::fmt_hashrate(999_999_900.0), "1.00 GH/s");
+    }
+
+    #[test]
+    fn mining_height_is_directly_below_uptime() {
+        for width in [60, 80, 120, 180] {
+            let mut window = FeedWindow::new();
+            window.mining_height = Some(111000);
+            let frame = window.repaint(width, false);
+            let lines = frame.lines().collect::<Vec<_>>();
+            let uptime = lines.iter().position(|l| l.contains("UPTIME")).unwrap();
+            assert!(lines[uptime + 1].contains("MINING HEIGHT"));
+            if width >= 80 { assert!(lines[uptime + 1].contains("111000")); }
+            window.mining_height = None;
+            assert!(window.repaint(120, false).contains("MINING HEIGHT  unavailable"));
+        }
+    }
+
+    #[test]
+    fn terminal_title_identifies_miner_and_reported_pool() {
+        let mut window = FeedWindow::new();
+        window.miner_version = "0.2.10".into();
+        window.pool_version = "0.1.5".into();
+        let frame = window.repaint(120, false);
+        assert!(frame.lines().next().unwrap().contains("MINING TERMINAL · Miner 0.2.10 · Pool 0.1.5"));
+        window.pool_version = "not reported".into();
+        assert!(window.repaint(120, false).contains("Pool not reported"));
     }
 
     #[test]

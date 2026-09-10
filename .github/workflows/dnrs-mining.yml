@@ -1,0 +1,50 @@
+name: DNRS mining compatibility
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mining:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sv2
+      - uses: actions/checkout@v4
+        with:
+          repository: DineroLabs/dinero-v8
+          ref: 5c0458c77596673e2e2344d5fd851b39f31324c6
+          submodules: recursive
+          path: core
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install daemon build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config python3 perl libcurl4-openssl-dev libudev-dev libusb-1.0-0-dev ocl-icd-opencl-dev
+      - name: Rust tests and CPU miner
+        working-directory: sv2
+        run: |
+          cargo test --locked --workspace
+          cargo build --locked -p dinero-sv2-miner
+      - name: Build pinned activation daemon
+        working-directory: core
+        run: |
+          OPENSSL_VERSION=3.5.7 bash scripts/build-openssl-vendored.sh
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDINERO_USE_VENDORED_DEPS=ON -DDINERO_ENABLE_PORTMAPPING=OFF -DENABLE_GRPC=OFF
+          cmake --build build --target dinerod -j2
+      - name: Real shared and solo mining across activation
+        working-directory: sv2
+        env:
+          DINEROD_BIN: ${{ github.workspace }}/core/build/dinerod
+          DINEROMINER_BIN: ${{ github.workspace }}/sv2/target/debug/dinero-sv2-miner
+        run: |
+          set -o pipefail
+          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e shared_block_coinbase_pays_window_contributors -- --ignored --nocapture 2>&1 | tee shared-dnrs.log
+          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e solo_miner_preserves_dnrs_through_pool -- --ignored --nocapture 2>&1 | tee solo-dnrs.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dnrs-mining-${{ github.sha }}
+          path: sv2/*-dnrs.log
