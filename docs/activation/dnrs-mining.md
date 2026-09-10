@@ -99,3 +99,9 @@ not proof of source provenance. Existing Noise key pinning still applies.
 Disconnect/reconnect clears the displayed server version. Local miner installation
 does not upgrade the remote pool; SJ will show `not reported` until its coordinated
 pool rollout is complete.
+
+For client rollout before tagging a release, manually dispatch `miner-release`
+on the reviewed branch. It builds the usual platform artifacts and retains the
+mandatory Windows signing checks, but does not publish a release on manual runs.
+Windows desktop users also need the bundled SV2 sidecars and `sidecars.lock`
+updated together; changing the terminal executable alone does not update the app.
