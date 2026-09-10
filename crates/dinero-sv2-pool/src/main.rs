@@ -275,6 +275,10 @@ struct Args {
     /// rejects with `bad-utreexo-root`.
     #[arg(long, default_value_t = UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)]
     utreexo_maturity_leaf_height: u32,
+
+    /// DNRS activation: mainnet 111000; regtest 1; dormant testnet 4294967295.
+    #[arg(long, default_value_t = 111000)]
+    state_commitment_height: u32,
 }
 
 #[tokio::main]
@@ -426,6 +430,7 @@ async fn main() -> Result<()> {
         let shared_fee_bps = args.shared_fee_bps;
         let shared_max_outputs = args.shared_max_outputs;
         let shared_dust_una = args.shared_dust_una;
+        let state_commitment_height = args.state_commitment_height;
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         let heartbeat = heartbeat.clone();
         tokio::spawn(async move {
@@ -490,13 +495,21 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                match mapper::state_commitment_root(&pt.coinbase_full_hex) {
+                    Ok(root) if root.is_some() || pt.height < state_commitment_height => {},
+                    other => {
+                        warn!(height = pt.height, result = ?other, "refusing template with missing or invalid DNRS; upgrade backend");
+                        continue;
+                    }
+                }
+
                 // Phase 6 mempool inclusion: apply mempool tx
                 // deletions+additions to the chain-tip pre-block state
                 // to derive the pre-coinbase state. Without this, JD
                 // miners can't reconstruct the right utreexo_root when
                 // mempool txs are in the block. If anything fails here
-                // we drop the mempool txs and fall back to a coinbase-
-                // only template (the pool stays alive).
+                // we refuse this template and retry; dropping transactions
+                // would invalidate the daemon-owned commitments.
                 if !pt.mempool_txs.is_empty() {
                     if let Some(pre_block) = pt.utreexo_pre_block.as_ref().cloned() {
                         match apply_mempool_to_pre_coinbase(
@@ -522,18 +535,12 @@ async fn main() -> Result<()> {
                                     error = %e,
                                     mempool_tx_count = pt.mempool_txs.len(),
                                     "post-mempool utreexo derivation failed — \
-                                     dropping mempool txs from this template"
+                                     refusing this template"
                                 );
-                                // Coinbase-only fallback: drop the
-                                // mempool tx list, restore the merkle
-                                // root to the bare coinbase txid (the
-                                // header leaf for a single-tx block),
-                                // and let JD miners build their own
-                                // coinbase on the unmodified
-                                // pre-block utreexo state.
-                                pt.mempool_txs.clear();
-                                pt.merkle_path.clear();
-                                pt.wire.merkle_root = pt.coinbase_txid_raw;
+                                // The coinbase commits to the original transaction set
+                                // (DNRS, witness and fees). Never drop transactions
+                                // while retaining that coinbase: retry a fresh template.
+                                continue;
                             }
                         }
                     }
@@ -1416,6 +1423,7 @@ async fn push_job(
             merkle_path: pt.merkle_path.clone(),
             height: pt.height,
             coinbase_value_una: pt.coinbase_value_una,
+            state_commitment_root: mapper::state_commitment_root(&pt.coinbase_full_hex)?,
         };
         let payload = encode_coinbase_context(&ctx)
             .map_err(|e| anyhow::anyhow!("coinbase context encode: {e}"))?;
@@ -1937,6 +1945,15 @@ async fn handle_extended_share(
             send_share_error(session, channel_id, ext.sequence_number, "missing-dnrw").await?;
             return Ok(());
         }
+    }
+
+    let expected_dnrs = mapper::state_commitment_root(&pt.coinbase_full_hex)?;
+    let dnrs_valid = mapper::valid_state_commitment_outputs(expected_dnrs,
+        ext.coinbase_outputs.iter().map(|o| (o.value_una, o.script_pubkey.as_slice())));
+    if !dnrs_valid {
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "bad-dnrs-upgrade-miner").await?;
+        return Ok(());
     }
 
     // 2. Reassemble the stripped coinbase using pool's prefix/suffix

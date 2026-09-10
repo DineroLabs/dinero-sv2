@@ -1257,6 +1257,9 @@ fn start_hashing_gpu(
             script_pubkey: dnrf_script,
         });
     }
+    if let Some(root) = ctx.state_commitment_root {
+        miner_outputs.push(dinero_sv2_jd::coinbase::state_commitment_output(root));
+    }
     let (_coinbase_bytes, coinbase_txid) =
         assemble_stripped_coinbase(&ctx.coinbase_prefix, &miner_outputs, &ctx.coinbase_suffix);
     let mut post_state = pre_block_state.clone();

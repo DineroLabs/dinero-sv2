@@ -314,6 +314,9 @@ pub fn encode_coinbase_context(msg: &CoinbaseContext) -> Result<Vec<u8>, Sv2Code
     }
     out.extend_from_slice(&msg.height.to_le_bytes());
     out.extend_from_slice(&msg.coinbase_value_una.to_le_bytes());
+    if let Some(root) = msg.state_commitment_root {
+        out.extend_from_slice(&root);
+    }
     Ok(out)
 }
 
@@ -357,6 +360,7 @@ pub fn decode_coinbase_context(buf: &[u8]) -> Result<CoinbaseContext, Sv2CodecEr
 
     let height = cur.read_u32()?;
     let coinbase_value_una = cur.read_u64()?;
+    let state_commitment_root = if cur.remaining() == 0 { None } else { Some(cur.read_array32()?) };
     cur.finish()?;
     Ok(CoinbaseContext {
         channel_id,
@@ -365,6 +369,7 @@ pub fn decode_coinbase_context(buf: &[u8]) -> Result<CoinbaseContext, Sv2CodecEr
         merkle_path,
         height,
         coinbase_value_una,
+        state_commitment_root,
     })
 }
 
@@ -842,6 +847,7 @@ mod tests {
     #[test]
     fn coinbase_context_roundtrip() {
         let m = CoinbaseContext {
+            state_commitment_root: None,
             channel_id: 1,
             coinbase_prefix: vec![1, 2, 3, 4, 5],
             coinbase_suffix: vec![0, 0, 0, 0],
@@ -854,8 +860,27 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_context_dnrs_extension_is_exact_and_bounded() {
+        let mut m = CoinbaseContext {
+            state_commitment_root: None, channel_id: 1,
+            coinbase_prefix: vec![], coinbase_suffix: vec![], merkle_path: vec![],
+            height: 111000, coinbase_value_una: 10,
+        };
+        let old = encode_coinbase_context(&m).unwrap();
+        m.state_commitment_root = Some([0x42; 32]);
+        let bytes = encode_coinbase_context(&m).unwrap();
+        assert_eq!(&bytes[..old.len()], &old);
+        assert_eq!(bytes.len(), old.len() + 32);
+        assert_eq!(decode_coinbase_context(&bytes).unwrap(), m);
+        for end in old.len()+1..bytes.len() { assert!(decode_coinbase_context(&bytes[..end]).is_err()); }
+        let mut trailing = bytes; trailing.push(0);
+        assert!(decode_coinbase_context(&trailing).is_err());
+    }
+
+    #[test]
     fn coinbase_context_empty_merkle_path_roundtrip() {
         let m = CoinbaseContext {
+            state_commitment_root: None,
             channel_id: 7,
             coinbase_prefix: b"prefix".to_vec(),
             coinbase_suffix: b"sfx".to_vec(),

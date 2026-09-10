@@ -49,6 +49,13 @@ pub fn assemble_stripped_coinbase(
     (bytes, txid)
 }
 
+/// Canonical DNRS v1 output, copied from the daemon's post-block root.
+pub fn state_commitment_output(root: [u8; 32]) -> CoinbaseOutput {
+    let mut script_pubkey = vec![0x6a, 37, b'D', b'N', b'R', b'S', 1];
+    script_pubkey.extend_from_slice(&root);
+    CoinbaseOutput { value_una: 0, script_pubkey }
+}
+
 /// Encode a Bitcoin varint (compact size) in-place.
 pub fn write_varint(buf: &mut Vec<u8>, n: u64) {
     if n < 0xFD {
