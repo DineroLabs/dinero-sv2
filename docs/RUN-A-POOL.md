@@ -119,9 +119,14 @@ curl -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
   http://127.0.0.1:4445/status
 ```
 
-Reports connected miners, PPLNS window depth and span, the template
-producer's heartbeat, pool-wide share counters, and each contributor's
-share of the next block in basis points.
+The response is a versioned contract. `schema_version: 2` reports connected
+Stratum sessions separately from PPLNS contributors, daemon block/header
+height, template identity and freshness, accepted/rejected share counters,
+the last accepted share, the last block-submission result, and rejection
+counts grouped by reason. Each contributor's next-block share remains in
+basis points. Fields are additive; v1 cockpit clients can continue reading
+their original fields, while v2 clients must reject missing or ill-typed v2
+health fields instead of displaying false zeroes.
 
 It is **loopback-only and plain HTTP by design** — a pool binary that
 handles money should not also carry a TLS stack. For remote access, use
@@ -200,6 +205,24 @@ curl -X POST -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
 
 `GET /status` reports `payout_address`, so you can confirm what is actually
 live rather than trusting the unit file.
+
+## Changing your operator fee
+
+The pool fee can also be changed without a restart when the operator explicitly
+enables that authority with `--ops-allow-fee-change` (the installer switch is
+`--allow-fee-change`). It is off by default because the ops token becomes a
+money-policy credential. Values are exact basis points: `500` is 5%, `1000` is
+10%, and the accepted range is 0 through 10000.
+
+```sh
+curl -X POST -H "Authorization: Bearer $(cat /etc/dinero-sv2/ops-token)" \
+  -H 'Content-Type: application/json' -d '{"fee_bps":500}' \
+  http://127.0.0.1:4445/fee-bps
+```
+
+The new value is atomically persisted in `/etc/dinero-sv2/shared-fee-bps`,
+reported by `GET /status`, and used only when the next template is built.
+Already-issued templates are never rewritten.
 
 ## What you actually earn
 

@@ -34,7 +34,8 @@ ExecStart=/usr/local/bin/dinero-sv2-pool \
   --ops-bind 127.0.0.1:4445 \
   --ops-token-file /etc/dinero-sv2/ops-token \
   --payout-address-file /etc/dinero-sv2/payout-address \
-  --shared-fee-bps __FEE_BPS____OPS_ALLOW_PAYOUT_CHANGE__
+  --shared-fee-bps-file /etc/dinero-sv2/shared-fee-bps \
+  --shared-fee-bps __FEE_BPS____OPS_ALLOW_PAYOUT_CHANGE____OPS_ALLOW_FEE_CHANGE__
 
 Restart=on-failure
 RestartSec=5

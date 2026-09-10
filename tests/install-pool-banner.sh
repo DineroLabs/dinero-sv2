@@ -75,9 +75,16 @@ case "$out" in
   *) echo "FAIL - unexpected: $out"; fails=$((fails+1)) ;;
 esac
 
+out=$(run_args --allow-fee-change --payout-address din1pgood || true)
+case "$out" in
+  *"run as root"*) echo "ok   - --allow-fee-change is a recognised option" ;;
+  *"unknown option"*) echo "FAIL - --allow-fee-change not parsed: $out"; fails=$((fails+1)) ;;
+  *) echo "FAIL - unexpected: $out"; fails=$((fails+1)) ;;
+esac
+
 out=$(run_args --help || true)
 case "$out" in
-  *--allow-payout-change*) echo "ok   - --help documents --allow-payout-change" ;;
+  *--allow-payout-change*--allow-fee-change*) echo "ok   - --help documents both mutation flags" ;;
   *) echo "FAIL - --help omits the new flag"; fails=$((fails+1)) ;;
 esac
 
@@ -86,7 +93,7 @@ esac
 # count: without the flag the variable is unset, and `set -u` then kills the
 # install midway, after it has already written files. Anchoring at column 0
 # is what distinguishes the two.
-for v in ALLOW_PAYOUT_CHANGE ALLOW_FLAG PAYOUT FEE_BPS BIND RPC_URL COOKIE START; do
+for v in ALLOW_PAYOUT_CHANGE ALLOW_FEE_CHANGE ALLOW_FLAG ALLOW_FEE_FLAG PAYOUT FEE_BPS BIND RPC_URL COOKIE START; do
   first_use=$(grep -nF "\$$v" "$SCRIPT" | head -1 | cut -d: -f1)
   first_set=$(grep -nE "^$v=" "$SCRIPT" | head -1 | cut -d: -f1)
   if [ -z "$first_use" ]; then

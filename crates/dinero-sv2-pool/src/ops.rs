@@ -31,8 +31,9 @@
 //! ambiguity is answered with a rejection rather than a guess.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +50,8 @@ pub const STATUS_PATH: &str = "/status";
 /// Gated behind `Policy::allow_payout_change` — OFF by default, because
 /// reaching it means the ops token can redirect money.
 pub const PAYOUT_PATH: &str = "/payout-address";
+/// Mutating route: set the operator fee for future templates.
+pub const FEE_PATH: &str = "/fee-bps";
 
 /// Cap on a request body. The only body we accept is a one-field JSON
 /// object holding an address, so anything larger is a mistake or an attack.
@@ -61,6 +64,8 @@ pub struct Policy {
     /// `--ops-allow-payout-change`. When false the payout route 403s even
     /// for a caller holding the correct token.
     pub allow_payout_change: bool,
+    /// `--ops-allow-fee-change`. Also OFF by default.
+    pub allow_fee_change: bool,
 }
 
 /// One contributor's standing in the PPLNS window.
@@ -80,10 +85,125 @@ pub struct MinerStatus {
     pub window_weight: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentShare {
+    pub accepted_at_unix: u64,
+    pub kind: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentBlock {
+    pub observed_at_unix: u64,
+    pub status: String,
+    pub hash: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub struct TelemetryState {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub rejection_reasons: BTreeMap<String, u64>,
+    pub last_share: Option<RecentShare>,
+    pub last_block: Option<RecentBlock>,
+    pub last_template_at_unix: u64,
+    pub last_template_height: u64,
+    pub last_template_id: u64,
+    pub last_template_hash: String,
+    pub daemon_endpoint: String,
+    pub daemon_blocks: u64,
+    pub daemon_headers: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct OpsTelemetry(Mutex<TelemetryState>);
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+impl OpsTelemetry {
+    pub fn record_template(
+        &self,
+        endpoint: &str,
+        blocks: u64,
+        headers: u64,
+        height: u64,
+        template_id: u64,
+        prev_hash: String,
+    ) {
+        let mut s = self.0.lock().expect("ops telemetry mutex");
+        s.last_template_at_unix = now_unix();
+        s.last_template_height = height;
+        s.last_template_id = template_id;
+        s.last_template_hash = prev_hash;
+        s.daemon_endpoint = endpoint.to_owned();
+        s.daemon_blocks = blocks;
+        s.daemon_headers = headers;
+    }
+
+    pub fn record_accepted_share(&self, kind: &str, hash: String) {
+        let mut s = self.0.lock().expect("ops telemetry mutex");
+        s.accepted = s.accepted.saturating_add(1);
+        s.last_share = Some(RecentShare {
+            accepted_at_unix: now_unix(),
+            kind: kind.to_owned(),
+            hash,
+        });
+    }
+
+    pub fn record_rejection(&self, reason: &str) {
+        let mut s = self.0.lock().expect("ops telemetry mutex");
+        s.rejected = s.rejected.saturating_add(1);
+        *s.rejection_reasons.entry(reason.to_owned()).or_default() += 1;
+    }
+
+    pub fn record_block(&self, status: &str, hash: String, reason: String) {
+        self.0.lock().expect("ops telemetry mutex").last_block = Some(RecentBlock {
+            observed_at_unix: now_unix(),
+            status: status.to_owned(),
+            hash,
+            reason,
+        });
+    }
+
+    pub fn snapshot(&self) -> TelemetryState {
+        let s = self.0.lock().expect("ops telemetry mutex");
+        TelemetryState {
+            accepted: s.accepted,
+            rejected: s.rejected,
+            rejection_reasons: s.rejection_reasons.clone(),
+            last_share: s.last_share.clone(),
+            last_block: s.last_block.clone(),
+            last_template_at_unix: s.last_template_at_unix,
+            last_template_height: s.last_template_height,
+            last_template_id: s.last_template_id,
+            last_template_hash: s.last_template_hash.clone(),
+            daemon_endpoint: s.daemon_endpoint.clone(),
+            daemon_blocks: s.daemon_blocks,
+            daemon_headers: s.daemon_headers,
+        }
+    }
+}
+
+static TELEMETRY: OnceLock<OpsTelemetry> = OnceLock::new();
+
+pub fn telemetry() -> &'static OpsTelemetry {
+    TELEMETRY.get_or_init(OpsTelemetry::default)
+}
+
 /// Everything the endpoint reports. Purely descriptive — a consumer
 /// that wants *earnings* should read the chain, not this.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpsStatus {
+    /// Monotonic contract version for strict consumers. Fields from v1 remain
+    /// present so older Qt releases continue to work.
+    pub schema_version: u32,
+    pub generated_at_unix: u64,
     pub pool_version: String,
     pub uptime_secs: u64,
     /// Operator fee in basis points (1000 = 10%).
@@ -103,6 +223,18 @@ pub struct OpsStatus {
     pub rejected_shares_total: u64,
     pub blocks_found_total: u64,
     pub miners: Vec<MinerStatus>,
+    pub stratum_bind: String,
+    pub daemon_connected: bool,
+    pub daemon_endpoint: String,
+    pub daemon_blocks: u64,
+    pub daemon_headers: u64,
+    pub template_height: u64,
+    pub template_id: u64,
+    pub template_prev_hash: String,
+    pub last_template_at_unix: u64,
+    pub last_share: Option<RecentShare>,
+    pub last_block: Option<RecentBlock>,
+    pub rejection_reasons: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +310,11 @@ pub fn parse_request(head: &str) -> Option<Request> {
             }
         }
     }
-    Some(Request { method, path, bearer })
+    Some(Request {
+        method,
+        path,
+        bearer,
+    })
 }
 
 /// Authorize and route. Auth is checked BEFORE the path, so an
@@ -217,6 +353,15 @@ pub fn decide(req: &Request, expected_token: &str, policy: Policy) -> Decision {
             }
             Decision::Serve
         }
+        FEE_PATH => {
+            if req.method != "POST" {
+                return Decision::MethodNotAllowed;
+            }
+            if !policy.allow_fee_change {
+                return Decision::Forbidden;
+            }
+            Decision::Serve
+        }
         _ => Decision::NotFound,
     }
 }
@@ -229,6 +374,15 @@ pub fn parse_payout_body(body: &str) -> Option<String> {
         return None;
     }
     Some(addr.to_string())
+}
+
+/// Extract an exact integral basis-point value from `{"fee_bps": 500}`.
+pub fn parse_fee_body(body: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let fee = value.get("fee_bps")?.as_u64()?;
+    u32::try_from(fee)
+        .ok()
+        .filter(|fee| *fee <= crate::fee::MAX_BPS)
 }
 
 /// Cheap syntactic gate so an obvious typo never costs an RPC round-trip.
@@ -293,12 +447,21 @@ mod tests {
     // The whole point of the flag is that enabling a money-routing verb is a
     // deliberate act. Default-constructed Policy must refuse.
 
-    fn open() -> Policy { Policy { allow_payout_change: true } }
+    fn open() -> Policy {
+        Policy {
+            allow_payout_change: true,
+            ..Policy::default()
+        }
+    }
 
     #[test]
     fn payout_change_is_refused_when_not_enabled() {
         assert_eq!(
-            decide(&req("POST", PAYOUT_PATH, Some("s3cret")), "s3cret", Policy::default()),
+            decide(
+                &req("POST", PAYOUT_PATH, Some("s3cret")),
+                "s3cret",
+                Policy::default()
+            ),
             Decision::Forbidden
         );
     }
@@ -316,7 +479,11 @@ mod tests {
     #[test]
     fn payout_route_reports_unauthorized_before_forbidden() {
         assert_eq!(
-            decide(&req("POST", PAYOUT_PATH, Some("wrong")), "s3cret", Policy::default()),
+            decide(
+                &req("POST", PAYOUT_PATH, Some("wrong")),
+                "s3cret",
+                Policy::default()
+            ),
             Decision::Unauthorized
         );
         assert_eq!(
@@ -334,6 +501,63 @@ mod tests {
                 Decision::MethodNotAllowed,
                 "method {m}"
             );
+        }
+    }
+
+    #[test]
+    fn fee_route_is_authenticated_opt_in_and_post_only() {
+        let post = req("POST", FEE_PATH, Some("secret"));
+        assert_eq!(
+            decide(&post, "secret", Policy::default()),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(
+                &post,
+                "different",
+                Policy {
+                    allow_fee_change: true,
+                    ..Policy::default()
+                }
+            ),
+            Decision::Unauthorized
+        );
+        assert_eq!(
+            decide(
+                &req("GET", FEE_PATH, Some("secret")),
+                "secret",
+                Policy {
+                    allow_fee_change: true,
+                    ..Policy::default()
+                }
+            ),
+            Decision::MethodNotAllowed
+        );
+        assert_eq!(
+            decide(
+                &post,
+                "secret",
+                Policy {
+                    allow_fee_change: true,
+                    ..Policy::default()
+                }
+            ),
+            Decision::Serve
+        );
+    }
+
+    #[test]
+    fn fee_body_requires_exact_bounded_integer_basis_points() {
+        assert_eq!(parse_fee_body(r#"{"fee_bps":500}"#), Some(500));
+        assert_eq!(parse_fee_body(r#"{"fee_bps":0}"#), Some(0));
+        assert_eq!(parse_fee_body(r#"{"fee_bps":10000}"#), Some(10000));
+        for body in [
+            r#"{"fee_bps":10001}"#,
+            r#"{"fee_bps":5.5}"#,
+            r#"{"fee_bps":"500"}"#,
+            r#"{"fee":500}"#,
+        ] {
+            assert_eq!(parse_fee_body(body), None, "accepted {body}");
         }
     }
 
@@ -379,9 +603,16 @@ mod tests {
 
     #[test]
     fn body_without_an_address_is_rejected() {
-        for b in [r#"{}"#, r#"{"addr":"din1pabc"}"#, r#"{"address":null}"#,
-                  r#"{"address":123}"#, r#"{"address":""}"#, r#"{"address":"   "}"#,
-                  "not json", ""] {
+        for b in [
+            r#"{}"#,
+            r#"{"addr":"din1pabc"}"#,
+            r#"{"address":null}"#,
+            r#"{"address":123}"#,
+            r#"{"address":""}"#,
+            r#"{"address":"   "}"#,
+            "not json",
+            "",
+        ] {
             assert!(parse_payout_body(b).is_none(), "should reject: {b}");
         }
     }
@@ -399,10 +630,10 @@ mod tests {
     fn obvious_junk_is_rejected_without_an_rpc() {
         for bad in [
             "",
-            "din1q0000000000000000000000000000000000000000000000000000000000",  // wrong prefix
-            "din1p",                                                            // too short
-            "bc1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy",   // other chain
-            "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggx!",  // bad charset
+            "din1q0000000000000000000000000000000000000000000000000000000000", // wrong prefix
+            "din1p",                                                           // too short
+            "bc1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy",  // other chain
+            "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggx!", // bad charset
             "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy din1pother", // two
         ] {
             assert!(!looks_like_payout_address(bad), "should reject: {bad:?}");
@@ -420,15 +651,27 @@ mod tests {
 
     #[test]
     fn content_length_is_read_case_insensitively() {
-        assert_eq!(content_length("POST / HTTP/1.1\r\ncontent-length: 22\r\n\r\n"), Some(22));
-        assert_eq!(content_length("POST / HTTP/1.1\r\nContent-Length:  7 \r\n\r\n"), Some(7));
+        assert_eq!(
+            content_length("POST / HTTP/1.1\r\ncontent-length: 22\r\n\r\n"),
+            Some(22)
+        );
+        assert_eq!(
+            content_length("POST / HTTP/1.1\r\nContent-Length:  7 \r\n\r\n"),
+            Some(7)
+        );
         assert_eq!(content_length("POST / HTTP/1.1\r\nHost: x\r\n\r\n"), None);
-        assert_eq!(content_length("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"), None);
+        assert_eq!(
+            content_length("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"),
+            None
+        );
     }
 
     #[test]
     fn oversize_content_length_is_refused() {
-        let h = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
+        let h = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
         assert_eq!(content_length(&h), None);
     }
 
@@ -459,18 +702,32 @@ mod tests {
 
     #[test]
     fn correct_token_on_the_status_route_is_served() {
-        assert_eq!(decide(&req("GET", STATUS_PATH, Some("s3cret")), "s3cret", Policy::default()), Decision::Serve);
+        assert_eq!(
+            decide(
+                &req("GET", STATUS_PATH, Some("s3cret")),
+                "s3cret",
+                Policy::default()
+            ),
+            Decision::Serve
+        );
     }
 
     #[test]
     fn missing_token_is_rejected() {
-        assert_eq!(decide(&req("GET", STATUS_PATH, None), "s3cret", Policy::default()), Decision::Unauthorized);
+        assert_eq!(
+            decide(&req("GET", STATUS_PATH, None), "s3cret", Policy::default()),
+            Decision::Unauthorized
+        );
     }
 
     #[test]
     fn wrong_token_is_rejected() {
         assert_eq!(
-            decide(&req("GET", STATUS_PATH, Some("guess")), "s3cret", Policy::default()),
+            decide(
+                &req("GET", STATUS_PATH, Some("guess")),
+                "s3cret",
+                Policy::default()
+            ),
             Decision::Unauthorized
         );
     }
@@ -480,16 +737,34 @@ mod tests {
         // An unauthenticated caller must not learn which paths exist:
         // a bad token on a bogus path must look like a bad token on a
         // real one.
-        assert_eq!(decide(&req("GET", "/nope", Some("guess")), "s3cret", Policy::default()), Decision::Unauthorized);
         assert_eq!(
-            decide(&req("GET", STATUS_PATH, Some("guess")), "s3cret", Policy::default()),
+            decide(
+                &req("GET", "/nope", Some("guess")),
+                "s3cret",
+                Policy::default()
+            ),
+            Decision::Unauthorized
+        );
+        assert_eq!(
+            decide(
+                &req("GET", STATUS_PATH, Some("guess")),
+                "s3cret",
+                Policy::default()
+            ),
             Decision::Unauthorized
         );
     }
 
     #[test]
     fn authenticated_unknown_route_is_not_found() {
-        assert_eq!(decide(&req("GET", "/nope", Some("s3cret")), "s3cret", Policy::default()), Decision::NotFound);
+        assert_eq!(
+            decide(
+                &req("GET", "/nope", Some("s3cret")),
+                "s3cret",
+                Policy::default()
+            ),
+            Decision::NotFound
+        );
     }
 
     #[test]
@@ -497,7 +772,11 @@ mod tests {
         // The endpoint is read-only by contract, not just by omission.
         for m in ["POST", "PUT", "DELETE", "PATCH"] {
             assert_eq!(
-                decide(&req(m, STATUS_PATH, Some("s3cret")), "s3cret", Policy::default()),
+                decide(
+                    &req(m, STATUS_PATH, Some("s3cret")),
+                    "s3cret",
+                    Policy::default()
+                ),
                 Decision::MethodNotAllowed,
                 "{m} should be refused"
             );
@@ -506,16 +785,36 @@ mod tests {
 
     #[test]
     fn head_is_treated_as_a_read_and_allowed() {
-        assert_eq!(decide(&req("HEAD", STATUS_PATH, Some("s3cret")), "s3cret", Policy::default()), Decision::Serve);
+        assert_eq!(
+            decide(
+                &req("HEAD", STATUS_PATH, Some("s3cret")),
+                "s3cret",
+                Policy::default()
+            ),
+            Decision::Serve
+        );
     }
 
     #[test]
     fn an_empty_configured_token_authorizes_nobody() {
         // Fail closed: an empty token file must not turn into
         // "" == "" and open the endpoint.
-        assert_eq!(decide(&req("GET", STATUS_PATH, Some("")), "", Policy::default()), Decision::Unauthorized);
-        assert_eq!(decide(&req("GET", STATUS_PATH, None), "", Policy::default()), Decision::Unauthorized);
-        assert_eq!(decide(&req("GET", STATUS_PATH, Some("anything")), "", Policy::default()), Decision::Unauthorized);
+        assert_eq!(
+            decide(&req("GET", STATUS_PATH, Some("")), "", Policy::default()),
+            Decision::Unauthorized
+        );
+        assert_eq!(
+            decide(&req("GET", STATUS_PATH, None), "", Policy::default()),
+            Decision::Unauthorized
+        );
+        assert_eq!(
+            decide(
+                &req("GET", STATUS_PATH, Some("anything")),
+                "",
+                Policy::default()
+            ),
+            Decision::Unauthorized
+        );
     }
 
     // ---- constant-time compare ----
@@ -537,11 +836,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn telemetry_preserves_last_events_and_groups_rejections() {
+        let telemetry = OpsTelemetry::default();
+        telemetry.record_template("http://127.0.0.1:20998", 42, 43, 43, 9, "ab".repeat(32));
+        telemetry.record_accepted_share("shared", "cd".repeat(32));
+        telemetry.record_rejection("stale-share");
+        telemetry.record_rejection("stale-share");
+        telemetry.record_block("rejected", "ef".repeat(32), "bad-root".to_string());
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.accepted, 1);
+        assert_eq!(snapshot.rejected, 2);
+        assert_eq!(snapshot.rejection_reasons.get("stale-share"), Some(&2));
+        assert_eq!(snapshot.daemon_blocks, 42);
+        assert_eq!(snapshot.daemon_headers, 43);
+        assert_eq!(snapshot.last_template_height, 43);
+        assert_eq!(snapshot.last_share.unwrap().kind, "shared");
+        assert_eq!(snapshot.last_block.unwrap().reason, "bad-root");
+    }
+
     // ---- parsing ----
 
     #[test]
     fn parses_method_path_and_bearer() {
-        let head = "GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok123\r\n\r\n";
+        let head =
+            "GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok123\r\n\r\n";
         let r = parse_request(head).unwrap();
         assert_eq!(r.method, "GET");
         assert_eq!(r.path, "/status");
@@ -551,7 +871,10 @@ mod tests {
     #[test]
     fn header_and_scheme_names_are_case_insensitive() {
         let head = "GET /status HTTP/1.1\r\nauthorization: bEaReR tok123\r\n\r\n";
-        assert_eq!(parse_request(head).unwrap().bearer.as_deref(), Some("tok123"));
+        assert_eq!(
+            parse_request(head).unwrap().bearer.as_deref(),
+            Some("tok123")
+        );
     }
 
     #[test]
@@ -633,17 +956,20 @@ async fn respond(sock: &mut TcpStream, decision: Decision, body: &str, head_only
 ///
 /// `snapshot` is called only for authorized requests, so an unauthorized
 /// caller cannot make the pool do work.
-pub async fn serve<F, A, Fut>(
+pub async fn serve<F, A, AFut, B, BFut>(
     listener: TcpListener,
     token: String,
     policy: Policy,
     snapshot: Arc<F>,
     apply_payout: Arc<A>,
+    apply_fee: Arc<B>,
 ) -> Result<()>
 where
     F: Fn() -> OpsStatus + Send + Sync + 'static,
-    A: Fn(String) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = std::result::Result<String, String>> + Send,
+    A: Fn(String) -> AFut + Send + Sync + 'static,
+    AFut: std::future::Future<Output = std::result::Result<String, String>> + Send,
+    B: Fn(u32) -> BFut + Send + Sync + 'static,
+    BFut: std::future::Future<Output = std::result::Result<u32, String>> + Send,
 {
     if token.is_empty() {
         anyhow::bail!("ops endpoint refuses to start without a token");
@@ -659,17 +985,36 @@ where
         let token = token.clone();
         let snapshot = snapshot.clone();
         let apply_payout = apply_payout.clone();
+        let apply_fee = apply_fee.clone();
         tokio::spawn(async move {
             let Some(raw) = read_head(&mut sock).await else {
-                respond(&mut sock, Decision::BadRequest, "{\"error\":\"bad request\"}", false).await;
+                respond(
+                    &mut sock,
+                    Decision::BadRequest,
+                    "{\"error\":\"bad request\"}",
+                    false,
+                )
+                .await;
                 return;
             };
             let Some((head, body_prefix)) = split_head_body(&raw) else {
-                respond(&mut sock, Decision::BadRequest, "{\"error\":\"bad request\"}", false).await;
+                respond(
+                    &mut sock,
+                    Decision::BadRequest,
+                    "{\"error\":\"bad request\"}",
+                    false,
+                )
+                .await;
                 return;
             };
             let Some(req) = parse_request(&head) else {
-                respond(&mut sock, Decision::BadRequest, "{\"error\":\"bad request\"}", false).await;
+                respond(
+                    &mut sock,
+                    Decision::BadRequest,
+                    "{\"error\":\"bad request\"}",
+                    false,
+                )
+                .await;
                 return;
             };
             let head_only = req.method.eq_ignore_ascii_case("HEAD");
@@ -686,8 +1031,13 @@ where
                         return;
                     };
                     let Some(body) = read_body(&mut sock, body_prefix, want).await else {
-                        respond(&mut sock, Decision::BadRequest, "{\"error\":\"short body\"}", false)
-                            .await;
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"short body\"}",
+                            false,
+                        )
+                        .await;
                         return;
                     };
                     let Some(addr) = parse_payout_body(&body) else {
@@ -715,8 +1065,53 @@ where
                         }
                         Err(why) => {
                             warn!(%peer, error = %why, "ops payout-address change REFUSED");
+                            let body = serde_json::json!({ "ok": false, "error": why }).to_string();
+                            respond(&mut sock, Decision::BadRequest, &body, false).await;
+                        }
+                    }
+                }
+                Decision::Serve if req.path == FEE_PATH => {
+                    let Some(want) = content_length(&head) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"Content-Length required, and must not exceed 1024\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(body) = read_body(&mut sock, body_prefix, want).await else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"short body\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(candidate) = parse_fee_body(&body) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"expected integral fee_bps from 0 through 10000\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    info!(%peer, fee_bps = candidate, "ops operator-fee change requested");
+                    match apply_fee(candidate).await {
+                        Ok(applied) => {
+                            info!(%peer, fee_bps = applied, "ops operator fee CHANGED");
                             let body =
-                                serde_json::json!({ "ok": false, "error": why }).to_string();
+                                serde_json::json!({"ok": true, "fee_bps": applied}).to_string();
+                            respond(&mut sock, Decision::Serve, &body, false).await;
+                        }
+                        Err(why) => {
+                            warn!(%peer, error = %why, "ops operator-fee change REFUSED");
+                            let body = serde_json::json!({"ok": false, "error": why}).to_string();
                             respond(&mut sock, Decision::BadRequest, &body, false).await;
                         }
                     }
@@ -737,8 +1132,8 @@ where
 
 /// Load the bearer token from a file, rejecting an empty one.
 pub fn load_token(path: &std::path::Path) -> Result<String> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading ops token {path:?}"))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading ops token {path:?}"))?;
     let token = raw.trim().to_string();
     if token.is_empty() {
         anyhow::bail!("ops token file {path:?} is empty");

@@ -14,8 +14,8 @@
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
 use dinero_sv2_pool::{
-    accounting, backend, block, dedup, job_generation, journal, mapper, ops, rpc,
-    shared_template, split, supervisor, target,
+    accounting, backend, block, dedup, job_generation, journal, mapper, ops, rpc, shared_template,
+    split, supervisor, target,
 };
 
 use std::net::SocketAddr;
@@ -68,11 +68,11 @@ use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry
 use crate::backend::BackendPool;
 use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
-use dinero_sv2_pool::payout;
 use crate::mapper::PoolTemplate;
 use crate::rpc::{Auth, RpcClient, SubmitBlockResult};
 use crate::shared_template::SharedTemplate;
 use crate::target::{hash_meets_target, leading_zero_bits_target, target_for_hashrate};
+use dinero_sv2_pool::{fee, payout};
 
 /// Bundle of the daemon-sourced solo template and (if it could be
 /// built this refresh) the pool-owned shared-mode variant. Sent as a
@@ -174,6 +174,14 @@ struct Args {
     /// come from the PPLNS window, which no ops route reaches.
     #[arg(long, default_value_t = false)]
     ops_allow_payout_change: bool,
+
+    /// Where a runtime-set operator fee is persisted across restarts.
+    #[arg(long, default_value = dinero_sv2_pool::fee::DEFAULT_PATH)]
+    shared_fee_bps_file: PathBuf,
+
+    /// Allow authenticated `POST /fee-bps` runtime fee changes. OFF by default.
+    #[arg(long, default_value_t = false)]
+    ops_allow_fee_change: bool,
 
     /// Tip-poll interval.
     #[arg(long, default_value_t = 2)]
@@ -401,6 +409,19 @@ async fn main() -> Result<()> {
         );
     }
     let (payout_tx, payout_rx) = watch::channel::<String>(payout_addr_str);
+    if args.shared_fee_bps > fee::MAX_BPS {
+        anyhow::bail!("--shared-fee-bps must be between 0 and 10000");
+    }
+    let (shared_fee_bps, fee_from_file) =
+        fee::resolve_startup(args.shared_fee_bps, &args.shared_fee_bps_file);
+    if fee_from_file {
+        info!(
+            fee_bps = shared_fee_bps,
+            path = %args.shared_fee_bps_file.display(),
+            "operator fee restored from disk (overrides --shared-fee-bps)"
+        );
+    }
+    let (fee_tx, fee_rx) = watch::channel::<u32>(shared_fee_bps);
 
     let (tx, rx) = watch::channel::<Option<Arc<TemplateBundle>>>(None);
 
@@ -412,6 +433,7 @@ async fn main() -> Result<()> {
     let mut template_producer = {
         let backends = backends.clone();
         let payout_rx = payout_rx.clone();
+        let fee_rx = fee_rx.clone();
         let poll = Duration::from_secs(args.poll_secs);
         let refresh_same_tip = if args.refresh_same_tip_secs == 0 {
             None
@@ -421,7 +443,6 @@ async fn main() -> Result<()> {
         // Renamed (not `window`) to avoid shadowing the `refresh_same_tip`
         // match arm's `window: Duration` binding a few lines below.
         let pplns_window = window.clone();
-        let shared_fee_bps = args.shared_fee_bps;
         let shared_max_outputs = args.shared_max_outputs;
         let shared_dust_una = args.shared_dust_una;
         let state_commitment_height = args.state_commitment_height;
@@ -595,7 +616,7 @@ async fn main() -> Result<()> {
                         };
                         let params = split::SplitParams {
                             reward_una: pt.coinbase_value_una,
-                            fee_bps: shared_fee_bps,
+                            fee_bps: *fee_rx.borrow(),
                             fee_script: &fee_script,
                             max_outputs: shared_max_outputs,
                             dust_una: shared_dust_una,
@@ -633,6 +654,14 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+                ops::telemetry().record_template(
+                    &backend.health.endpoint,
+                    backend.health.blocks,
+                    backend.health.headers,
+                    u64::from(pt.height),
+                    pt.wire.template_id,
+                    hex::encode(pt.wire.prev_block_hash),
+                );
                 let _ = tx.send(Some(Arc::new(TemplateBundle {
                     pt: pt.clone(),
                     shared_split,
@@ -660,7 +689,9 @@ async fn main() -> Result<()> {
         let ops_ledger = ledger.clone();
         let ops_heartbeat = heartbeat.clone();
         let ops_connected = connected_miners.clone();
-        let fee_bps = args.shared_fee_bps;
+        let ops_templates = rx.clone();
+        let stratum_bind = args.bind.to_string();
+        let ops_fee_rx = fee_rx.clone();
         let ops_payout_rx = payout_rx.clone();
         let snapshot = Arc::new(move || {
             let (entries, span, miners) = {
@@ -692,29 +723,55 @@ async fn main() -> Result<()> {
                 (w.len(), span, rows)
             };
             let credits = ops_ledger.snapshot();
+            let telemetry = ops::telemetry().snapshot();
+            const TEMPLATE_STALE_SECS: u64 = 120;
             ops::OpsStatus {
+                schema_version: 2,
+                generated_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
                 payout_address: ops_payout_rx.borrow().clone(),
                 pool_version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime_secs: started.elapsed().as_secs(),
-                fee_bps,
+                fee_bps: *ops_fee_rx.borrow(),
                 connected_miners: ops_connected.load(Ordering::Relaxed),
                 window_entries: entries,
                 window_span_secs: span,
                 template_heartbeat_age_secs: ops_heartbeat.age_secs(),
                 template_phase: ops_heartbeat.phase().as_str().to_string(),
-                accepted_shares_total: credits.values().map(|c| c.accepted_shares).sum(),
-                rejected_shares_total: credits.values().map(|c| c.rejected_shares).sum(),
+                accepted_shares_total: telemetry.accepted,
+                rejected_shares_total: telemetry.rejected,
                 blocks_found_total: credits.values().map(|c| c.found_blocks).sum(),
                 miners,
+                stratum_bind: stratum_bind.clone(),
+                daemon_connected: ops_templates.borrow().is_some()
+                    && ops_heartbeat.age_secs() <= TEMPLATE_STALE_SECS,
+                daemon_endpoint: telemetry.daemon_endpoint,
+                daemon_blocks: telemetry.daemon_blocks,
+                daemon_headers: telemetry.daemon_headers,
+                template_height: telemetry.last_template_height,
+                template_id: telemetry.last_template_id,
+                template_prev_hash: telemetry.last_template_hash,
+                last_template_at_unix: telemetry.last_template_at_unix,
+                last_share: telemetry.last_share,
+                last_block: telemetry.last_block,
+                rejection_reasons: telemetry.rejection_reasons,
             }
         });
         let policy = ops::Policy {
             allow_payout_change: args.ops_allow_payout_change,
+            allow_fee_change: args.ops_allow_fee_change,
         };
         if policy.allow_payout_change {
             warn!(
                 "ops endpoint accepts payout-address changes: the ops token can \
                  now redirect YOUR fee output (miners' payouts are unaffected)"
+            );
+        }
+        if policy.allow_fee_change {
+            warn!(
+                "ops endpoint accepts operator-fee changes: the ops token can alter YOUR fee percentage for future templates"
             );
         }
         let apply_backends = backends.clone();
@@ -749,8 +806,28 @@ async fn main() -> Result<()> {
                 Ok(candidate)
             }
         });
+        let apply_fee_path = args.shared_fee_bps_file.clone();
+        let apply_fee_tx = Arc::new(fee_tx);
+        let apply_fee = Arc::new(move |candidate: u32| {
+            let path = apply_fee_path.clone();
+            let tx = apply_fee_tx.clone();
+            async move {
+                if candidate > fee::MAX_BPS {
+                    return Err("operator fee must be between 0 and 10000 basis points".to_string());
+                }
+                if let Err(error) = fee::store(&path, candidate) {
+                    return Err(format!("could not persist the operator fee: {error}"));
+                }
+                if tx.send(candidate).is_err() {
+                    return Err("template producer is gone".to_string());
+                }
+                Ok(candidate)
+            }
+        });
         tokio::spawn(async move {
-            if let Err(e) = ops::serve(listener, token, policy, snapshot, apply_payout).await {
+            if let Err(e) =
+                ops::serve(listener, token, policy, snapshot, apply_payout, apply_fee).await
+            {
                 warn!(error = %e, "ops endpoint stopped");
             }
         });
@@ -1501,6 +1578,7 @@ async fn handle_share(
         Err(e) => {
             warn!(error = %e, "bad share shape");
             ledger.reject(miner_key);
+            ops::telemetry().record_rejection("invalid-payload");
             let err = SubmitSharesError {
                 channel_id,
                 sequence_number: *last_sequence_number,
@@ -1517,6 +1595,7 @@ async fn handle_share(
     let Some(pt) = current else {
         warn!("share received before any template");
         ledger.reject(miner_key);
+        ops::telemetry().record_rejection("no-template");
         let err = SubmitSharesError {
             channel_id,
             sequence_number: share.sequence_number,
@@ -1540,6 +1619,8 @@ async fn handle_share(
 
     if !meets_share {
         debug!(hash = %hex::encode(hash), "share below share-target");
+        ledger.reject(miner_key);
+        ops::telemetry().record_rejection("under-target");
         let err = SubmitSharesError {
             channel_id,
             sequence_number: share.sequence_number,
@@ -1557,11 +1638,18 @@ async fn handle_share(
     if !dedup.lock().expect("share dedup mutex").insert(hash) {
         warn!(hash = %hex::encode(hash), channel_id, "duplicate share rejected");
         ledger.reject(miner_key);
-        send_share_error(session, channel_id, share.sequence_number, "duplicate-share").await?;
+        send_share_error(
+            session,
+            channel_id,
+            share.sequence_number,
+            "duplicate-share",
+        )
+        .await?;
         return Ok(());
     }
 
     ledger.credit_share(miner_key);
+    ops::telemetry().record_accepted_share("standard", hex::encode(hash));
     *accepted_in_window += 1;
     info!(
         hash = %hex::encode(hash),
@@ -1599,6 +1687,7 @@ async fn handle_share(
                     "★ block accepted by dinerod"
                 );
                 ledger.credit_block(miner_key);
+                ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
             }
             Ok(SubmitBlockResult::Rejected(reason)) => {
                 warn!(
@@ -1606,9 +1695,11 @@ async fn handle_share(
                     hash = %hex::encode(hash),
                     "dinerod rejected our block"
                 );
+                ops::telemetry().record_block("rejected", hex::encode(hash), reason);
             }
             Err(e) => {
                 warn!(error = %e, "submitblock RPC failed");
+                ops::telemetry().record_block("error", hex::encode(hash), e.to_string());
             }
         }
     }
@@ -1719,7 +1810,13 @@ async fn handle_shared_share(
             "duplicate shared share rejected"
         );
         ledger.reject(miner_key);
-        send_share_error(session, channel_id, share.sequence_number, "duplicate-share").await?;
+        send_share_error(
+            session,
+            channel_id,
+            share.sequence_number,
+            "duplicate-share",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1740,6 +1837,7 @@ async fn handle_shared_share(
     }
 
     ledger.credit_share(miner_key);
+    ops::telemetry().record_accepted_share("shared", hex::encode(hash));
     *accepted_in_window += 1;
 
     info!(
@@ -1774,6 +1872,7 @@ async fn handle_shared_share(
                     "★ SHARED block ACCEPTED — split across contributors"
                 );
                 ledger.credit_block(miner_key);
+                ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
             }
             Ok(SubmitBlockResult::Rejected(reason)) => {
                 warn!(
@@ -1781,9 +1880,11 @@ async fn handle_shared_share(
                     hash = %hex::encode(hash),
                     "dinerod rejected our shared block"
                 );
+                ops::telemetry().record_block("rejected", hex::encode(hash), reason);
             }
             Err(e) => {
                 warn!(error = %e, "submitblock RPC failed (shared)");
+                ops::telemetry().record_block("error", hex::encode(hash), e.to_string());
             }
         }
     }
@@ -1815,6 +1916,7 @@ async fn handle_extended_share(
         Err(e) => {
             warn!(error = %e, "bad extended share shape");
             ledger.reject(miner_key);
+            ops::telemetry().record_rejection("invalid-payload");
             let err = SubmitSharesError {
                 channel_id,
                 sequence_number: *last_sequence_number,
@@ -2016,6 +2118,7 @@ async fn handle_extended_share(
     }
 
     ledger.credit_share(miner_key);
+    ops::telemetry().record_accepted_share("extended", hex::encode(hash));
     *accepted_in_window += 1;
     info!(
         hash = %hex::encode(hash),
@@ -2052,11 +2155,16 @@ async fn handle_extended_share(
                 Ok(SubmitBlockResult::Accepted) => {
                     info!("★ extended-share block ACCEPTED by dinerod");
                     ledger.credit_block(miner_key);
+                    ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
                 }
                 Ok(SubmitBlockResult::Rejected(reason)) => {
                     warn!(reason, "dinerod rejected our extended-share block");
+                    ops::telemetry().record_block("rejected", hex::encode(hash), reason);
                 }
-                Err(e) => warn!(error = %e, "submitblock RPC failed"),
+                Err(e) => {
+                    ops::telemetry().record_block("error", hex::encode(hash), e.to_string());
+                    warn!(error = %e, "submitblock RPC failed")
+                }
             },
             Err(e) => warn!(error = %e, "assemble_block_hex_raw failed"),
         }
@@ -2071,6 +2179,7 @@ async fn send_share_error(
     sequence_number: u32,
     code: &str,
 ) -> Result<()> {
+    ops::telemetry().record_rejection(code);
     let err = SubmitSharesError {
         channel_id,
         sequence_number,
@@ -2251,9 +2360,26 @@ mod cli_tests {
         let a = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
         assert!(!a.ops_allow_payout_change, "must default OFF");
         let b = Args::try_parse_from([
-            "pool", "--payout-address", "din1pxx", "--ops-allow-payout-change",
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--ops-allow-payout-change",
         ])
         .unwrap();
         assert!(b.ops_allow_payout_change);
+    }
+
+    #[test]
+    fn fee_change_is_off_unless_asked_for() {
+        let a = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
+        assert!(!a.ops_allow_fee_change, "must default OFF");
+        let b = Args::try_parse_from([
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--ops-allow-fee-change",
+        ])
+        .unwrap();
+        assert!(b.ops_allow_fee_change);
     }
 }
