@@ -18,7 +18,8 @@ Absent extension retains the old wire encoding. A present extension contains
 only the root; clients construct the canonical `6a25 DNRS 01 <32 bytes>` script.
 Updated decoders reject truncated or oversized extensions. Older strict
 decoders reject the extension instead of silently constructing invalid work.
-CPU and GPU SV2 solo clients therefore require updated binaries. Shared miners
+CPU and GPU SV2 solo clients therefore require the 0.2.9 binaries from this
+change (pool 0.1.4). Record source commit and SHA-256 as well as version. Shared miners
 grind pool-owned templates, but distributions should update all sidecars together.
 No new hardware kernel or hashing algorithm is required.
 
@@ -72,3 +73,12 @@ The previously observed SJ executable SHA-256 was
 Its deployed main.rs matched historical commit
 `55567f203a289f0192ccd1a8e2cc2e2046038de7`, but that file match does not establish
 complete binary build provenance. Do not label the old binary activation-ready.
+
+
+The live SJ source snapshot also contains older CPU/GPU clients that submit
+job ID zero; the current pool requires the actual job ID. Client rollout must
+precede the pool swap. Do not weaken stale-share rejection to accommodate old
+clients. A local executable named `~/.local/bin/dinero-miner` may actually be an
+SV2 client: inspect `--help`/`--version`, not only the filename. Direct core RPC
+CPU/Metal GPU binaries were separately verified mining enforced DNRS blocks and
+retaining identical tip/shielded state after daemon restart.
