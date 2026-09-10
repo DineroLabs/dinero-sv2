@@ -373,21 +373,15 @@ async fn main() -> Result<()> {
 
     // PPLNS shared-mode state: a rolling window of recent share credits
     // (14_400s target span) restored from the on-disk journal, plus the
-    // journal itself for ongoing appends. Losing the journal only costs
-    // unpaid share *credit* — never funds (see journal.rs).
-    let window = Arc::new(Mutex::new(PplnsWindow::restore(
-        WindowJournal::load(&args.pplns_journal).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                "PPLNS journal unreadable — starting with an empty window"
-            );
-            Vec::new()
-        }),
-        14_400,
-    )));
-    let journal = Arc::new(Mutex::new(
-        WindowJournal::open(&args.pplns_journal).context("opening PPLNS journal")?,
-    ));
+    // journal itself for ongoing appends. Recovery errors must not silently
+    // discard unpaid contribution credits.
+    let recovered = WindowJournal::recover(&args.pplns_journal, 14_400)
+        .context("recovering PPLNS journal; refusing to discard credits")?;
+    let mut recovered_journal = WindowJournal::open(&args.pplns_journal)?;
+    // Establish an explicit checkpoint before accepting any new shares.
+    recovered_journal.compact(&recovered.entries().cloned().collect::<Vec<_>>())?;
+    let window = Arc::new(Mutex::new(recovered));
+    let journal = Arc::new(Mutex::new(recovered_journal));
 
     // Payout address: file beats flag (see payout.rs). Held in a watch so the
     // template producer picks up a runtime change on its next iteration —
@@ -1727,9 +1721,6 @@ async fn handle_shared_share(
         return Ok(());
     }
 
-    ledger.credit_share(miner_key);
-    *accepted_in_window += 1;
-
     // Credit the PPLNS window + journal (amendment 5: SystemTime::now()
     // is fine in the pool binary).
     let weight = share_weight(&share_target);
@@ -1738,37 +1729,16 @@ async fn handle_shared_share(
         .unwrap_or_default()
         .as_secs();
     {
-        let mut w = window.lock().expect("pplns window mutex");
-        w.record(payout_script.to_vec(), weight, ts);
-    }
-    {
-        // Separate lock scope from `window` above: `journal.compact`
-        // used to take its own fresh `window` lock internally, so holding
-        // the first guard across this block would deadlock (std::sync::
-        // Mutex is not reentrant). It now takes a snapshot of entries
-        // instead (see below), so the window lock is only ever held
-        // briefly to clone the snapshot — never across the compact I/O
-        // (serialize + flush + rename of up to 50k entries), which would
-        // otherwise stall the template producer's own window lock and
-        // block SOLO job production.
+        // Serialize credit order with journal order. Keep the journal guard
+        // through compaction, but release the window guard before disk I/O.
         let mut j = journal.lock().expect("pplns journal mutex");
-        if let Err(e) = j.append(&WindowEntry {
-            payout_script: payout_script.to_vec(),
-            weight,
-            unix_ts: ts,
-        }) {
-            warn!(error = %e, "pplns journal append failed — window credit still live in memory");
-        }
-        if j.should_compact() {
-            let entries: Vec<WindowEntry> = {
-                let w = window.lock().expect("pplns window mutex");
-                w.entries().cloned().collect()
-            };
-            if let Err(e) = j.compact(&entries) {
-                warn!(error = %e, "pplns journal compact failed");
-            }
-        }
+        j.credit(window, &WindowEntry {
+            payout_script: payout_script.to_vec(), weight, unix_ts: ts,
+        }).context("persisting share credit")?;
     }
+
+    ledger.credit_share(miner_key);
+    *accepted_in_window += 1;
 
     info!(
         hash = %hex::encode(hash),
