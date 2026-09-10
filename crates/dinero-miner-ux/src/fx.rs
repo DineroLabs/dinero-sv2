@@ -56,6 +56,10 @@ pub struct FxScreen {
 }
 
 impl FxScreen {
+    pub fn set_mining_height(&self, height: Option<u64>) {
+        self.inner.lock().unwrap().window.mining_height = height;
+    }
+
     pub fn new(out: Box<dyn Write + Send>, cfg: FxConfig) -> Self {
         let mut window = FeedWindow::with_session(
             cfg.pool.clone(), cfg.reward_mode.clone(), cfg.threads, cfg.pinned,

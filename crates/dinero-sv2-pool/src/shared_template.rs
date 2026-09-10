@@ -22,6 +22,7 @@ use crate::mapper::PoolTemplate;
 /// final — the miner grinds nonce/timestamp/version only.
 #[derive(Debug)]
 pub struct SharedTemplate {
+    pub height: u32,
     /// Miner-facing wire message: `merkle_root` + `utreexo_root` are
     /// the pool's own recomputation over the split coinbase, not the
     /// daemon's original template values.
@@ -181,6 +182,7 @@ pub fn build_shared_template(
     };
 
     Ok(SharedTemplate {
+        height: pt.height,
         wire,
         coinbase_full_hex: hex::encode(full_coinbase),
         outputs,

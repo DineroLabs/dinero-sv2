@@ -1150,6 +1150,9 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
         .context("miner must report negotiated software versions")?;
     let versions: serde_json::Value = serde_json::from_str(version_line.trim_start_matches("[software_versions] "))?;
     assert_eq!(versions["pool_version"], env!("CARGO_PKG_VERSION"));
+    assert!(output.lines().filter_map(|line| line.strip_prefix("[job_height] "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|job| job["height"] == 2), "miner must receive the real mining height");
     assert!(versions["miner_version"].as_str().is_some_and(|s| !s.is_empty()));
     let hash = rpc.call_raw("getblockhash", serde_json::json!([2])).await?;
     let raw = rpc.call_raw("getblock", serde_json::json!([hash, 0])).await?;

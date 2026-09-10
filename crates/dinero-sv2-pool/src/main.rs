@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
     decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
-    decode_submit_shares_extended, encode_coinbase_context, encode_new_template,
+    decode_submit_shares_extended, encode_coinbase_context,
     encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
     encode_set_new_prev_hash, encode_set_target, encode_setup_connection_error,
     encode_submit_shares_error, encode_submit_shares_success,
@@ -923,7 +923,7 @@ async fn serve_miner(
             MSG_SETUP_CONNECTION_SUCCESS,
             &dinero_sv2_codec::sv2::encode_setup_success_with_pool_version(&SetupConnectionSuccess {
                 used_version: PROTOCOL_VERSION,
-                flags: 0,
+                flags: setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
             }, setup.flags, env!("CARGO_PKG_VERSION"))?,
         )
         .await?;
@@ -1090,11 +1090,11 @@ async fn serve_miner(
                 if let Some(st) =
                     derive_channel_shared(&bundle, channel_id, utreexo_maturity_leaf_height)
                 {
-                    push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
+                    push_shared_job(&mut session, channel_id, &st, &window, payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                     current_shared = Some(st);
                 }
             }
-            None => push_job(&mut session, channel_id, &bundle.pt).await?,
+            None => push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?,
         }
         current = Some(bundle);
     }
@@ -1143,7 +1143,7 @@ async fn serve_miner(
                             // the old merkle_root/mempool set), silently
                             // failing valid — even block-worthy — shares.
                             if bundle.solo_changed {
-                                push_job(&mut session, channel_id, &bundle.pt).await?;
+                                push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                 current = Some(bundle);
                             }
                         }
@@ -1157,7 +1157,7 @@ async fn serve_miner(
                                 channel_id,
                                 utreexo_maturity_leaf_height,
                             ) {
-                                push_shared_job(&mut session, channel_id, &st, &window, payout_script).await?;
+                                push_shared_job(&mut session, channel_id, &st, &window, payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                 current_shared = Some(st);
                                 // Keep the daemon-derived block target paired
                                 // with the exact per-channel template that was
@@ -1266,7 +1266,7 @@ async fn serve_miner(
                                             channel_id,
                                             utreexo_maturity_leaf_height,
                                         ) {
-                                            push_shared_job(&mut session, channel_id, &st, &window, &m.payout_script).await?;
+                                            push_shared_job(&mut session, channel_id, &st, &window, &m.payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                             current_shared = Some(st);
                                         }
                                     }
@@ -1390,6 +1390,7 @@ async fn push_job(
     session: &mut NoiseSession<TcpStream>,
     channel_id: u32,
     pt: &PoolTemplate,
+    height_enabled: bool,
 ) -> Result<()> {
     let snph = SetNewPrevHash {
         channel_id,
@@ -1424,7 +1425,7 @@ async fn push_job(
         session.write_frame(MSG_COINBASE_CONTEXT, &payload).await?;
     }
 
-    let payload = encode_new_template(&pt.wire);
+    let payload = dinero_sv2_codec::encode_job_height(&pt.wire, height_enabled.then_some(pt.height));
     session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
     debug!(
         template_id = pt.wire.template_id,
@@ -1446,6 +1447,7 @@ async fn push_shared_job(
     st: &SharedTemplate,
     window: &Arc<Mutex<PplnsWindow>>,
     payout_script: &[u8],
+    height_enabled: bool,
 ) -> Result<()> {
     let snph = SetNewPrevHash {
         channel_id,
@@ -1457,7 +1459,7 @@ async fn push_shared_job(
         .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
         .await?;
     session
-        .write_frame(MSG_NEW_MINING_JOB, &encode_new_template(&st.wire))
+        .write_frame(MSG_NEW_MINING_JOB, &dinero_sv2_codec::encode_job_height(&st.wire, height_enabled.then_some(st.height)))
         .await?;
     let (bps, shares) = {
         let w = window.lock().expect("pplns window mutex");

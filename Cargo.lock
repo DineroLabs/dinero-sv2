@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "dinero-sv2-gpu-miner"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "dinero-sv2-miner"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "dinero-sv2-pool"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",

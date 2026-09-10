@@ -112,8 +112,10 @@ pub fn decode_setup_connection_success(
     })
 }
 
-/// Dinero capability: request a pool software version in SetupConnectionSuccess.
-/// Legacy peers continue to exchange the original six-byte response.
+/// Negotiate a u32 mining-height trailer on each job.
+pub const FLAG_JOB_HEIGHT: u32 = 1 << 30;
+
+/// Request a pool software version; legacy peers retain the six-byte response.
 pub const FLAG_POOL_VERSION: u32 = 1 << 31;
 
 fn valid_pool_version(version: &[u8]) -> bool {
