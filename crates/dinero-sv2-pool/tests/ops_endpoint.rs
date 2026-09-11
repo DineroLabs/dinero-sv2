@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 fn canned() -> OpsStatus {
     OpsStatus {
         schema_version: 2,
+        schema_min_compatible: 2,
         generated_at_unix: 1_700_000_000,
         payout_address: "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy".into(),
         pool_version: "test".into(),
@@ -130,6 +131,39 @@ async fn post_json(addr: &str, path: &str, body: &str) -> String {
 }
 
 // ---- bans over the wire ----
+
+// The compatibility declaration is what lets a future bump happen
+// without taking every deployed wallet's Pool tab offline, so it has to
+// actually reach the wire.
+#[tokio::test]
+async fn status_declares_what_clients_can_still_read_it() {
+    let addr = start().await;
+    let resp = raw(
+        &addr,
+        "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\n\r\n",
+    )
+    .await;
+    let body = resp.split("\r\n\r\n").nth(1).unwrap();
+    let raw_json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(raw_json["schema_version"], 2);
+    assert_eq!(raw_json["schema_min_compatible"], 2);
+}
+
+// A payload from a pool predating the field is schema 2 and additive
+// only, so reading it as "compatible back to 2" is the truth rather
+// than an optimistic default.
+#[tokio::test]
+async fn a_payload_without_the_declaration_reads_as_compatible_with_two() {
+    let without = r#"{"schema_version":2,"generated_at_unix":1,"pool_version":"x","uptime_secs":1,
+        "fee_bps":0,"payout_address":"a","connected_miners":0,"window_entries":0,
+        "window_span_secs":0,"template_heartbeat_age_secs":0,"template_phase":"p",
+        "accepted_shares_total":0,"rejected_shares_total":0,"blocks_found_total":0,"miners":[],
+        "stratum_bind":"s","daemon_connected":true,"daemon_endpoint":"e","daemon_blocks":0,
+        "daemon_headers":0,"template_height":0,"template_id":0,"template_prev_hash":"h",
+        "last_template_at_unix":0,"last_share":null,"last_block":null,"rejection_reasons":{}}"#;
+    let parsed: OpsStatus = serde_json::from_str(without).expect("older payload still parses");
+    assert_eq!(parsed.schema_min_compatible, 2);
+}
 
 #[tokio::test]
 async fn a_ban_is_refused_unless_the_operator_enabled_it() {

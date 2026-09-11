@@ -744,6 +744,10 @@ async fn main() -> Result<()> {
             const TEMPLATE_STALE_SECS: u64 = 120;
             ops::OpsStatus {
                 schema_version: 2,
+                // `bans` was added without a bump because it is additive.
+                // This stays 2 until something is removed, renamed, or
+                // given a new meaning.
+                schema_min_compatible: 2,
                 generated_at_unix: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

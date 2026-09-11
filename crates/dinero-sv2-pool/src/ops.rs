@@ -211,6 +211,13 @@ pub fn telemetry() -> &'static OpsTelemetry {
     TELEMETRY.get_or_init(OpsTelemetry::default)
 }
 
+/// What a payload with no `schema_min_compatible` should be read as.
+/// Every pool that predates the field is schema 2 and additive-only, so
+/// 2 is the truthful answer for them.
+fn default_min_compatible() -> u32 {
+    2
+}
+
 /// Everything the endpoint reports. Purely descriptive — a consumer
 /// that wants *earnings* should read the chain, not this.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -218,6 +225,20 @@ pub struct OpsStatus {
     /// Monotonic contract version for strict consumers. Fields from v1 remain
     /// present so older Qt releases continue to work.
     pub schema_version: u32,
+    /// The oldest client this payload is still readable by.
+    ///
+    /// `schema_version` says what this pool IS; it cannot tell a consumer
+    /// whether a bump was additive. Only the pool knows that, so it says
+    /// so here and a client compares against its own schema rather than
+    /// guessing.
+    ///
+    /// Adding fields keeps this at 2 and every deployed wallet keeps
+    /// working. Removing, renaming, or REINTERPRETING one — a field
+    /// keeping its name and type while changing meaning, which no field
+    /// validation catches — must raise it, so older clients refuse the
+    /// payload instead of rendering it wrong.
+    #[serde(default = "default_min_compatible")]
+    pub schema_min_compatible: u32,
     pub generated_at_unix: u64,
     pub pool_version: String,
     pub uptime_secs: u64,
