@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use dinero_sv2_pool::bans::{BanList, MAX_BAN_SECS};
 use dinero_sv2_pool::ops::{self, MinerStatus, OpsStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,6 +15,7 @@ use tokio::net::TcpStream;
 fn canned() -> OpsStatus {
     OpsStatus {
         schema_version: 2,
+        schema_min_compatible: Some(2),
         generated_at_unix: 1_700_000_000,
         payout_address: "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy".into(),
         pool_version: "test".into(),
@@ -44,10 +46,25 @@ fn canned() -> OpsStatus {
         last_share: None,
         last_block: None,
         rejection_reasons: BTreeMap::new(),
+        bans: Vec::new(),
     }
 }
 
 async fn start_with(policy: ops::Policy) -> String {
+    start_with_bans(policy, Arc::new(BanList::default()))
+        .await
+        .0
+}
+
+/// Serves with a ban list the caller keeps a handle on, so a test can
+/// check that a ban placed over HTTP is visible to the enforcement path
+/// — that shared handle is the wiring most likely to break.
+async fn start_with_bans(policy: ops::Policy, bans: Arc<BanList>) -> (String, Arc<BanList>) {
+    let addr = spawn_server(policy, bans.clone()).await;
+    (addr, bans)
+}
+
+async fn spawn_server(policy: ops::Policy, bans: Arc<BanList>) -> String {
     let listener = ops::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let snapshot = Arc::new(canned);
@@ -61,6 +78,14 @@ async fn start_with(policy: ops::Policy) -> String {
         }
     });
     let apply_fee = Arc::new(|fee: u32| async move { Ok(fee) });
+    // The status closure reads the same list the routes write, so /status
+    // reflects a ban the moment it is placed.
+    let status_bans = bans.clone();
+    let snapshot = Arc::new(move || {
+        let mut status = snapshot();
+        status.bans = status_bans.active(now_unix());
+        status
+    });
     tokio::spawn(async move {
         let _ = ops::serve(
             listener,
@@ -69,10 +94,226 @@ async fn start_with(policy: ops::Policy) -> String {
             snapshot,
             apply,
             apply_fee,
+            bans,
         )
         .await;
     });
     addr
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn start_ban_open() -> (String, Arc<BanList>) {
+    start_with_bans(
+        ops::Policy {
+            allow_ban: true,
+            ..ops::Policy::default()
+        },
+        Arc::new(BanList::default()),
+    )
+    .await
+}
+
+async fn post_json(addr: &str, path: &str, body: &str) -> String {
+    raw(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await
+}
+
+// ---- bans over the wire ----
+
+// The compatibility declaration is what lets a future bump happen
+// without taking every deployed wallet's Pool tab offline, so it has to
+// actually reach the wire.
+#[tokio::test]
+async fn status_declares_what_clients_can_still_read_it() {
+    let addr = start().await;
+    let resp = raw(
+        &addr,
+        "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\n\r\n",
+    )
+    .await;
+    let body = resp.split("\r\n\r\n").nth(1).unwrap();
+    let raw_json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(raw_json["schema_version"], 2);
+    assert_eq!(raw_json["schema_min_compatible"], 2);
+}
+
+// A payload from a pool predating the field is schema 2 and additive
+// only, so reading it as "compatible back to 2" is the truth rather
+// than an optimistic default.
+#[tokio::test]
+async fn a_payload_without_the_declaration_reads_as_compatible_with_two() {
+    let without = r#"{"schema_version":2,"generated_at_unix":1,"pool_version":"x","uptime_secs":1,
+        "fee_bps":0,"payout_address":"a","connected_miners":0,"window_entries":0,
+        "window_span_secs":0,"template_heartbeat_age_secs":0,"template_phase":"p",
+        "accepted_shares_total":0,"rejected_shares_total":0,"blocks_found_total":0,"miners":[],
+        "stratum_bind":"s","daemon_connected":true,"daemon_endpoint":"e","daemon_blocks":0,
+        "daemon_headers":0,"template_height":0,"template_id":0,"template_prev_hash":"h",
+        "last_template_at_unix":0,"last_share":null,"last_block":null,"rejection_reasons":{}}"#;
+    let parsed: OpsStatus = serde_json::from_str(without).expect("older payload still parses");
+    // Absence stays absence. A schema-2 payload is readable by a
+    // schema-2 client on the strength of the version alone.
+    assert_eq!(parsed.schema_min_compatible, None);
+    assert!(parsed.readable_by(2));
+}
+
+// The hole a default would reopen: a pool that bumped to 3 without
+// saying whether it stayed compatible must NOT read as readable by a
+// schema-2 client. Exercised through real deserialization, because a
+// serde default is exactly where this would come back.
+#[tokio::test]
+async fn an_undeclared_newer_payload_is_not_readable_by_an_older_client() {
+    let raw_json = r#"{"schema_version":3,"generated_at_unix":1,"pool_version":"x","uptime_secs":1,
+        "fee_bps":0,"payout_address":"a","connected_miners":0,"window_entries":0,
+        "window_span_secs":0,"template_heartbeat_age_secs":0,"template_phase":"p",
+        "accepted_shares_total":0,"rejected_shares_total":0,"blocks_found_total":0,"miners":[],
+        "stratum_bind":"s","daemon_connected":true,"daemon_endpoint":"e","daemon_blocks":0,
+        "daemon_headers":0,"template_height":0,"template_id":0,"template_prev_hash":"h",
+        "last_template_at_unix":0,"last_share":null,"last_block":null,"rejection_reasons":{}}"#;
+    let parsed: OpsStatus = serde_json::from_str(raw_json).expect("parses");
+    assert_eq!(parsed.schema_min_compatible, None, "absence must survive parsing");
+    assert!(
+        !parsed.readable_by(2),
+        "an undeclared schema-3 payload must not claim compatibility it never stated"
+    );
+    assert!(parsed.readable_by(3), "a client of its own schema can read it");
+}
+
+#[tokio::test]
+async fn a_declared_newer_payload_is_readable_by_the_clients_it_names() {
+    let with = |min: &str| {
+        format!(
+            r#"{{"schema_version":3,"schema_min_compatible":{min},"generated_at_unix":1,
+            "pool_version":"x","uptime_secs":1,"fee_bps":0,"payout_address":"a",
+            "connected_miners":0,"window_entries":0,"window_span_secs":0,
+            "template_heartbeat_age_secs":0,"template_phase":"p","accepted_shares_total":0,
+            "rejected_shares_total":0,"blocks_found_total":0,"miners":[],"stratum_bind":"s",
+            "daemon_connected":true,"daemon_endpoint":"e","daemon_blocks":0,"daemon_headers":0,
+            "template_height":0,"template_id":0,"template_prev_hash":"h",
+            "last_template_at_unix":0,"last_share":null,"last_block":null,
+            "rejection_reasons":{{}}}}"#
+        )
+    };
+    let additive: OpsStatus = serde_json::from_str(&with("2")).expect("parses");
+    assert!(additive.readable_by(2), "an additive bump stays readable");
+
+    let breaking: OpsStatus = serde_json::from_str(&with("3")).expect("parses");
+    assert!(!breaking.readable_by(2), "a breaking change locks out older clients");
+    assert!(breaking.readable_by(3));
+}
+
+// An older pool than the client is unreadable regardless of what it
+// declares: the fields the client needs are not there.
+#[tokio::test]
+async fn an_older_payload_is_not_readable_by_a_newer_client() {
+    let status = canned();
+    assert!(!status.readable_by(3));
+    assert!(status.readable_by(2));
+}
+
+#[tokio::test]
+async fn a_ban_is_refused_unless_the_operator_enabled_it() {
+    let addr = start().await;
+    let resp = post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":3600}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+}
+
+#[tokio::test]
+async fn a_ban_takes_effect_and_shows_up_in_status() {
+    let (addr, bans) = start_ban_open().await;
+    let target = vec![0x51, 0x20, 0xaa];
+
+    assert!(!bans.is_banned(&target, now_unix()));
+
+    let resp = post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":3600}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+    let body = resp.split("\r\n\r\n").nth(1).unwrap();
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["expires_in_secs"], 3600);
+
+    // The enforcement path consults this same list.
+    assert!(bans.is_banned(&target, now_unix()));
+
+    let status = raw(
+        &addr,
+        "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-abc\r\n\r\n",
+    )
+    .await;
+    let parsed: OpsStatus = serde_json::from_str(status.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(parsed.bans.len(), 1);
+    assert_eq!(parsed.bans[0].target_hex, "5120aa");
+    assert!(parsed.bans[0].expires_in_secs > 3590);
+}
+
+#[tokio::test]
+async fn unban_lifts_it_and_says_whether_there_was_one() {
+    let (addr, bans) = start_ban_open().await;
+    let target = vec![0x51, 0x20, 0xaa];
+    post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":3600}"#).await;
+
+    let resp = post_json(&addr, "/unban", r#"{"target":"5120aa"}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+    let json: serde_json::Value =
+        serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["lifted"], true);
+    assert!(!bans.is_banned(&target, now_unix()));
+
+    // A second unban found nothing. Reported honestly rather than as a
+    // success, because it usually means a mistyped target.
+    let again = post_json(&addr, "/unban", r#"{"target":"5120aa"}"#).await;
+    let json: serde_json::Value =
+        serde_json::from_str(again.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["lifted"], false);
+}
+
+// A duration is mandatory, and the two bounds are refused with messages
+// that say which one was crossed.
+#[tokio::test]
+async fn a_ban_without_a_valid_duration_is_refused() {
+    let (addr, bans) = start_ban_open().await;
+
+    let no_duration = post_json(&addr, "/ban", r#"{"target":"5120aa"}"#).await;
+    assert!(
+        no_duration.starts_with("HTTP/1.1 400"),
+        "got: {no_duration}"
+    );
+
+    let zero = post_json(&addr, "/ban", r#"{"target":"5120aa","seconds":0}"#).await;
+    assert!(zero.starts_with("HTTP/1.1 400"), "got: {zero}");
+    assert!(zero.contains("/unban"), "should point at the right route");
+
+    let too_long = post_json(
+        &addr,
+        "/ban",
+        &format!(r#"{{"target":"5120aa","seconds":{}}}"#, MAX_BAN_SECS + 1),
+    )
+    .await;
+    assert!(too_long.starts_with("HTTP/1.1 400"), "got: {too_long}");
+    assert!(too_long.contains("temporary"), "got: {too_long}");
+
+    assert!(
+        !bans.is_banned(&[0x51, 0x20, 0xaa], now_unix()),
+        "no refused request may leave a ban behind"
+    );
+}
+
+#[tokio::test]
+async fn a_ban_target_that_is_not_hex_is_refused() {
+    let (addr, _bans) = start_ban_open().await;
+    let resp = post_json(&addr, "/ban", r#"{"target":"nothex","seconds":60}"#).await;
+    assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
 }
 
 async fn start() -> String {
@@ -224,6 +465,7 @@ async fn serve_refuses_to_start_without_a_token() {
         Arc::new(canned),
         Arc::new(|a: String| async move { Ok(a) }),
         Arc::new(|fee: u32| async move { Ok(fee) }),
+        Arc::new(BanList::default()),
     )
     .await
     .unwrap_err();

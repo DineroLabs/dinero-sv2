@@ -53,6 +53,17 @@ pub const PAYOUT_PATH: &str = "/payout-address";
 /// Mutating route: set the operator fee for future templates.
 pub const FEE_PATH: &str = "/fee-bps";
 
+/// Enforcement routes: refuse, or resume, serving work to one payout
+/// script. Gated behind `Policy::allow_ban` — OFF by default, because a
+/// token that can read status should not silently be able to stop a
+/// miner earning.
+///
+/// Neither route touches the PPLNS window. A banned contributor keeps
+/// every share they have already contributed and is still paid for them
+/// on the next block; the ban only declines FUTURE work.
+pub const BAN_PATH: &str = "/ban";
+pub const UNBAN_PATH: &str = "/unban";
+
 /// Cap on a request body. The only body we accept is a one-field JSON
 /// object holding an address, so anything larger is a mistake or an attack.
 pub const MAX_BODY_BYTES: usize = 1024;
@@ -66,6 +77,10 @@ pub struct Policy {
     pub allow_payout_change: bool,
     /// `--ops-allow-fee-change`. Also OFF by default.
     pub allow_fee_change: bool,
+    /// `--ops-allow-ban`. Also OFF by default. Independent of the two
+    /// above: enabling enforcement must not enable money routing, and
+    /// enabling money routing must not enable enforcement.
+    pub allow_ban: bool,
 }
 
 /// One contributor's standing in the PPLNS window.
@@ -203,6 +218,26 @@ pub struct OpsStatus {
     /// Monotonic contract version for strict consumers. Fields from v1 remain
     /// present so older Qt releases continue to work.
     pub schema_version: u32,
+    /// The oldest client this payload is still readable by.
+    ///
+    /// `schema_version` says what this pool IS; it cannot tell a consumer
+    /// whether a bump was additive. Only the pool knows that, so it says
+    /// so here and a client compares against its own schema rather than
+    /// guessing.
+    ///
+    /// Adding fields keeps this at 2 and every deployed wallet keeps
+    /// working. Removing, renaming, or REINTERPRETING one — a field
+    /// keeping its name and type while changing meaning, which no field
+    /// validation catches — must raise it, so older clients refuse the
+    /// payload instead of rendering it wrong.
+    /// `None` means the pool did not say. That is NOT the same as
+    /// saying 2: defaulting a missing declaration would report
+    /// "compatible" on behalf of a pool that never claimed it, and a
+    /// schema-3 payload with no declaration would then be read as
+    /// readable by schema-2 clients — recreating the exact hole this
+    /// field closes. Absence is represented as absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_min_compatible: Option<u32>,
     pub generated_at_unix: u64,
     pub pool_version: String,
     pub uptime_secs: u64,
@@ -235,6 +270,38 @@ pub struct OpsStatus {
     pub last_share: Option<RecentShare>,
     pub last_block: Option<RecentBlock>,
     pub rejection_reasons: BTreeMap<String, u64>,
+    /// Bans currently in force, soonest expiry first. Additive at schema
+    /// 2 rather than a version bump: a strict consumer pinned to 2 keeps
+    /// working and simply ignores the field, and bumping would lock out
+    /// every deployed client that checks for equality. The version moves
+    /// once a tolerant client is actually in the field.
+    #[serde(default)]
+    pub bans: Vec<crate::bans::BanStatus>,
+}
+
+impl OpsStatus {
+    /// Whether a client written against `client_schema` can read this
+    /// payload.
+    ///
+    /// Older than the client is unreadable. Equal is readable. Newer is
+    /// readable only on the pool's own word — an undeclared newer
+    /// payload is refused, because silence is not a promise and
+    /// assuming otherwise renders a reinterpreted field as though its
+    /// meaning had not changed.
+    ///
+    /// The one exception is a payload at exactly the client's schema
+    /// with no declaration: every pool predating the field is schema 2
+    /// and additive-only, so that IS readable — and it is the only case
+    /// where absence can be safely interpreted at all.
+    pub fn readable_by(&self, client_schema: u32) -> bool {
+        if self.schema_version < client_schema {
+            return false;
+        }
+        match self.schema_min_compatible {
+            Some(min) => min <= client_schema,
+            None => self.schema_version == client_schema,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +429,18 @@ pub fn decide(req: &Request, expected_token: &str, policy: Policy) -> Decision {
             }
             Decision::Serve
         }
+        BAN_PATH | UNBAN_PATH => {
+            // Method before policy, as above: a GET here is wrong whether
+            // or not the operator enabled bans, and 405 keeps the two
+            // mistakes distinguishable in a log.
+            if req.method != "POST" {
+                return Decision::MethodNotAllowed;
+            }
+            if !policy.allow_ban {
+                return Decision::Forbidden;
+            }
+            Decision::Serve
+        }
         _ => Decision::NotFound,
     }
 }
@@ -377,6 +456,35 @@ pub fn parse_payout_body(body: &str) -> Option<String> {
 }
 
 /// Extract an exact integral basis-point value from `{"fee_bps": 500}`.
+/// `{"target":"<hex>","seconds":N}`.
+///
+/// The duration has no default. An omitted `seconds` is the mistake that
+/// would otherwise become a permanent ban, so it is a parse failure
+/// rather than something to fill in.
+///
+/// Range is NOT checked here — `BanList::ban` owns the bounds and its
+/// error says which one was crossed, which is more useful to an operator
+/// than a bare 400.
+pub fn parse_ban_body(body: &str) -> Option<(String, u64)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let target = v.get("target")?.as_str()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let seconds = v.get("seconds")?.as_u64()?;
+    Some((target.to_string(), seconds))
+}
+
+/// `{"target":"<hex>"}`.
+pub fn parse_unban_body(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let target = v.get("target")?.as_str()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(target.to_string())
+}
+
 pub fn parse_fee_body(body: &str) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let fee = value.get("fee_bps")?.as_u64()?;
@@ -452,6 +560,135 @@ mod tests {
             allow_payout_change: true,
             ..Policy::default()
         }
+    }
+
+    // ---- ban routes: gating ----
+    //
+    // Same posture as the money-routing verbs: refusing to serve a miner
+    // is an enforcement power, and a read credential must not silently
+    // become one.
+
+    fn ban_open() -> Policy {
+        Policy {
+            allow_ban: true,
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn banning_is_refused_when_not_enabled() {
+        for path in [BAN_PATH, UNBAN_PATH] {
+            assert_eq!(
+                decide(
+                    &req("POST", path, Some("s3cret")),
+                    "s3cret",
+                    Policy::default()
+                ),
+                Decision::Forbidden,
+                "{path} must be off by default"
+            );
+        }
+    }
+
+    #[test]
+    fn banning_is_served_when_enabled() {
+        for path in [BAN_PATH, UNBAN_PATH] {
+            assert_eq!(
+                decide(&req("POST", path, Some("s3cret")), "s3cret", ban_open()),
+                Decision::Serve
+            );
+        }
+    }
+
+    // Enabling bans must not turn on the money verbs, and vice versa.
+    #[test]
+    fn the_ban_flag_does_not_unlock_the_payout_or_fee_routes() {
+        assert_eq!(
+            decide(
+                &req("POST", PAYOUT_PATH, Some("s3cret")),
+                "s3cret",
+                ban_open()
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(&req("POST", FEE_PATH, Some("s3cret")), "s3cret", ban_open()),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(&req("POST", BAN_PATH, Some("s3cret")), "s3cret", open()),
+            Decision::Forbidden
+        );
+    }
+
+    #[test]
+    fn ban_routes_reject_non_post_before_checking_policy() {
+        for path in [BAN_PATH, UNBAN_PATH] {
+            for method in ["GET", "PUT", "DELETE"] {
+                assert_eq!(
+                    decide(&req(method, path, Some("s3cret")), "s3cret", ban_open()),
+                    Decision::MethodNotAllowed,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    // Auth is still checked before routing, so a caller with a bad token
+    // cannot discover that this pool has bans enabled.
+    #[test]
+    fn a_bad_token_cannot_probe_for_the_ban_routes() {
+        assert_eq!(
+            decide(&req("POST", BAN_PATH, Some("wrong")), "s3cret", ban_open()),
+            Decision::Unauthorized
+        );
+    }
+
+    // ---- ban bodies ----
+
+    #[test]
+    fn a_ban_body_carries_a_target_and_a_duration() {
+        assert_eq!(
+            parse_ban_body(r#"{"target":"512001","seconds":3600}"#),
+            Some(("512001".to_string(), 3600))
+        );
+    }
+
+    // Omitting the duration is the mistake that would otherwise become a
+    // permanent ban. There is no default: say how long.
+    #[test]
+    fn a_ban_body_without_a_duration_is_rejected() {
+        assert_eq!(parse_ban_body(r#"{"target":"512001"}"#), None);
+        assert_eq!(parse_ban_body(r#"{"seconds":3600}"#), None);
+        assert_eq!(parse_ban_body(r#"{"target":"","seconds":3600}"#), None);
+        assert_eq!(parse_ban_body("not json"), None);
+    }
+
+    // Bounds are the ban module's to enforce, so a negative or absurd
+    // duration must not be silently coerced into a valid one here.
+    #[test]
+    fn a_ban_body_does_not_coerce_an_impossible_duration() {
+        assert_eq!(parse_ban_body(r#"{"target":"512001","seconds":-5}"#), None);
+        assert_eq!(
+            parse_ban_body(r#"{"target":"512001","seconds":"3600"}"#),
+            None
+        );
+        // Out-of-range durations parse; `BanList::ban` refuses them with a
+        // message that says which bound was crossed.
+        assert_eq!(
+            parse_ban_body(r#"{"target":"512001","seconds":0}"#),
+            Some(("512001".to_string(), 0))
+        );
+    }
+
+    #[test]
+    fn an_unban_body_carries_only_a_target() {
+        assert_eq!(
+            parse_unban_body(r#"{"target":"512001"}"#),
+            Some("512001".to_string())
+        );
+        assert_eq!(parse_unban_body(r#"{"target":""}"#), None);
+        assert_eq!(parse_unban_body("{}"), None);
     }
 
     #[test]
@@ -963,6 +1200,11 @@ pub async fn serve<F, A, AFut, B, BFut>(
     snapshot: Arc<F>,
     apply_payout: Arc<A>,
     apply_fee: Arc<B>,
+    // Passed as data rather than as another closure: a ban needs no
+    // async validation the way a payout address does (which is proven
+    // against a real template before adoption), so a callback would add
+    // indirection without adding a check.
+    bans: Arc<crate::bans::BanList>,
 ) -> Result<()>
 where
     F: Fn() -> OpsStatus + Send + Sync + 'static,
@@ -986,6 +1228,7 @@ where
         let snapshot = snapshot.clone();
         let apply_payout = apply_payout.clone();
         let apply_fee = apply_fee.clone();
+        let bans = bans.clone();
         tokio::spawn(async move {
             let Some(raw) = read_head(&mut sock).await else {
                 respond(
@@ -1112,6 +1355,110 @@ where
                         Err(why) => {
                             warn!(%peer, error = %why, "ops operator-fee change REFUSED");
                             let body = serde_json::json!({"ok": false, "error": why}).to_string();
+                            respond(&mut sock, Decision::BadRequest, &body, false).await;
+                        }
+                    }
+                }
+                Decision::Serve if req.path == BAN_PATH || req.path == UNBAN_PATH => {
+                    let Some(want) = content_length(&head) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"Content-Length required, and must not exceed 1024\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(body) = read_body(&mut sock, body_prefix, want).await else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"short body\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    if req.path == UNBAN_PATH {
+                        let Some(target_hex) = parse_unban_body(&body) else {
+                            respond(
+                                &mut sock,
+                                Decision::BadRequest,
+                                "{\"error\":\"expected {\\\"target\\\": \\\"<hex payout script>\\\"}\"}",
+                                false,
+                            )
+                            .await;
+                            return;
+                        };
+                        let target = match crate::bans::decode_target(&target_hex) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let body = serde_json::json!({"ok": false, "error": e.message()})
+                                    .to_string();
+                                respond(&mut sock, Decision::BadRequest, &body, false).await;
+                                return;
+                            }
+                        };
+                        let lifted = bans.unban(&target);
+                        info!(%peer, target = %target_hex, lifted, "ops ban LIFTED");
+                        let body = serde_json::json!({
+                            "ok": true,
+                            "target": target_hex,
+                            // False means nothing was banned — usually a
+                            // mistyped target, and the operator should be
+                            // told rather than reassured.
+                            "lifted": lifted
+                        })
+                        .to_string();
+                        respond(&mut sock, Decision::Serve, &body, false).await;
+                        return;
+                    }
+
+                    let Some((target_hex, seconds)) = parse_ban_body(&body) else {
+                        respond(
+                            &mut sock,
+                            Decision::BadRequest,
+                            "{\"error\":\"expected {\\\"target\\\": \\\"<hex payout script>\\\", \\\"seconds\\\": N}; there is no default duration\"}",
+                            false,
+                        )
+                        .await;
+                        return;
+                    };
+                    let target = match crate::bans::decode_target(&target_hex) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let body =
+                                serde_json::json!({"ok": false, "error": e.message()}).to_string();
+                            respond(&mut sock, Decision::BadRequest, &body, false).await;
+                            return;
+                        }
+                    };
+                    // Logged unconditionally. Refusing to serve a miner is
+                    // the other act an operator must be able to account for
+                    // afterwards.
+                    info!(%peer, target = %target_hex, seconds, "ops ban requested");
+                    match bans.ban(target, seconds, now) {
+                        Ok(expires_at) => {
+                            info!(%peer, target = %target_hex, expires_at, "miner BANNED");
+                            let body = serde_json::json!({
+                                "ok": true,
+                                "target": target_hex,
+                                "expires_at_unix": expires_at,
+                                "expires_in_secs": expires_at.saturating_sub(now),
+                            })
+                            .to_string();
+                            respond(&mut sock, Decision::Serve, &body, false).await;
+                        }
+                        Err(e) => {
+                            warn!(%peer, target = %target_hex, error = %e.message(), "ops ban REFUSED");
+                            let body =
+                                serde_json::json!({"ok": false, "error": e.message()}).to_string();
                             respond(&mut sock, Decision::BadRequest, &body, false).await;
                         }
                     }
