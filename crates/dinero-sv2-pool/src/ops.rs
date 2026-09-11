@@ -211,13 +211,6 @@ pub fn telemetry() -> &'static OpsTelemetry {
     TELEMETRY.get_or_init(OpsTelemetry::default)
 }
 
-/// What a payload with no `schema_min_compatible` should be read as.
-/// Every pool that predates the field is schema 2 and additive-only, so
-/// 2 is the truthful answer for them.
-fn default_min_compatible() -> u32 {
-    2
-}
-
 /// Everything the endpoint reports. Purely descriptive — a consumer
 /// that wants *earnings* should read the chain, not this.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -237,8 +230,14 @@ pub struct OpsStatus {
     /// keeping its name and type while changing meaning, which no field
     /// validation catches — must raise it, so older clients refuse the
     /// payload instead of rendering it wrong.
-    #[serde(default = "default_min_compatible")]
-    pub schema_min_compatible: u32,
+    /// `None` means the pool did not say. That is NOT the same as
+    /// saying 2: defaulting a missing declaration would report
+    /// "compatible" on behalf of a pool that never claimed it, and a
+    /// schema-3 payload with no declaration would then be read as
+    /// readable by schema-2 clients — recreating the exact hole this
+    /// field closes. Absence is represented as absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_min_compatible: Option<u32>,
     pub generated_at_unix: u64,
     pub pool_version: String,
     pub uptime_secs: u64,
@@ -278,6 +277,31 @@ pub struct OpsStatus {
     /// once a tolerant client is actually in the field.
     #[serde(default)]
     pub bans: Vec<crate::bans::BanStatus>,
+}
+
+impl OpsStatus {
+    /// Whether a client written against `client_schema` can read this
+    /// payload.
+    ///
+    /// Older than the client is unreadable. Equal is readable. Newer is
+    /// readable only on the pool's own word — an undeclared newer
+    /// payload is refused, because silence is not a promise and
+    /// assuming otherwise renders a reinterpreted field as though its
+    /// meaning had not changed.
+    ///
+    /// The one exception is a payload at exactly the client's schema
+    /// with no declaration: every pool predating the field is schema 2
+    /// and additive-only, so that IS readable — and it is the only case
+    /// where absence can be safely interpreted at all.
+    pub fn readable_by(&self, client_schema: u32) -> bool {
+        if self.schema_version < client_schema {
+            return false;
+        }
+        match self.schema_min_compatible {
+            Some(min) => min <= client_schema,
+            None => self.schema_version == client_schema,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

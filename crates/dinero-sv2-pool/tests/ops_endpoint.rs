@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 fn canned() -> OpsStatus {
     OpsStatus {
         schema_version: 2,
-        schema_min_compatible: 2,
+        schema_min_compatible: Some(2),
         generated_at_unix: 1_700_000_000,
         payout_address: "din1pfxwz4m56c2wh2zhs4448224nc4ym3svx9vauxxsqj8vhzkn8d0vq92ggxy".into(),
         pool_version: "test".into(),
@@ -162,7 +162,64 @@ async fn a_payload_without_the_declaration_reads_as_compatible_with_two() {
         "daemon_headers":0,"template_height":0,"template_id":0,"template_prev_hash":"h",
         "last_template_at_unix":0,"last_share":null,"last_block":null,"rejection_reasons":{}}"#;
     let parsed: OpsStatus = serde_json::from_str(without).expect("older payload still parses");
-    assert_eq!(parsed.schema_min_compatible, 2);
+    // Absence stays absence. A schema-2 payload is readable by a
+    // schema-2 client on the strength of the version alone.
+    assert_eq!(parsed.schema_min_compatible, None);
+    assert!(parsed.readable_by(2));
+}
+
+// The hole a default would reopen: a pool that bumped to 3 without
+// saying whether it stayed compatible must NOT read as readable by a
+// schema-2 client. Exercised through real deserialization, because a
+// serde default is exactly where this would come back.
+#[tokio::test]
+async fn an_undeclared_newer_payload_is_not_readable_by_an_older_client() {
+    let raw_json = r#"{"schema_version":3,"generated_at_unix":1,"pool_version":"x","uptime_secs":1,
+        "fee_bps":0,"payout_address":"a","connected_miners":0,"window_entries":0,
+        "window_span_secs":0,"template_heartbeat_age_secs":0,"template_phase":"p",
+        "accepted_shares_total":0,"rejected_shares_total":0,"blocks_found_total":0,"miners":[],
+        "stratum_bind":"s","daemon_connected":true,"daemon_endpoint":"e","daemon_blocks":0,
+        "daemon_headers":0,"template_height":0,"template_id":0,"template_prev_hash":"h",
+        "last_template_at_unix":0,"last_share":null,"last_block":null,"rejection_reasons":{}}"#;
+    let parsed: OpsStatus = serde_json::from_str(raw_json).expect("parses");
+    assert_eq!(parsed.schema_min_compatible, None, "absence must survive parsing");
+    assert!(
+        !parsed.readable_by(2),
+        "an undeclared schema-3 payload must not claim compatibility it never stated"
+    );
+    assert!(parsed.readable_by(3), "a client of its own schema can read it");
+}
+
+#[tokio::test]
+async fn a_declared_newer_payload_is_readable_by_the_clients_it_names() {
+    let with = |min: &str| {
+        format!(
+            r#"{{"schema_version":3,"schema_min_compatible":{min},"generated_at_unix":1,
+            "pool_version":"x","uptime_secs":1,"fee_bps":0,"payout_address":"a",
+            "connected_miners":0,"window_entries":0,"window_span_secs":0,
+            "template_heartbeat_age_secs":0,"template_phase":"p","accepted_shares_total":0,
+            "rejected_shares_total":0,"blocks_found_total":0,"miners":[],"stratum_bind":"s",
+            "daemon_connected":true,"daemon_endpoint":"e","daemon_blocks":0,"daemon_headers":0,
+            "template_height":0,"template_id":0,"template_prev_hash":"h",
+            "last_template_at_unix":0,"last_share":null,"last_block":null,
+            "rejection_reasons":{{}}}}"#
+        )
+    };
+    let additive: OpsStatus = serde_json::from_str(&with("2")).expect("parses");
+    assert!(additive.readable_by(2), "an additive bump stays readable");
+
+    let breaking: OpsStatus = serde_json::from_str(&with("3")).expect("parses");
+    assert!(!breaking.readable_by(2), "a breaking change locks out older clients");
+    assert!(breaking.readable_by(3));
+}
+
+// An older pool than the client is unreadable regardless of what it
+// declares: the fields the client needs are not there.
+#[tokio::test]
+async fn an_older_payload_is_not_readable_by_a_newer_client() {
+    let status = canned();
+    assert!(!status.readable_by(3));
+    assert!(status.readable_by(2));
 }
 
 #[tokio::test]

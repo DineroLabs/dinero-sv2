@@ -747,7 +747,7 @@ async fn main() -> Result<()> {
                 // `bans` was added without a bump because it is additive.
                 // This stays 2 until something is removed, renamed, or
                 // given a new meaning.
-                schema_min_compatible: 2,
+                schema_min_compatible: Some(2),
                 generated_at_unix: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
