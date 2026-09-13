@@ -80,14 +80,19 @@ fn config(max_requests: u32) -> stats::Config {
             window_secs: 60,
         },
         cache_ttl: Duration::from_millis(10),
+        ..stats::Config::default()
     }
 }
 
 async fn start_public(max_requests: u32) -> String {
+    start_with(config(max_requests)).await
+}
+
+async fn start_with(cfg: stats::Config) -> String {
     let listener = stats::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
-        let _ = stats::serve(listener, Arc::new(sample), config(max_requests)).await;
+        let _ = stats::serve(listener, Arc::new(sample), cfg).await;
     });
     addr
 }
@@ -262,7 +267,7 @@ async fn api_miner_reports_a_known_address() {
     // 60_000 of 61_000 total window weight.
     assert_eq!(v["window_bps"], 9_836);
     // Estimated next-block payout: 50_000_000 × 0.98 × 9836/10000.
-    assert_eq!(v["pending_una"], 48_196_400);
+    assert_eq!(v["est_next_block_una"], 48_196_400);
     assert_eq!(v["paid_una"], 5 * 49_000_000u64);
     assert_eq!(v["last_share_time"], NOW - 10);
 }
@@ -435,6 +440,9 @@ async fn index_serves_html_that_fetches_the_stats_api() {
     assert!(resp.contains("/api/stats"), "{resp}");
     assert!(resp.contains("install.sh"), "{resp}");
     assert!(resp.contains("install.ps1"), "{resp}");
+    // Polls no faster than every 30s: 60 req/min per client must leave
+    // room for a few open tabs behind one NAT.
+    assert!(resp.contains("setInterval(load, 30000)"), "{resp}");
     // HEAD gets the headers and no body.
     let resp = raw(&addr, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n").await;
     assert_eq!(status_line(&resp), "HTTP/1.1 200 OK", "{resp}");
@@ -460,6 +468,7 @@ async fn the_sample_is_cached_for_the_configured_ttl() {
             window_secs: 60,
         },
         cache_ttl: Duration::from_secs(10),
+        ..stats::Config::default()
     };
     tokio::spawn(async move {
         let _ = stats::serve(listener, source, cfg).await;
@@ -472,5 +481,98 @@ async fn the_sample_is_cached_for_the_configured_ttl() {
         calls.load(Ordering::SeqCst),
         1,
         "sample rebuilt inside the TTL"
+    );
+}
+
+// ---- rate limit keying behind a reverse proxy ----
+
+// Behind nginx every peer is 127.0.0.1. The limiter must key on the
+// forwarded client, or the whole internet shares one bucket.
+#[tokio::test]
+async fn loopback_peers_are_keyed_by_the_forwarded_client_address() {
+    let addr = start_public(1).await;
+    let req = |hdr: &str| format!("GET /api/stats HTTP/1.1\r\nHost: x\r\n{hdr}\r\n\r\n");
+    let a = raw(&addr, &req("X-Forwarded-For: 203.0.113.1, 10.0.0.1")).await;
+    assert_eq!(status_line(&a), "HTTP/1.1 200 OK", "{a}");
+    let b = raw(&addr, &req("X-Forwarded-For: 203.0.113.2")).await;
+    assert_eq!(
+        status_line(&b),
+        "HTTP/1.1 200 OK",
+        "second client shares a bucket: {b}"
+    );
+    let c = raw(&addr, &req("X-Forwarded-For: 203.0.113.1")).await;
+    assert_eq!(status_line(&c), "HTTP/1.1 429 Too Many Requests", "{c}");
+    let d = raw(&addr, &req("X-Real-IP: 203.0.113.3")).await;
+    assert_eq!(status_line(&d), "HTTP/1.1 200 OK", "{d}");
+    // Case-insensitive header names, as everywhere else.
+    let e = raw(&addr, &req("x-forwarded-for: 203.0.113.2")).await;
+    assert_eq!(status_line(&e), "HTTP/1.1 429 Too Many Requests", "{e}");
+}
+
+// ---- connection cap ----
+
+#[tokio::test]
+async fn connections_beyond_the_cap_are_closed_without_a_response() {
+    let addr = start_with(stats::Config {
+        max_connections: 2,
+        ..config(1_000)
+    })
+    .await;
+    let held1 = TcpStream::connect(&addr).await.unwrap();
+    let held2 = TcpStream::connect(&addr).await.unwrap();
+    // Let the acceptor take both permits.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut third = TcpStream::connect(&addr).await.unwrap();
+    let _ = third
+        .write_all(b"GET /api/stats HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await;
+    let mut out = String::new();
+    match tokio::time::timeout(Duration::from_secs(2), third.read_to_string(&mut out)).await {
+        Ok(_) => {}
+        Err(_) => panic!("third connection was neither served nor closed"),
+    }
+    assert!(out.is_empty(), "over-cap connection got a response: {out}");
+
+    // Permits return when the held connections end.
+    drop(held1);
+    drop(held2);
+    let mut served = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if status_line(&get(&addr, "/api/stats").await) == "HTTP/1.1 200 OK" {
+            served = true;
+            break;
+        }
+    }
+    assert!(served, "permits were not released");
+}
+
+// ---- slowloris ----
+
+#[tokio::test]
+async fn a_stalled_connection_is_closed_at_the_deadline() {
+    let addr = start_with(stats::Config {
+        connection_timeout: Duration::from_millis(300),
+        ..config(1_000)
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
+    sock.write_all(b"G").await.unwrap();
+    let mut out = Vec::new();
+    match tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut out)).await {
+        Ok(_) => {}
+        Err(_) => panic!("stalled connection was held open past the deadline"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        out.is_empty(),
+        "a half-request got a response: {:?}",
+        String::from_utf8_lossy(&out)
     );
 }

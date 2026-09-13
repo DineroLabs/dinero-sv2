@@ -289,13 +289,15 @@ struct Args {
     /// at `/`. OFF unless set. Deliberately separate from --ops-bind: it
     /// shares no token, no route and no code path with the operator
     /// endpoint, and exposes no payout address, fee control or
-    /// configuration — so it is safe behind a public reverse proxy.
-    #[arg(long)]
+    /// configuration — so it is safe behind a reverse proxy. Bind it on
+    /// loopback and let the proxy terminate TLS; a port already in use
+    /// fails startup rather than silently running without the page.
+    #[arg(long, requires = "public_stratum_addr")]
     public_stats_bind: Option<String>,
 
-    /// Stratum endpoint advertised by the public stats API, e.g.
-    /// `pool.example.org:4444`. Defaults to --bind, which is rarely what
-    /// a miner should type.
+    /// Stratum endpoint the public stats API advertises to strangers,
+    /// e.g. `pool.example.org:4444`. Required with --public-stats-bind:
+    /// there is no sane default (the internal --bind is not it).
     #[arg(long)]
     public_stratum_addr: Option<String>,
 
@@ -912,10 +914,12 @@ async fn main() -> Result<()> {
         let stats_fee_rx = fee_rx.clone();
         let stats_templates = rx.clone();
         let stats_connected = connected_miners.clone();
+        // clap enforces `requires`; this is belt and braces for a future
+        // caller that builds Args by hand.
         let stratum = args
             .public_stratum_addr
             .clone()
-            .unwrap_or_else(|| args.bind.to_string());
+            .context("--public-stratum-addr is required with --public-stats-bind")?;
         let min_payout_una = args.shared_dust_una;
         // Called at most once per cache TTL, however many requests arrive.
         let sample = Arc::new(move || {
@@ -1001,8 +1005,6 @@ async fn main() -> Result<()> {
         let dedup = dedup.clone();
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         tokio::spawn(async move {
-            conn_gauge.fetch_add(1, Ordering::Relaxed);
-            let _gauge = ConnGauge(conn_gauge);
             info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
                 Ok(s) => s,
@@ -1011,6 +1013,13 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
+            // Counted only once the Noise handshake succeeds: a port scan
+            // or a TLS probe that opens a socket and leaves must not show
+            // up as a worker on the ops or public gauges. The guard is
+            // created here too, so the decrement matches on every exit
+            // path from this point.
+            conn_gauge.fetch_add(1, Ordering::Relaxed);
+            let _gauge = ConnGauge(conn_gauge);
             let miner_key = session.peer_static_key();
             info!(%peer, channel_id, miner = %hex::encode(miner_key), "noise handshake complete");
             if let Err(e) = serve_miner(
@@ -2544,6 +2553,36 @@ mod cli_tests {
             !b.ops_allow_payout_change && !b.ops_allow_fee_change,
             "enabling bans must not enable the money-routing verbs"
         );
+    }
+
+    // The public API advertises a stratum endpoint to strangers. Defaulting
+    // it to the internal --bind would publish "0.0.0.0:4444", so the flag is
+    // required the moment the listener is enabled — refused at parse time.
+    #[test]
+    fn public_stats_requires_an_advertised_stratum_address() {
+        assert!(Args::try_parse_from([
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--public-stats-bind",
+            "127.0.0.1:8080",
+        ])
+        .is_err());
+        let a = Args::try_parse_from([
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--public-stats-bind",
+            "127.0.0.1:8080",
+            "--public-stratum-addr",
+            "pool.example.org:4444",
+        ])
+        .unwrap();
+        assert_eq!(a.public_stats_bind.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(a.public_stratum_addr.as_deref(), Some("pool.example.org:4444"));
+        // Off by default, and the stratum flag alone is harmless.
+        let b = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
+        assert!(b.public_stats_bind.is_none());
     }
 
     #[test]

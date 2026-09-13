@@ -153,11 +153,17 @@ Add two flags to `ExecStart` in
 `/etc/systemd/system/dinero-sv2-pool.service`:
 
 ```
-  --public-stats-bind 0.0.0.0:8080 \
+  --public-stats-bind 127.0.0.1:8080 \
   --public-stratum-addr pool.example.org:4444 \
 ```
 
-then `systemctl daemon-reload && systemctl restart dinero-sv2-pool` and
+Both flags are required together: the stratum address is what the page
+advertises to strangers, and there is no sane default for it. Bind on
+loopback and let a reverse proxy face the internet (below). If port 8080
+is already taken the pool **fails to start** — check
+`journalctl -u dinero-sv2-pool` rather than assuming the page is up.
+
+Then `systemctl daemon-reload && systemctl restart dinero-sv2-pool` and
 
 ```sh
 curl -s http://127.0.0.1:8080/api/stats
@@ -171,9 +177,10 @@ What it can and cannot do: `GET`/`HEAD` only, nothing takes a body, no
 token, and no ops route exists on it — `/status`, `/payout-address`,
 `/fee-bps`, `/ban` all 404 there, and `/api/*` 404s on the ops listener.
 It never shows your payout address, fee or ban controls, daemon endpoint,
-or configuration. Answers come from one cached sample per 10 s and each
-client IP gets 60 requests per minute, so a scraper cannot make the pool
-do work.
+or configuration. Answers come from one sample rendered every 10 s; each
+client gets 60 requests per minute, at most 256 connections are served at
+once, and every connection has a 10 s deadline — so a scraper cannot make
+the pool do work.
 
 It is plain HTTP. For `https://pool.example.org/`, put a reverse proxy
 with TLS in front — for example, with Caddy:
@@ -184,8 +191,10 @@ pool.example.org {
 }
 ```
 
-(bind `--public-stats-bind 127.0.0.1:8080` in that case, and open only
-443 to the world). Once it answers, email the URL
+Caddy and nginx (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`)
+pass the client address along; the pool rate-limits by that header only
+when the connection comes from loopback, which is exactly this setup. Open
+only 443 to the world. Once it answers, email the URL
 `https://pool.example.org/api/stats` to the aggregators.
 
 ## If it stops

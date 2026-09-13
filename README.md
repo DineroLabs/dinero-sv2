@@ -164,25 +164,34 @@ for aggregator sites (MiningPoolStats, minerstat) and for a human landing
 on the pool's hostname. It is OFF unless you pass `--public-stats-bind`:
 
 ```sh
-dinero-sv2-pool ... --public-stats-bind 0.0.0.0:8080 --public-stratum-addr pool.example.org:4444
+dinero-sv2-pool ... --public-stats-bind 127.0.0.1:8080 --public-stratum-addr pool.example.org:4444
 ```
+
+`--public-stratum-addr` is required alongside it (the pool refuses to start
+without it — the internal `--bind` is not something to advertise). Bind on
+loopback and put a TLS reverse proxy in front; a port that is already taken
+fails startup rather than silently running without the page.
 
 | Route | Returns |
 | --- | --- |
 | `GET /` | A small HTML page: hashrate, miners, last block, recent blocks, install one-liners. Fetches `/api/stats` from the browser. |
 | `GET /api/stats` | `{ pool_hashrate_hs, miners, workers, blocks_found_24h, blocks_found_total, last_block_height, last_block_hash, last_block_time, fee_bps, payout_scheme: "PPLNS", min_payout_una, stratum, network_height, network_difficulty, updated_at }` |
 | `GET /api/blocks?limit=N` | Newest first, `N` clamped to 1..100 (default 50): `[{ height, hash, time, reward_una, status }]` |
-| `GET /api/miner/<din1p…>` | `{ address, hashrate_hs, shares_1h, window_bps, pending_una, paid_una, last_share_time }` — **404** for any address that never submitted a share. There is no miner listing. |
+| `GET /api/miner/<din1p…>` | `{ address, hashrate_hs, shares_1h, window_bps, est_next_block_una, paid_una, last_share_time }` — **404** for any address that never submitted a share. There is no miner listing. |
 
-Field notes: `pool_hashrate_hs` and `hashrate_hs` are expected hashes per
-second from shares in the last 10 minutes (share weight is calibrated to
-expected hashes). `miners` is distinct payout addresses with a share in the
-last 10 minutes; `workers` is connected Stratum sessions. `pending_una` is
-the address's estimated slice of the *next* block at its current PPLNS
-standing (reward less fee, times `window_bps`) — PPLNS holds no balance.
-`paid_una` sums coinbase outputs to that address in blocks the pool built
-and dinerod accepted. `network_difficulty` uses the Bitcoin `0x1d00ffff`
-convention. Times are Unix seconds; amounts are una.
+Field notes: `pool_hashrate_hs`, `hashrate_hs` and `miners` describe
+**shared-mode (PPLNS) work only** — expected hashes per second from shares
+in the PPLNS window over the last 10 minutes (share weight is calibrated to
+expected hashes), and distinct payout addresses with such a share. Solo-mode
+miners are not credited to the window and do not appear in those numbers.
+`workers` is Stratum sessions that completed the Noise handshake, shared
+and solo alike, so it can exceed what `miners` accounts for.
+`est_next_block_una` is an *estimate* of what the address would receive if
+the next block were found right now (reward less fee, times `window_bps`);
+PPLNS holds no balance, so it is a standing, not a debt. `paid_una` sums
+coinbase outputs to that address in blocks the pool built and dinerod
+accepted. `network_difficulty` uses the Bitcoin `0x1d00ffff` convention.
+Times are Unix seconds; amounts are una.
 
 Safe to expose: every route is `GET`/`HEAD` only, nothing takes a body, and
 the listener shares **no token, route, or code path** with the operator
@@ -190,10 +199,16 @@ endpoint. It cannot show the payout address, fee controls, ban controls,
 daemon endpoint, or any configuration; `/status`, `/payout-address`,
 `/fee-bps`, `/ban` are 404 on it, and `/api/*` is 404 on the ops listener
 (`crates/dinero-sv2-pool/tests/public_stats.rs` pins both). Responses carry
-`Access-Control-Allow-Origin: *` on GET, are computed from one cached
-sample per 10 s, and each client IP is limited to 60 requests/minute
-(429 + `Retry-After` beyond that). It speaks plain HTTP; put a TLS reverse
-proxy in front of it for `https://pool.example.org/api/stats`.
+`Access-Control-Allow-Origin: *` on GET and are served from one sample
+rendered every 10 s. Abuse limits: 60 requests/minute per client (429 +
+`Retry-After` beyond that; when the peer is loopback — a local reverse
+proxy — the client is the first hop of `X-Forwarded-For`/`X-Real-IP`,
+otherwise the peer itself, so a direct client cannot pick its own bucket;
+IPv6 is bucketed by /64), at most 256 concurrent connections (extra ones
+are closed on accept), and a 10 s deadline per connection. It speaks plain
+HTTP; put a TLS reverse proxy in front of it for
+`https://pool.example.org/api/stats` and make sure the proxy sets
+`X-Forwarded-For`.
 
 Found blocks are appended to `found-blocks.jsonl` next to the PPLNS
 journal so `blocks_found_total` and `/api/blocks` survive a restart.

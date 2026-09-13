@@ -36,7 +36,7 @@
   <p class="sub">Shared (PPLNS) Stratum V2 pool &middot; stratum <code id="stratum">&hellip;</code> &middot; fee <span id="fee">&hellip;</span></p>
 
   <div class="grid">
-    <div class="card"><div class="k">Pool hashrate</div><div class="v" id="hashrate">&hellip;</div><div class="s">last 10 minutes</div></div>
+    <div class="card"><div class="k">Shared hashrate</div><div class="v" id="hashrate">&hellip;</div><div class="s">PPLNS shares, last 10 minutes</div></div>
     <div class="card"><div class="k">Miners</div><div class="v" id="miners">&hellip;</div><div class="s"><span id="workers">&hellip;</span> connected workers</div></div>
     <div class="card"><div class="k">Last block</div><div class="v" id="lastblock">&hellip;</div><div class="s" id="lastblockage">&hellip;</div></div>
     <div class="card"><div class="k">Blocks found</div><div class="v" id="blocks24">&hellip;</div><div class="s"><span id="blockstotal">&hellip;</span> all time</div></div>
@@ -66,7 +66,7 @@ cd "$env:LOCALAPPDATA\DineroMiner\bin"; .\dinero-miner.exe --address "YOUR_DIN1_
     <code><a href="/api/blocks?limit=50">/api/blocks?limit=N</a></code>,
     <code>/api/miner/&lt;din1p&hellip;&gt;</code>.</p>
 
-  <footer>Updated <span id="updated">&hellip;</span>. Refreshes every 15 seconds.</footer>
+  <footer>Updated <span id="updated">&hellip;</span>. Refreshes every 30 seconds.</footer>
 </main>
 <script>
 (function () {
@@ -112,7 +112,7 @@ cd "$env:LOCALAPPDATA\DineroMiner\bin"; .\dinero-miner.exe --address "YOUR_DIN1_
     }).catch(function () {});
   }
   load();
-  setInterval(load, 15000);
+  setInterval(load, 30000);
 })();
 </script>
 </body>

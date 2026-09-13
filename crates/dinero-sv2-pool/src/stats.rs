@@ -15,9 +15,16 @@
 //!     on the ops listener. `tests/public_stats.rs` pins both directions.
 //!   * **No enumeration.** `/api/miner/<addr>` answers only for an address
 //!     that has actually submitted a share; there is no list of miners.
-//!   * **Cheap to hit.** One sample of pool state is built at most every
-//!     `Config::cache_ttl` (10s by default) and every request is served
-//!     from it; each client IP is rate limited on top of that.
+//!   * **Cheap to hit.** One sample of pool state is taken at most every
+//!     `Config::cache_ttl` (10s by default) and rendered ONCE — the stats
+//!     JSON, the recent-block list and a per-address aggregate map — so a
+//!     request is a clone or a hash lookup, never a walk of the PPLNS
+//!     window. The sample is built outside the cache lock. On top of that:
+//!     a fixed-window per-client rate limit (keyed by the first hop of
+//!     `X-Forwarded-For`/`X-Real-IP` when the peer is loopback, i.e. a
+//!     local reverse proxy, otherwise by the peer; IPv6 by /64; the key
+//!     table is hard-capped), a cap on concurrent connections, and a
+//!     deadline on every connection from accept to close.
 //!   * **Cross-origin readable.** `Access-Control-Allow-Origin: *` on GET,
 //!     so a static web page anywhere can render it.
 //!
@@ -36,6 +43,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::accounting::WindowEntry;
@@ -115,10 +123,15 @@ pub struct Sample {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoolStats {
+    /// SHARED-mode (PPLNS) hashrate: expected hashes/s from shares in the
+    /// PPLNS window over the last 10 minutes. Solo-mode work is not
+    /// credited to the window and is not included.
     pub pool_hashrate_hs: u64,
-    /// Distinct payout addresses with a share in the last 10 minutes.
+    /// Distinct payout addresses with a shared-mode share in the last 10
+    /// minutes.
     pub miners: usize,
-    /// Connected stratum sessions.
+    /// Stratum sessions that completed the Noise handshake, shared and
+    /// solo alike — so `workers` can exceed what `miners` accounts for.
     pub workers: usize,
     pub blocks_found_24h: u64,
     pub blocks_found_total: u64,
@@ -150,11 +163,11 @@ pub struct MinerStats {
     pub shares_1h: u64,
     /// Share of the next block's contributor split, in basis points.
     pub window_bps: u32,
-    /// Estimated una this address receives if the next block is found
-    /// now: next reward, less the operator fee, times `window_bps`.
-    /// PPLNS has no balance to owe — this is the current standing, not a
-    /// debt.
-    pub pending_una: u64,
+    /// Estimate of what this address would receive if the NEXT block were
+    /// found right now: next reward, less the operator fee, times
+    /// `window_bps`. PPLNS holds no balance and owes nothing — this is a
+    /// standing, not a debt, and it moves with every share anyone submits.
+    pub est_next_block_una: u64,
     /// Una paid to this address in coinbases the pool built and dinerod
     /// accepted (since the pool started keeping its block log).
     pub paid_una: u64,
@@ -177,16 +190,26 @@ fn hashrate_hs<'a>(
     all: impl Iterator<Item = &'a WindowEntry>,
     mine: impl Iterator<Item = &'a WindowEntry>,
 ) -> u64 {
-    let cutoff = now.saturating_sub(HASHRATE_WINDOW_SECS);
-    let oldest = all.map(|e| e.unix_ts).min();
-    let span = oldest
+    let span = hashrate_span(now, all);
+    recent_weight_hs(now, mine, span)
+}
+
+/// The divisor for hashrate: the hashrate window, or the age of the
+/// pool's oldest window entry if that is shorter. Never zero.
+fn hashrate_span<'a>(now: u64, all: impl Iterator<Item = &'a WindowEntry>) -> u64 {
+    all.map(|e| e.unix_ts)
+        .min()
         .map(|o| now.saturating_sub(o).min(HASHRATE_WINDOW_SECS))
         .unwrap_or(HASHRATE_WINDOW_SECS)
-        .max(1);
+        .max(1)
+}
+
+fn recent_weight_hs<'a>(now: u64, mine: impl Iterator<Item = &'a WindowEntry>, span: u64) -> u64 {
+    let cutoff = now.saturating_sub(HASHRATE_WINDOW_SECS);
     let sum: u128 = mine
         .filter(|e| e.unix_ts >= cutoff)
         .fold(0u128, |acc, e| acc.saturating_add(e.weight));
-    u64::try_from(sum / u128::from(span)).unwrap_or(u64::MAX)
+    u64::try_from(sum / u128::from(span.max(1))).unwrap_or(u64::MAX)
 }
 
 /// Bitcoin-convention difficulty for a compact target: how many times
@@ -248,48 +271,92 @@ pub fn recent_blocks(s: &Sample, limit: usize) -> Vec<BlockJson> {
         .collect()
 }
 
+/// Per-address aggregate, built once per sample so `/api/miner/<addr>`
+/// is a hash lookup rather than a walk of the window per request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ScriptAgg {
+    weight: u128,
+    recent_weight: u128,
+    shares_1h: u64,
+    last_share_time: Option<u64>,
+    paid_una: u64,
+}
+
+/// One sample, fully rendered: everything a request can ask for, already
+/// computed. Shared behind an `Arc` by every request within the TTL.
+#[derive(Debug, Clone)]
+pub struct Rendered {
+    /// `/api/stats`, pre-encoded.
+    pub stats_json: String,
+    /// Newest first, already capped at `MAX_BLOCKS_LIMIT`.
+    blocks: Vec<BlockJson>,
+    per_script: HashMap<Vec<u8>, ScriptAgg>,
+    total_weight: u128,
+    span_secs: u64,
+    fee_bps: u32,
+    next_reward_una: u64,
+}
+
+/// One pass over the window and the block list.
+pub fn render(s: &Sample) -> Rendered {
+    let now = s.now_unix;
+    let recent_cutoff = now.saturating_sub(HASHRATE_WINDOW_SECS);
+    let hour_cutoff = now.saturating_sub(HOUR_SECS);
+    let mut per_script: HashMap<Vec<u8>, ScriptAgg> = HashMap::new();
+    let mut total_weight = 0u128;
+    for e in &s.window {
+        total_weight = total_weight.saturating_add(e.weight);
+        let a = per_script.entry(e.payout_script.clone()).or_default();
+        a.weight = a.weight.saturating_add(e.weight);
+        if e.unix_ts >= recent_cutoff {
+            a.recent_weight = a.recent_weight.saturating_add(e.weight);
+        }
+        if e.unix_ts >= hour_cutoff {
+            a.shares_1h += 1;
+        }
+        a.last_share_time = Some(a.last_share_time.map_or(e.unix_ts, |t| t.max(e.unix_ts)));
+    }
+    for (spk, una) in s.blocks.iter().flat_map(|b| b.outputs.iter()) {
+        if let Ok(script) = hex::decode(spk) {
+            let a = per_script.entry(script).or_default();
+            a.paid_una = a.paid_una.saturating_add(*una);
+        }
+    }
+    Rendered {
+        stats_json: encode(&compute_stats(s)),
+        blocks: recent_blocks(s, MAX_BLOCKS_LIMIT),
+        per_script,
+        total_weight,
+        span_secs: hashrate_span(now, s.window.iter()),
+        fee_bps: s.fee_bps,
+        next_reward_una: s.next_reward_una,
+    }
+}
+
 /// `None` when the address has never contributed: not in the window and
 /// never paid. That is what makes the route non-enumerable — a 404 says
 /// "not a miner here", nothing more.
-pub fn miner_stats(s: &Sample, script: &[u8], address: &str) -> Option<MinerStats> {
-    let now = s.now_unix;
-    let mine = || s.window.iter().filter(|e| e.payout_script == script);
-    let script_hex = hex::encode(script);
-    let paid_una: u64 = s
-        .blocks
-        .iter()
-        .flat_map(|b| b.outputs.iter())
-        .filter(|(spk, _)| *spk == script_hex)
-        .map(|(_, una)| *una)
-        .fold(0u64, u64::saturating_add);
-    let last_share_time = mine().map(|e| e.unix_ts).max();
-    if last_share_time.is_none() && paid_una == 0 {
-        return None;
-    }
-    let total: u128 = s
-        .window
-        .iter()
-        .fold(0u128, |acc, e| acc.saturating_add(e.weight));
-    let weight: u128 = mine().fold(0u128, |acc, e| acc.saturating_add(e.weight));
-    let window_bps = if total == 0 {
+pub fn miner_stats(r: &Rendered, script: &[u8], address: &str) -> Option<MinerStats> {
+    let agg = r.per_script.get(script)?;
+    let window_bps = if r.total_weight == 0 {
         0
     } else {
-        (weight.saturating_mul(10_000) / total) as u32
+        (agg.weight.saturating_mul(10_000) / r.total_weight) as u32
     };
-    let after_fee = u128::from(s.next_reward_una)
-        * u128::from(10_000u32.saturating_sub(s.fee_bps.min(10_000)))
+    let after_fee = u128::from(r.next_reward_una)
+        * u128::from(10_000u32.saturating_sub(r.fee_bps.min(10_000)))
         / 10_000;
-    let pending_una =
+    let est_next_block_una =
         u64::try_from(after_fee * u128::from(window_bps) / 10_000).unwrap_or(u64::MAX);
-    let hour_cutoff = now.saturating_sub(HOUR_SECS);
     Some(MinerStats {
         address: address.to_string(),
-        hashrate_hs: hashrate_hs(now, s.window.iter(), mine()),
-        shares_1h: mine().filter(|e| e.unix_ts >= hour_cutoff).count() as u64,
+        hashrate_hs: u64::try_from(agg.recent_weight / u128::from(r.span_secs.max(1)))
+            .unwrap_or(u64::MAX),
+        shares_1h: agg.shares_1h,
         window_bps,
-        pending_una,
-        paid_una,
-        last_share_time,
+        est_next_block_una,
+        paid_una: agg.paid_una,
+        last_share_time: agg.last_share_time,
     })
 }
 
@@ -447,25 +514,84 @@ impl Default for RateLimit {
 pub struct Config {
     pub rate_limit: RateLimit,
     pub cache_ttl: Duration,
+    /// Concurrent connections served; anything beyond is closed on
+    /// accept without a response.
+    pub max_connections: usize,
+    /// Hard deadline for one connection, accept to close. Bounds a client
+    /// that trickles bytes (slowloris) or never reads its response.
+    pub connection_timeout: Duration,
 }
+
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             rate_limit: RateLimit::default(),
             cache_ttl: DEFAULT_CACHE_TTL,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
         }
     }
 }
 
-/// Fixed-window counter per IP. Bounded: once it holds too many IPs the
-/// expired windows are swept, so an address scan cannot grow it forever.
+/// The address a request should be rate limited as.
+///
+/// Behind a local reverse proxy every peer is loopback, so the proxy's
+/// `X-Forwarded-For` (first hop) or `X-Real-IP` is the client. From any
+/// other peer those headers are attacker-controlled and ignored: a direct
+/// client cannot choose its own bucket. Unparseable values fall back to
+/// the peer.
+pub fn client_ip(peer: IpAddr, head: &str) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+    let mut forwarded: Option<&str> = None;
+    let mut real: Option<&str> = None;
+    for line in head.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("x-forwarded-for") && forwarded.is_none() {
+            forwarded = value.split(',').next().map(str::trim);
+        } else if name.eq_ignore_ascii_case("x-real-ip") && real.is_none() {
+            real = Some(value.trim());
+        }
+    }
+    forwarded
+        .and_then(|v| v.parse().ok())
+        .or_else(|| real.and_then(|v| v.parse().ok()))
+        .unwrap_or(peer)
+}
+
+/// Hard cap on distinct limiter keys. Reaching it sweeps expired windows;
+/// if the table is still full, it is cleared outright — a flood of fresh
+/// sources briefly resets everyone's count rather than growing memory.
+pub const LIMITER_MAX_KEYS: usize = 50_000;
+
+/// IPv4 as-is; IPv6 collapsed to its /64, since one host commonly holds
+/// a whole /64 and could otherwise mint a fresh key per request.
+fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            IpAddr::V6(o.into())
+        }
+    }
+}
+
+/// Fixed-window counter per client key. Bounded by `LIMITER_MAX_KEYS`.
 pub struct Limiter {
     limit: RateLimit,
     buckets: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
-
-const LIMITER_SWEEP_AT: usize = 10_000;
 
 impl Limiter {
     pub fn new(limit: RateLimit) -> Self {
@@ -476,12 +602,18 @@ impl Limiter {
     }
 
     pub fn allow(&self, ip: IpAddr, now: Instant) -> bool {
+        let key = bucket_key(ip);
         let window = Duration::from_secs(self.limit.window_secs.max(1));
         let mut b = self.buckets.lock().expect("limiter mutex");
-        if b.len() >= LIMITER_SWEEP_AT {
+        if b.len() >= LIMITER_MAX_KEYS && !b.contains_key(&key) {
+            // One O(n) sweep per LIMITER_MAX_KEYS insertions at worst, and
+            // never more than that many entries.
             b.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if b.len() >= LIMITER_MAX_KEYS {
+                b.clear();
+            }
         }
-        let entry = b.entry(ip).or_insert((now, 0));
+        let entry = b.entry(key).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
             *entry = (now, 0);
         }
@@ -491,25 +623,42 @@ impl Limiter {
         entry.1 += 1;
         true
     }
+
+    pub fn len(&self) -> usize {
+        self.buckets.lock().expect("limiter mutex").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 struct Cache<F> {
     source: Arc<F>,
     ttl: Duration,
-    slot: Mutex<Option<(Instant, Arc<Sample>)>>,
+    slot: Mutex<Option<(Instant, Arc<Rendered>)>>,
 }
 
 impl<F: Fn() -> Sample> Cache<F> {
-    fn get(&self) -> Arc<Sample> {
-        let mut slot = self.slot.lock().expect("stats cache mutex");
-        if let Some((built, sample)) = slot.as_ref() {
+    /// Double-checked: the lock is held only to read or to store, never
+    /// while the sample is taken (which takes the PPLNS window lock) or
+    /// rendered. Two requests racing across an expiry may both build; the
+    /// first to store wins and the other adopts it.
+    fn get(&self) -> Arc<Rendered> {
+        if let Some((built, r)) = self.slot.lock().expect("stats cache mutex").as_ref() {
             if built.elapsed() < self.ttl {
-                return sample.clone();
+                return r.clone();
             }
         }
-        let fresh = Arc::new((self.source)());
-        *slot = Some((Instant::now(), fresh.clone()));
-        fresh
+        let fresh = Arc::new(render(&(self.source)()));
+        let mut slot = self.slot.lock().expect("stats cache mutex");
+        match slot.as_ref() {
+            Some((built, r)) if built.elapsed() < self.ttl => r.clone(),
+            _ => {
+                *slot = Some((Instant::now(), fresh.clone()));
+                fresh
+            }
+        }
     }
 }
 
@@ -563,7 +712,7 @@ const TOO_MANY: &str = "429 Too Many Requests";
 /// is "not here" whatever the verb, and 405 is reserved for a path this
 /// listener actually serves. Answering 405 first would confirm to a
 /// prober that `/withdraw` exists somewhere.
-fn route(method: &str, path: &str, query: &str, sample: &Sample) -> Response {
+fn route(method: &str, path: &str, query: &str, r: &Rendered) -> Response {
     let known = matches!(path, "/" | "/index.html" | STATS_PATH | BLOCKS_PATH)
         || path.starts_with(MINER_PREFIX);
     if !known {
@@ -581,14 +730,17 @@ fn route(method: &str, path: &str, query: &str, sample: &Sample) -> Response {
             body: INDEX_HTML.to_string(),
             extra: Vec::new(),
         },
-        STATS_PATH => Response::json(OK, encode(&compute_stats(sample))),
-        BLOCKS_PATH => Response::json(OK, encode(&recent_blocks(sample, parse_limit(query)))),
+        STATS_PATH => Response::json(OK, r.stats_json.clone()),
+        BLOCKS_PATH => {
+            let n = parse_limit(query).min(r.blocks.len());
+            Response::json(OK, encode(&r.blocks[..n]))
+        }
         p if p.starts_with(MINER_PREFIX) => {
             let addr = &p[MINER_PREFIX.len()..];
             let Some(script) = address_to_script(addr) else {
                 return Response::error(BAD_REQUEST, "expected a din1p... taproot address");
             };
-            match miner_stats(sample, &script, &addr.trim().to_lowercase()) {
+            match miner_stats(r, &script, &addr.trim().to_lowercase()) {
                 Some(m) => Response::json(OK, encode(&m)),
                 None => Response::error(NOT_FOUND, "not found"),
             }
@@ -597,7 +749,7 @@ fn route(method: &str, path: &str, query: &str, sample: &Sample) -> Response {
     }
 }
 
-fn encode<T: Serialize>(v: &T) -> String {
+fn encode<T: Serialize + ?Sized>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "{\"error\":\"encode failed\"}".to_string())
 }
 
@@ -645,50 +797,72 @@ where
         ttl: config.cache_ttl,
         slot: Mutex::new(None),
     });
+    let permits = Arc::new(Semaphore::new(config.max_connections.max(1)));
+    let deadline = config.connection_timeout;
     loop {
-        let (mut sock, peer) = match listener.accept().await {
+        let (sock, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
+                // EMFILE and friends: back off instead of spinning the core.
                 warn!(error = %e, "public stats accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
+        };
+        // Over the cap: close on accept, no task, no response.
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(sock);
+            continue;
         };
         let limiter = limiter.clone();
         let cache = cache.clone();
         tokio::spawn(async move {
-            let ttl = cache.ttl;
-            // Counted on arrival: a client over its limit costs us a head
-            // read (bounded) and a one-line answer, never a sample.
-            let allowed = limiter.allow(peer.ip(), Instant::now());
-            let Some(raw) = crate::ops::read_head(&mut sock).await else {
-                let r = Response::error(BAD_REQUEST, "bad request");
-                write_response(&mut sock, &r, false, false, ttl).await;
-                return;
-            };
-            let Some((head, _body)) = crate::ops::split_head_body(&raw) else {
-                let r = Response::error(BAD_REQUEST, "bad request");
-                write_response(&mut sock, &r, false, false, ttl).await;
-                return;
-            };
-            let Some((method, path, query)) = parse_request_line(&head) else {
-                let r = Response::error(BAD_REQUEST, "bad request");
-                write_response(&mut sock, &r, false, false, ttl).await;
-                return;
-            };
-            let head_only = method == "HEAD";
-            let cors = method == "GET" || head_only;
-            if !allowed {
-                let mut r = Response::error(TOO_MANY, "rate limited");
-                r.extra
-                    .push(("Retry-After", limiter.limit.window_secs.to_string()));
-                write_response(&mut sock, &r, head_only, cors, ttl).await;
-                return;
-            }
-            let sample = cache.get();
-            let r = route(&method, &path, &query, &sample);
-            write_response(&mut sock, &r, head_only, cors, ttl).await;
+            let _permit = permit;
+            // The whole conversation — head read, render, write — is under
+            // one deadline. On expiry the future is dropped and the socket
+            // closes with it.
+            let _ = tokio::time::timeout(deadline, handle(sock, peer.ip(), limiter, cache)).await;
         });
     }
+}
+
+async fn handle<F: Fn() -> Sample>(
+    mut sock: TcpStream,
+    peer: IpAddr,
+    limiter: Arc<Limiter>,
+    cache: Arc<Cache<F>>,
+) {
+    let ttl = cache.ttl;
+    let Some(raw) = crate::ops::read_head(&mut sock).await else {
+        let r = Response::error(BAD_REQUEST, "bad request");
+        write_response(&mut sock, &r, false, false, ttl).await;
+        return;
+    };
+    let Some((head, _body)) = crate::ops::split_head_body(&raw) else {
+        let r = Response::error(BAD_REQUEST, "bad request");
+        write_response(&mut sock, &r, false, false, ttl).await;
+        return;
+    };
+    let Some((method, path, query)) = parse_request_line(&head) else {
+        let r = Response::error(BAD_REQUEST, "bad request");
+        write_response(&mut sock, &r, false, false, ttl).await;
+        return;
+    };
+    let head_only = method == "HEAD";
+    let cors = method == "GET" || head_only;
+    // Keyed after the head is read (the forwarded address lives in it)
+    // but before any work: an over-limit client costs a bounded read and
+    // a one-line answer, never a render.
+    if !limiter.allow(client_ip(peer, &head), Instant::now()) {
+        let mut r = Response::error(TOO_MANY, "rate limited");
+        r.extra
+            .push(("Retry-After", limiter.limit.window_secs.to_string()));
+        write_response(&mut sock, &r, head_only, cors, ttl).await;
+        return;
+    }
+    let rendered = cache.get();
+    let r = route(&method, &path, &query, &rendered);
+    write_response(&mut sock, &r, head_only, cors, ttl).await;
 }
 
 /// Bind the public listener. Unlike the ops listener this one is MEANT to
@@ -919,13 +1093,14 @@ mod tests {
         };
         let mut stranger = a.clone();
         stranger[7] ^= 1;
-        assert_eq!(miner_stats(&sample, &stranger, "x"), None);
+        let r = render(&sample);
+        assert_eq!(miner_stats(&r, &stranger, "x"), None);
 
-        let m = miner_stats(&sample, &a, ADDR).unwrap();
+        let m = miner_stats(&r, &a, ADDR).unwrap();
         assert_eq!(m.address, ADDR);
         assert_eq!(m.window_bps, 7_500);
         // 1000 × 0.9 × 0.75
-        assert_eq!(m.pending_una, 675);
+        assert_eq!(m.est_next_block_una, 675);
         assert_eq!(m.paid_una, 700);
         assert_eq!(m.shares_1h, 1);
         assert_eq!(m.last_share_time, Some(now - 30));
@@ -948,7 +1123,7 @@ mod tests {
             }],
             ..Sample::default()
         };
-        let m = miner_stats(&sample, &a, ADDR).unwrap();
+        let m = miner_stats(&render(&sample), &a, ADDR).unwrap();
         assert_eq!(m.paid_una, 9);
         assert_eq!(m.window_bps, 0);
         assert_eq!(m.last_share_time, None);
@@ -958,7 +1133,7 @@ mod tests {
 
     #[test]
     fn router_knows_no_ops_route_under_any_method() {
-        let s = Sample::default();
+        let s = render(&Sample::default());
         for path in [
             "/status",
             "/payout-address",
@@ -1061,5 +1236,86 @@ mod tests {
         let log2 = BlockLog::default();
         log2.attach(&path).unwrap();
         assert_eq!(log2.snapshot().1, 1);
+    }
+
+    // ---- client keying behind a proxy ----
+
+    #[test]
+    fn forwarded_address_is_honoured_only_from_a_loopback_peer() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let lo6: IpAddr = "::1".parse().unwrap();
+        let remote: IpAddr = "198.51.100.7".parse().unwrap();
+        let xff = "GET / HTTP/1.1\r\nX-Forwarded-For: 203.0.113.9, 10.0.0.1\r\n\r\n";
+        let real = "GET / HTTP/1.1\r\nx-real-ip: 203.0.113.8\r\n\r\n";
+        let none = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let junk = "GET / HTTP/1.1\r\nX-Forwarded-For: not-an-ip\r\n\r\n";
+        assert_eq!(client_ip(lo, xff), "203.0.113.9".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            client_ip(lo6, xff),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(lo, real),
+            "203.0.113.8".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(client_ip(lo, none), lo);
+        assert_eq!(client_ip(lo, junk), lo);
+        // A direct client cannot pick its own bucket.
+        assert_eq!(client_ip(remote, xff), remote);
+        assert_eq!(client_ip(remote, real), remote);
+    }
+
+    // ---- limiter bounds ----
+
+    #[test]
+    fn limiter_never_holds_more_than_the_cap() {
+        let l = Limiter::new(RateLimit {
+            max_requests: 10,
+            window_secs: 60,
+        });
+        let t0 = Instant::now();
+        for i in 0..(LIMITER_MAX_KEYS as u32 + 1_000) {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000u32 + i));
+            assert!(l.allow(ip, t0));
+        }
+        assert!(l.len() <= LIMITER_MAX_KEYS, "{}", l.len());
+    }
+
+    #[test]
+    fn ipv6_clients_share_a_bucket_per_64() {
+        let l = Limiter::new(RateLimit {
+            max_requests: 1,
+            window_secs: 60,
+        });
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(l.allow(a, t0));
+        assert!(!l.allow(b, t0), "same /64 must share the bucket");
+        assert!(l.allow(c, t0), "a different /64 is a different client");
+    }
+
+    // ---- rendered sample ----
+
+    #[test]
+    fn render_precomputes_stats_json_and_per_script_aggregates() {
+        let a = hex::decode(SCRIPT_HEX).unwrap();
+        let now = 1_000_000;
+        let sample = Sample {
+            now_unix: now,
+            window: vec![entry(&a, 5, now - 1), entry(&a, 7, now - HOUR_SECS - 1)],
+            fee_bps: 0,
+            next_reward_una: 100,
+            ..Sample::default()
+        };
+        let r = render(&sample);
+        let v: serde_json::Value = serde_json::from_str(&r.stats_json).unwrap();
+        assert_eq!(v["updated_at"], now);
+        let m = miner_stats(&r, &a, ADDR).unwrap();
+        assert_eq!(m.shares_1h, 1);
+        assert_eq!(m.window_bps, 10_000);
+        assert_eq!(m.est_next_block_una, 100);
+        assert_eq!(m.last_share_time, Some(now - 1));
     }
 }
