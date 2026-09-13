@@ -12,6 +12,13 @@
 # changes it at runtime, the choice is persisted to
 # /etc/dinero-sv2/payout-address, which takes precedence on the next start —
 # otherwise a restart would quietly revert the fee to the address below.
+#
+# To publish a read-only stats page/API for miners and aggregator sites,
+# append to ExecStart (off by default; separate from the ops endpoint and
+# token; both flags required together; bind on loopback behind a TLS
+# reverse proxy — see docs/RUN-A-POOL.md). A port already in use fails
+# startup rather than running without the page.
+#   --public-stats-bind 127.0.0.1:8080 --public-stratum-addr pool.example.org:4444
 [Unit]
 Description=Dinero SV2 Pool Server
 Documentation=https://github.com/DineroLabs/dinero-sv2/blob/main/docs/RUN-A-POOL.md

@@ -78,8 +78,9 @@
 use anyhow::{bail, Context, Result};
 use dinero_sv2_codec::{
     decode_new_template, decode_open_standard_mining_channel_success,
-    decode_setup_connection_success, decode_submit_shares_error, encode_open_standard_mining_channel,
-    encode_setup_connection, encode_submit_shares, sv2::encode_set_reward_mode,
+    decode_setup_connection_success, decode_submit_shares_error,
+    encode_open_standard_mining_channel, encode_setup_connection, encode_submit_shares,
+    sv2::encode_set_reward_mode,
 };
 use dinero_sv2_common::{
     HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannel, SetRewardMode, SetupConnection,
@@ -122,7 +123,9 @@ impl RegtestDaemon {
     /// this file (and the datadir path folds in the port too) so two
     /// scenarios can run in the same `cargo test -- --ignored` process
     /// without colliding on a bind address or on-disk state.
-    fn spawn(port: u16) -> Result<Self> { Self::spawn_at_dnrs(port, 26) }
+    fn spawn(port: u16) -> Result<Self> {
+        Self::spawn_at_dnrs(port, 26)
+    }
 
     fn spawn_at_dnrs(port: u16, dnrs_height: u32) -> Result<Self> {
         let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
@@ -216,8 +219,7 @@ impl PoolProcess {
         stderr_log: PathBuf,
     ) -> Result<Self> {
         let binary = env!("CARGO_BIN_EXE_dinero-sv2-pool");
-        let stderr_file =
-            std::fs::File::create(&stderr_log).context("creating pool stderr log")?;
+        let stderr_file = std::fs::File::create(&stderr_log).context("creating pool stderr log")?;
 
         let child = Command::new(binary)
             .arg("--ops-bind=")
@@ -320,7 +322,11 @@ struct MinerConn {
 }
 
 impl MinerConn {
-    async fn connect(pool_addr: SocketAddr, payout_script: Vec<u8>, request_id: u32) -> Result<Self> {
+    async fn connect(
+        pool_addr: SocketAddr,
+        payout_script: Vec<u8>,
+        request_id: u32,
+    ) -> Result<Self> {
         let tcp = TcpStream::connect(pool_addr)
             .await
             .context("connect to pool")?;
@@ -440,12 +446,20 @@ impl MinerConn {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("timed out waiting for frame type 0x{want:02x} on channel {}", self.channel_id);
+                bail!(
+                    "timed out waiting for frame type 0x{want:02x} on channel {}",
+                    self.channel_id
+                );
             }
             let outer = tokio::time::timeout(remaining, self.session.read_frame()).await;
             let frame = match outer {
-                Ok(inner) => inner?.ok_or_else(|| anyhow::anyhow!("pool closed connection (EOF)"))?,
-                Err(_) => bail!("timed out waiting for frame type 0x{want:02x} on channel {}", self.channel_id),
+                Ok(inner) => {
+                    inner?.ok_or_else(|| anyhow::anyhow!("pool closed connection (EOF)"))?
+                }
+                Err(_) => bail!(
+                    "timed out waiting for frame type 0x{want:02x} on channel {}",
+                    self.channel_id
+                ),
             };
             if frame.msg_type == MSG_NEW_MINING_JOB {
                 self.wire = decode_new_template(&frame.payload)?;
@@ -460,7 +474,11 @@ impl MinerConn {
     /// success/error ack (any `NewMiningJob`/`WindowStatus`/etc. pushed
     /// in between is drained and, for `NewMiningJob`, folded into
     /// `self.wire`).
-    async fn submit_and_ack(&mut self, share: &SubmitSharesDinero, overall_timeout: Duration) -> Result<()> {
+    async fn submit_and_ack(
+        &mut self,
+        share: &SubmitSharesDinero,
+        overall_timeout: Duration,
+    ) -> Result<()> {
         self.seq += 1;
         let mut s = share.clone();
         s.sequence_number = self.seq;
@@ -473,12 +491,20 @@ impl MinerConn {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("timed out waiting for share ack on channel {}", self.channel_id);
+                bail!(
+                    "timed out waiting for share ack on channel {}",
+                    self.channel_id
+                );
             }
             let outer = tokio::time::timeout(remaining, self.session.read_frame()).await;
             let frame = match outer {
-                Ok(inner) => inner?.ok_or_else(|| anyhow::anyhow!("pool closed connection (EOF)"))?,
-                Err(_) => bail!("timed out waiting for share ack on channel {}", self.channel_id),
+                Ok(inner) => {
+                    inner?.ok_or_else(|| anyhow::anyhow!("pool closed connection (EOF)"))?
+                }
+                Err(_) => bail!(
+                    "timed out waiting for share ack on channel {}",
+                    self.channel_id
+                ),
             };
             if frame.msg_type == MSG_NEW_MINING_JOB {
                 self.wire = decode_new_template(&frame.payload)?;
@@ -487,10 +513,7 @@ impl MinerConn {
                 MSG_SUBMIT_SHARES_SUCCESS => return Ok(()),
                 MSG_SUBMIT_SHARES_ERROR => {
                     let e = decode_submit_shares_error(&frame.payload)?;
-                    bail!(
-                        "share rejected: {}",
-                        String::from_utf8_lossy(&e.error_code)
-                    );
+                    bail!("share rejected: {}", String::from_utf8_lossy(&e.error_code));
                 }
                 _ => {}
             }
@@ -523,7 +546,10 @@ impl MinerConn {
             }
             nonce = nonce.wrapping_add(1);
             if nonce == 0 {
-                bail!("nonce space exhausted accumulating shares (channel {})", self.channel_id);
+                bail!(
+                    "nonce space exhausted accumulating shares (channel {})",
+                    self.channel_id
+                );
             }
         }
         Ok(())
@@ -534,20 +560,26 @@ impl MinerConn {
     /// template refresh has baked the just-accumulated PPLNS weights
     /// into a fresh shared coinbase (the split only happens at
     /// refresh time, not at share-submit time).
-    async fn wait_for_refreshed_job(&mut self, old_merkle_root: [u8; 32], overall_timeout: Duration) -> Result<()> {
+    async fn wait_for_refreshed_job(
+        &mut self,
+        old_merkle_root: [u8; 32],
+        overall_timeout: Duration,
+    ) -> Result<()> {
         let deadline = Instant::now() + overall_timeout;
         while self.wire.merkle_root == old_merkle_root {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 bail!(
                     "no refreshed shared job (changed merkle_root) within {:?} on channel {}",
-                    overall_timeout, self.channel_id
+                    overall_timeout,
+                    self.channel_id
                 );
             }
             let slice = remaining.min(Duration::from_secs(1));
             match tokio::time::timeout(slice, self.session.read_frame()).await {
                 Ok(inner) => {
-                    let frame = inner?.ok_or_else(|| anyhow::anyhow!("pool closed connection (EOF)"))?;
+                    let frame =
+                        inner?.ok_or_else(|| anyhow::anyhow!("pool closed connection (EOF)"))?;
                     if frame.msg_type == MSG_NEW_MINING_JOB {
                         self.wire = decode_new_template(&frame.payload)?;
                     }
@@ -632,7 +664,10 @@ fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
 fn parse_coinbase_only_block_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8>)>> {
     let bytes = hex::decode(block_hex).context("block hex decode")?;
     if bytes.len() < 128 {
-        bail!("block shorter than the 128-byte Dinero header: {} bytes", bytes.len());
+        bail!(
+            "block shorter than the 128-byte Dinero header: {} bytes",
+            bytes.len()
+        );
     }
     let mut cur = 128usize;
     let (tx_count, n) = read_compact_size(&bytes, cur)?;
@@ -750,7 +785,10 @@ async fn run_shared_split_scenario(
 
     // Wallet + payout address for the pool's own getblocktemplate calls.
     let create = rpc
-        .call_raw("wallet.createhd", serde_json::json!(["regtestw", "", false]))
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["regtestw", "", false]),
+        )
         .await
         .context("createhd")?;
     let address = create
@@ -815,7 +853,9 @@ async fn run_shared_split_scenario(
         stderr_log.clone(),
     )
     .context("spawn dinero-sv2-pool")?;
-    pool.wait_ready().await.context("pool did not start listening")?;
+    pool.wait_ready()
+        .await
+        .context("pool did not start listening")?;
 
     let script_a = payout_script(0xA1);
     let script_b = payout_script(0xB2);
@@ -860,7 +900,11 @@ async fn run_shared_split_scenario(
     // `getblockcount` reports the current TIP height; `pre_pool_height`
     // (from getblocktemplate's `height` field) is the height of the NEXT
     // block to be mined — i.e. exactly `pre_submit_height + 1`.
-    assert_eq!(pre_submit_height + 1, pre_pool_height, "unexpected chain tip drift before block submission");
+    assert_eq!(
+        pre_submit_height + 1,
+        pre_pool_height,
+        "unexpected chain tip drift before block submission"
+    );
 
     miner_a
         .find_and_submit_block()
@@ -912,12 +956,18 @@ async fn run_shared_split_scenario(
         .get("height")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("getblock: missing height"))?;
-    assert_eq!(height, pre_pool_height, "found block is not the expected next height");
+    assert_eq!(
+        height, pre_pool_height,
+        "found block is not the expected next height"
+    );
     let n_tx = block_json
         .get("nTx")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("getblock: missing nTx"))?;
-    assert_eq!(n_tx, 1, "expected a coinbase-only shared block (Task 5/6 scope)");
+    assert_eq!(
+        n_tx, 1,
+        "expected a coinbase-only shared block (Task 5/6 scope)"
+    );
 
     let block_hex = rpc
         .call_raw("getblock", serde_json::json!([block_hash, 0]))
@@ -936,14 +986,20 @@ async fn run_shared_split_scenario(
     let value_a = find_value(&script_a).ok_or_else(|| {
         anyhow::anyhow!(
             "coinbase does not pay miner A's script; outputs: {:?}\npool stderr tail:\n{}",
-            outputs.iter().map(|(v, s)| format!("{}:{}", hex::encode(s), v)).collect::<Vec<_>>(),
+            outputs
+                .iter()
+                .map(|(v, s)| format!("{}:{}", hex::encode(s), v))
+                .collect::<Vec<_>>(),
             pool.tail_log()
         )
     })?;
     let value_b = find_value(&script_b).ok_or_else(|| {
         anyhow::anyhow!(
             "coinbase does not pay miner B's script; outputs: {:?}\npool stderr tail:\n{}",
-            outputs.iter().map(|(v, s)| format!("{}:{}", hex::encode(s), v)).collect::<Vec<_>>(),
+            outputs
+                .iter()
+                .map(|(v, s)| format!("{}:{}", hex::encode(s), v))
+                .collect::<Vec<_>>(),
             pool.tail_log()
         )
     })?;
@@ -974,7 +1030,10 @@ async fn run_shared_split_scenario(
     // una) rounding remainder the split absorbs into the fee slice —
     // see split::compute_split's remainder-handling doc comment.
     let fee_value = find_value(&fee_script).ok_or_else(|| {
-        anyhow::anyhow!("coinbase does not pay the pool's fee script ({})", hex::encode(&fee_script))
+        anyhow::anyhow!(
+            "coinbase does not pay the pool's fee script ({})",
+            hex::encode(&fee_script)
+        )
     })?;
     let expected_fee_una = (u128::from(expected_reward_una) * 200 / 10_000) as u64;
     assert!(
@@ -997,14 +1056,28 @@ async fn run_shared_split_scenario(
     // Compare to the independently fetched daemon template, then require the
     // actual pool submission to have connected under daemon enforcement.
     let expected_root = dinero_sv2_pool::mapper::state_commitment_root(coinbase_hex)?;
-    assert!(expected_root.is_some(), "daemon template must contain DNRS at activation");
+    assert!(
+        expected_root.is_some(),
+        "daemon template must contain DNRS at activation"
+    );
     let expected = dinero_sv2_jd::coinbase::state_commitment_output(expected_root.unwrap());
-    assert_eq!(outputs.iter().filter(|(_, s)| s.len() >= 6 && &s[2..6] == b"DNRS").count(), 1);
-    assert!(outputs.iter().any(|(v,s)| *v == 0 && *s == expected.script_pubkey));
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|(_, s)| s.len() >= 6 && &s[2..6] == b"DNRS")
+            .count(),
+        1
+    );
+    assert!(outputs
+        .iter()
+        .any(|(v, s)| *v == 0 && *s == expected.script_pubkey));
 
     // Every value output sums exactly to the block reward.
     let total: u64 = outputs.iter().map(|(v, _)| *v).sum();
-    assert_eq!(total, expected_reward_una, "coinbase output sum != block reward");
+    assert_eq!(
+        total, expected_reward_una,
+        "coinbase output sum != block reward"
+    );
 
     let scenario_elapsed = started.elapsed();
     eprintln!(
@@ -1038,7 +1111,11 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
         "shared_block_coinbase_pays_window_contributors",
     )
     .await?;
-    assert_eq!(outcome.height, u64::from(SETUP_BLOCKS) + 1, "found block is not the expected next height");
+    assert_eq!(
+        outcome.height,
+        u64::from(SETUP_BLOCKS) + 1,
+        "found block is not the expected next height"
+    );
     Ok(())
 }
 
@@ -1088,11 +1165,18 @@ async fn shared_block_at_dnrw_mandatory_height_includes_witness_commitment() -> 
     // ratio, fee, DNRF, reward sum).
     const DNRW_MAGIC_AND_VERSION: [u8; 7] = [0x6a, 0x25, 0x44, 0x4e, 0x52, 0x57, 0x01];
     assert!(
-        outcome.outputs.iter().any(|(_, s)| s.starts_with(&DNRW_MAGIC_AND_VERSION)),
+        outcome
+            .outputs
+            .iter()
+            .any(|(_, s)| s.starts_with(&DNRW_MAGIC_AND_VERSION)),
         "coinbase at DNRW-mandatory height {} is missing the DNRW witness commitment output; \
          outputs: {:?}",
         outcome.height,
-        outcome.outputs.iter().map(|(v, s)| format!("{}:{}", hex::encode(s), v)).collect::<Vec<_>>()
+        outcome
+            .outputs
+            .iter()
+            .map(|(v, s)| format!("{}:{}", hex::encode(s), v))
+            .collect::<Vec<_>>()
     );
 
     Ok(())
@@ -1102,66 +1186,133 @@ async fn shared_block_at_dnrw_mandatory_height_includes_witness_commitment() -> 
 /// a valid miner-owned coinbase through the live pool's extended-share path.
 #[tokio::test]
 #[ignore = "requires DINEROD_BIN and DINEROMINER_BIN; starts real isolated processes"]
-async fn solo_miner_preserves_dnrs_through_pool() -> Result<()> { run_solo_miner(false).await }
+async fn solo_miner_preserves_dnrs_through_pool() -> Result<()> {
+    run_solo_miner(false).await
+}
 
 #[tokio::test]
 #[ignore = "requires an actual GPU and DINEROGPUMINER_BIN"]
-async fn solo_gpu_miner_preserves_dnrs_through_pool() -> Result<()> { run_solo_miner(true).await }
+async fn solo_gpu_miner_preserves_dnrs_through_pool() -> Result<()> {
+    run_solo_miner(true).await
+}
 
 async fn run_solo_miner(gpu: bool) -> Result<()> {
     // CPU and GPU cases may run concurrently in the ignored-test suite.
     let (rpc_port, pool_port) = if gpu { (29987, 29988) } else { (29985, 29986) };
     let daemon = RegtestDaemon::spawn_at_dnrs(rpc_port, 2)?;
     daemon.wait_for_cookie()?;
-    let rpc = RpcClient::new(daemon.rpc_url.clone(), Auth::Cookie(daemon.cookie_path.display().to_string()))?;
-    let create = rpc.call_raw("wallet.createhd", serde_json::json!(["solo", "", false])).await?;
+    let rpc = RpcClient::new(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+    )?;
+    let create = rpc
+        .call_raw("wallet.createhd", serde_json::json!(["solo", "", false]))
+        .await?;
     let address = create["first_address"].as_str().context("wallet address")?;
     mine_blocks(&rpc, address, 1).await?;
     let gbt = rpc.get_block_template(address).await?;
-    let expected = mapper::state_commitment_root(gbt["coinbasetxn"]["data"].as_str().context("coinbase")?)?.context("DNRS")?;
+    let expected =
+        mapper::state_commitment_root(gbt["coinbasetxn"]["data"].as_str().context("coinbase")?)?
+            .context("DNRS")?;
     let dir = tempfile::tempdir()?;
     let key_path = dir.path().join("pool.key");
     let keys = dinero_sv2_transport::StaticKeys::load_or_generate(&key_path)?;
-    let pool = PoolProcess::spawn(format!("127.0.0.1:{pool_port}").parse()?, &daemon.rpc_url,
-        &daemon.cookie_path, address, &dir.path().join("journal"), &key_path, dir.path().join("pool.log"))?;
+    let pool = PoolProcess::spawn(
+        format!("127.0.0.1:{pool_port}").parse()?,
+        &daemon.rpc_url,
+        &daemon.cookie_path,
+        address,
+        &dir.path().join("journal"),
+        &key_path,
+        dir.path().join("pool.log"),
+    )?;
     pool.wait_ready().await?;
     struct Miner(std::process::Child);
-    impl Drop for Miner { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
-    let miner_bin = std::env::var(if gpu { "DINEROGPUMINER_BIN" } else { "DINEROMINER_BIN" }).context("set miner binary path")?;
+    impl Drop for Miner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let miner_bin = std::env::var(if gpu {
+        "DINEROGPUMINER_BIN"
+    } else {
+        "DINEROMINER_BIN"
+    })
+    .context("set miner binary path")?;
     let script = payout_script(0x71);
-    let mut miner = Miner(Command::new(miner_bin)
-        .args(["--pool", &format!("127.0.0.1:{pool_port}"), "--reward-mode", "solo", "--no-save", "--plain"])
-        .args(if gpu { vec!["--batch-size", "4096"] } else { vec!["--threads", "1"] })
-        .arg("--server-pubkey").arg(keys.public_hex())
-        .arg("--payout-script-hex").arg(hex::encode(&script))
-        .stdin(Stdio::null()).stdout(std::fs::File::create(dir.path().join("miner-output.log"))?)
-        .stderr(std::fs::File::create(dir.path().join("miner.log"))?).spawn()?);
+    let mut miner = Miner(
+        Command::new(miner_bin)
+            .args([
+                "--pool",
+                &format!("127.0.0.1:{pool_port}"),
+                "--reward-mode",
+                "solo",
+                "--no-save",
+                "--plain",
+            ])
+            .args(if gpu {
+                vec!["--batch-size", "4096"]
+            } else {
+                vec!["--threads", "1"]
+            })
+            .arg("--server-pubkey")
+            .arg(keys.public_hex())
+            .arg("--payout-script-hex")
+            .arg(hex::encode(&script))
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(dir.path().join("miner-output.log"))?)
+            .stderr(std::fs::File::create(dir.path().join("miner.log"))?)
+            .spawn()?,
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let height = rpc.call_raw("getblockcount", serde_json::json!([])).await?.as_u64().unwrap_or(0);
-        if height >= 2 { break; }
+        let height = rpc
+            .call_raw("getblockcount", serde_json::json!([]))
+            .await?
+            .as_u64()
+            .unwrap_or(0);
+        if height >= 2 {
+            break;
+        }
         if Instant::now() >= deadline || miner.0.try_wait()?.is_some() {
-            bail!("solo miner did not connect a block; miner={} pool={}",
+            bail!(
+                "solo miner did not connect a block; miner={} pool={}",
                 std::fs::read_to_string(dir.path().join("miner.log"))?,
-                std::fs::read_to_string(dir.path().join("pool.log"))?);
+                std::fs::read_to_string(dir.path().join("pool.log"))?
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let output = std::fs::read_to_string(dir.path().join("miner-output.log"))?;
-    let version_line = output.lines().find(|line| line.starts_with("[software_versions] "))
+    let version_line = output
+        .lines()
+        .find(|line| line.starts_with("[software_versions] "))
         .context("miner must report negotiated software versions")?;
-    let versions: serde_json::Value = serde_json::from_str(version_line.trim_start_matches("[software_versions] "))?;
+    let versions: serde_json::Value =
+        serde_json::from_str(version_line.trim_start_matches("[software_versions] "))?;
     assert_eq!(versions["pool_version"], env!("CARGO_PKG_VERSION"));
-    assert!(output.lines().filter_map(|line| line.strip_prefix("[job_height] "))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|job| job["height"] == 2), "miner must receive the real mining height");
-    assert!(versions["miner_version"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix("[job_height] "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|job| job["height"] == 2),
+        "miner must receive the real mining height"
+    );
+    assert!(versions["miner_version"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
     let hash = rpc.call_raw("getblockhash", serde_json::json!([2])).await?;
-    let raw = rpc.call_raw("getblock", serde_json::json!([hash, 0])).await?;
+    let raw = rpc
+        .call_raw("getblock", serde_json::json!([hash, 0]))
+        .await?;
     let outputs = parse_coinbase_only_block_outputs(raw.as_str().context("raw block")?)?;
     let dnrs = dinero_sv2_jd::coinbase::state_commitment_output(expected);
-    assert!(outputs.iter().any(|(v,s)| *v == 0 && *s == dnrs.script_pubkey));
-    assert!(outputs.iter().any(|(v,s)| *v > 0 && *s == script));
+    assert!(outputs
+        .iter()
+        .any(|(v, s)| *v == 0 && *s == dnrs.script_pubkey));
+    assert!(outputs.iter().any(|(v, s)| *v > 0 && *s == script));
     eprintln!("solo miner (gpu={gpu}) -> pool -> daemon: accepted DNRS block {hash}");
     Ok(())
 }

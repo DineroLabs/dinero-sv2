@@ -79,7 +79,12 @@ pub fn build_shared_template(
         .as_ref()
         .ok_or_else(|| anyhow!("template lacks utreexo pre-block state"))?;
 
-    anyhow::ensure!(split_outputs.iter().all(|o| o.script_pubkey.first() != Some(&0x6a)), "split must contain payout outputs only");
+    anyhow::ensure!(
+        split_outputs
+            .iter()
+            .all(|o| o.script_pubkey.first() != Some(&0x6a)),
+        "split must contain payout outputs only"
+    );
     let mut outputs = split_outputs;
     if let Some(root) = crate::mapper::state_commitment_root(&pt.coinbase_full_hex)? {
         outputs.push(dinero_sv2_jd::coinbase::state_commitment_output(root));
@@ -197,21 +202,41 @@ mod tests {
     #[test]
     fn shared_dnrs_preserves_daemon_root_and_rejects_bad_candidates() {
         let mut pt = crate::mapper::tests::fixture_pool_template();
-        let pay = CoinbaseOutput { value_una: pt.coinbase_value_una, script_pubkey: vec![0x51] };
+        let pay = CoinbaseOutput {
+            value_una: pt.coinbase_value_una,
+            script_pubkey: vec![0x51],
+        };
         let dnrs = dinero_sv2_jd::coinbase::state_commitment_output([0x35; 32]);
         for bad in 0..4 {
             let mut source = vec![pay.clone(), dnrs.clone()];
-            if bad == 1 { source.push(dnrs.clone()); }
-            if bad == 2 { source[1].script_pubkey[6] = 2; }
-            if bad == 3 { source[1].value_una = 1; }
-            let (raw, _) = assemble_stripped_coinbase(&pt.coinbase_prefix, &source, &pt.coinbase_suffix);
+            if bad == 1 {
+                source.push(dnrs.clone());
+            }
+            if bad == 2 {
+                source[1].script_pubkey[6] = 2;
+            }
+            if bad == 3 {
+                source[1].value_una = 1;
+            }
+            let (raw, _) =
+                assemble_stripped_coinbase(&pt.coinbase_prefix, &source, &pt.coinbase_suffix);
             pt.coinbase_full_hex = hex::encode(raw);
-            let result = build_shared_template(&pt, vec![pay.clone()], None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET);
+            let result = build_shared_template(
+                &pt,
+                vec![pay.clone()],
+                None,
+                UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+            );
             if bad == 0 {
                 let built = result.unwrap();
-                assert_eq!(crate::mapper::state_commitment_root(&built.coinbase_full_hex).unwrap(), Some([0x35;32]));
+                assert_eq!(
+                    crate::mapper::state_commitment_root(&built.coinbase_full_hex).unwrap(),
+                    Some([0x35; 32])
+                );
                 assert_eq!(built.outputs.iter().filter(|o| **o == dnrs).count(), 1);
-            } else { assert!(result.is_err()); }
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 
@@ -233,7 +258,13 @@ mod tests {
                 script_pubkey: vec![0x51, 0x20, 0x09],
             },
         ];
-        let st = build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
+        let st = build_shared_template(
+            &pt,
+            outputs.clone(),
+            None,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
 
         // Value invariant:
         let cb = hex::decode(&st.coinbase_full_hex).unwrap();
@@ -242,8 +273,12 @@ mod tests {
         assert_eq!(st.outputs.len(), 4);
         assert_eq!(st.outputs[0], outputs[0]);
         assert_eq!(st.outputs[1], outputs[1]);
-        assert!(st.outputs[2].script_pubkey.starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x57])); // DNRW
-        assert!(st.outputs[3].script_pubkey.starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x46])); // DNRF
+        assert!(st.outputs[2]
+            .script_pubkey
+            .starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x57])); // DNRW
+        assert!(st.outputs[3]
+            .script_pubkey
+            .starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x46])); // DNRF
 
         // Roots differ from the daemon-template ones (different coinbase):
         assert_ne!(st.wire.merkle_root, pt.wire.merkle_root);
@@ -296,9 +331,13 @@ mod tests {
             UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
         )
         .unwrap();
-        let base =
-            build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
-                .unwrap();
+        let base = build_shared_template(
+            &pt,
+            outputs.clone(),
+            None,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
 
         assert_ne!(a.wire.merkle_root, b.wire.merkle_root);
         assert_ne!(a.wire.utreexo_root, b.wire.utreexo_root);
@@ -333,9 +372,13 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let base =
-            build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
-                .unwrap();
+        let base = build_shared_template(
+            &pt,
+            outputs.clone(),
+            None,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
         let en = build_shared_template(
             &pt,
             outputs,
@@ -383,7 +426,13 @@ mod tests {
         };
         let merged = split::merge_duplicate_outputs(split::compute_split(&weights, &params));
 
-        let st = build_shared_template(&pt, merged.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
+        let st = build_shared_template(
+            &pt,
+            merged.clone(),
+            None,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
 
         // The template's leading value outputs (before DNRW/DNRF) must
         // equal the merged compute_split result exactly.
@@ -402,7 +451,8 @@ mod tests {
             value_una: pt.coinbase_value_una - 1,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
+        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
+            .unwrap_err();
         assert!(err.to_string().contains("split sum"));
     }
 
@@ -414,7 +464,8 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
+        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
+            .unwrap_err();
         assert!(err.to_string().contains("utreexo pre-block"));
     }
 
@@ -433,7 +484,8 @@ mod tests {
             value_una: pt.coinbase_value_una,
             script_pubkey: vec![0x51, 0x20, 0x01],
         }];
-        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap_err();
+        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
+            .unwrap_err();
         assert!(err.to_string().contains("coinbase-only"));
     }
 
@@ -455,16 +507,25 @@ mod tests {
                 script_pubkey: vec![0x51, 0x20, 0x09],
             },
         ];
-        let st = build_shared_template(&pt, outputs.clone(), None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET).unwrap();
+        let st = build_shared_template(
+            &pt,
+            outputs.clone(),
+            None,
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
 
         // Should have 2 value outputs + DNRF only (no DNRW).
         assert_eq!(st.outputs.len(), 3);
         assert_eq!(st.outputs[0], outputs[0]);
         assert_eq!(st.outputs[1], outputs[1]);
         // DNRF: starts with 0x6a 0x25 0x44 0x4e 0x52 0x46 ("DNRF" magic).
-        assert!(st.outputs[2].script_pubkey.starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x46]));
+        assert!(st.outputs[2]
+            .script_pubkey
+            .starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x46]));
         // Verify no script starts with DNRW prefix (0x6a 0x25 0x44 0x4e 0x52 0x57).
-        assert!(!st.outputs.iter()
-            .any(|o| o.script_pubkey.starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x57])));
+        assert!(!st.outputs.iter().any(|o| o
+            .script_pubkey
+            .starts_with(&[0x6a, 0x25, 0x44, 0x4E, 0x52, 0x57])));
     }
 }

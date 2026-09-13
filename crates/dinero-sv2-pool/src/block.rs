@@ -43,9 +43,8 @@ pub fn assemble_block_hex_raw(
     let tx_count = 1 + mempool_tx_data.len();
     let varint = compact_size(tx_count as u64);
     let mempool_size: usize = mempool_tx_data.iter().map(|t| t.len()).sum();
-    let mut buf = Vec::with_capacity(
-        header.len() + varint.len() + coinbase_bytes.len() + mempool_size,
-    );
+    let mut buf =
+        Vec::with_capacity(header.len() + varint.len() + coinbase_bytes.len() + mempool_size);
     buf.extend_from_slice(&header);
     buf.extend_from_slice(&varint);
     buf.extend_from_slice(coinbase_bytes);
@@ -168,7 +167,9 @@ mod tests {
     #[test]
     fn wrap_stripped_reinserts_segwit_marker_and_witness() {
         // stripped = version(4) || vin+vout(3) || locktime(4)
-        let stripped = vec![0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x00];
+        let stripped = vec![
+            0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x00,
+        ];
         let witness = vec![0xDE, 0xAD];
         let suffix = vec![0x00, 0x00, 0x00, 0x00];
         let wrapped = wrap_stripped_with_segwit_witness(&stripped, &witness, &suffix);

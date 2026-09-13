@@ -15,7 +15,7 @@
 
 use dinero_sv2_pool::{
     accounting, backend, bans, block, dedup, job_generation, journal, mapper, ops, rpc,
-    shared_template, split, supervisor, target,
+    shared_template, split, stats, supervisor, target,
 };
 
 use std::net::SocketAddr;
@@ -284,6 +284,23 @@ struct Args {
     #[arg(long, default_value = "/var/lib/dinero-sv2/pplns-journal.jsonl")]
     pplns_journal: PathBuf,
 
+    /// PUBLIC, unauthenticated, read-only stats listener: `GET /api/stats`,
+    /// `/api/blocks?limit=N`, `/api/miner/<din1p...>`, and an HTML index
+    /// at `/`. OFF unless set. Deliberately separate from --ops-bind: it
+    /// shares no token, no route and no code path with the operator
+    /// endpoint, and exposes no payout address, fee control or
+    /// configuration — so it is safe behind a reverse proxy. Bind it on
+    /// loopback and let the proxy terminate TLS; a port already in use
+    /// fails startup rather than silently running without the page.
+    #[arg(long, requires = "public_stratum_addr")]
+    public_stats_bind: Option<String>,
+
+    /// Stratum endpoint the public stats API advertises to strangers,
+    /// e.g. `pool.example.org:4444`. Required with --public-stats-bind:
+    /// there is no sane default (the internal --bind is not it).
+    #[arg(long)]
+    public_stratum_addr: Option<String>,
+
     /// Utreexo maturity-leaf hard-fork activation height for the
     /// network this pool's dinerod is running. Coinbase leaves created
     /// at/above this height hash with the v2 (maturity-bound) preimage;
@@ -407,6 +424,18 @@ async fn main() -> Result<()> {
     let window = Arc::new(Mutex::new(recovered));
     let journal = Arc::new(Mutex::new(recovered_journal));
 
+    // Found-blocks log, next to the journal. Kept whether or not the public
+    // stats listener is on, so history exists the day it is switched on.
+    // Not fatal: block history is a courtesy, share credit is not.
+    let found_blocks_path = args.pplns_journal.with_file_name(stats::BLOCK_LOG_BASENAME);
+    if let Err(e) = stats::blocks().attach(&found_blocks_path) {
+        warn!(
+            error = %e,
+            path = %found_blocks_path.display(),
+            "found-blocks log unavailable; block history is in-memory only"
+        );
+    }
+
     // Payout address: file beats flag (see payout.rs). Held in a watch so the
     // template producer picks up a runtime change on its next iteration —
     // no restart, and no chance of a half-applied swap.
@@ -527,7 +556,7 @@ async fn main() -> Result<()> {
                 }
 
                 match mapper::state_commitment_root(&pt.coinbase_full_hex) {
-                    Ok(root) if root.is_some() || pt.height < state_commitment_height => {},
+                    Ok(root) if root.is_some() || pt.height < state_commitment_height => {}
                     other => {
                         warn!(height = pt.height, result = ?other, "refusing template with missing or invalid DNRS; upgrade backend");
                         continue;
@@ -870,6 +899,62 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Public stats listener. Off unless asked for. Like ops, a bind failure
+    // is fatal: a configured-but-dead endpoint is worse than a loud exit.
+    if let Some(public_bind) = args
+        .public_stats_bind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let listener = stats::bind(public_bind).await?;
+        let stats_window = window.clone();
+        let stats_fee_rx = fee_rx.clone();
+        let stats_templates = rx.clone();
+        let stats_connected = connected_miners.clone();
+        // clap enforces `requires`; this is belt and braces for a future
+        // caller that builds Args by hand.
+        let stratum = args
+            .public_stratum_addr
+            .clone()
+            .context("--public-stratum-addr is required with --public-stats-bind")?;
+        let min_payout_una = args.shared_dust_una;
+        // Called at most once per cache TTL, however many requests arrive.
+        let sample = Arc::new(move || {
+            let window = stats_window
+                .lock()
+                .unwrap()
+                .entries()
+                .cloned()
+                .collect::<Vec<_>>();
+            let (blocks, blocks_found_total) = stats::blocks().snapshot();
+            let telemetry = ops::telemetry().snapshot();
+            let (network_nbits, next_reward_una) = stats_templates
+                .borrow()
+                .as_ref()
+                .map(|b| (b.pt.wire.difficulty, b.pt.coinbase_value_una))
+                .unwrap_or((0, 0));
+            stats::Sample {
+                now_unix: stats::now_unix(),
+                window,
+                blocks,
+                blocks_found_total,
+                fee_bps: *stats_fee_rx.borrow(),
+                min_payout_una,
+                stratum: stratum.clone(),
+                network_height: telemetry.daemon_blocks,
+                network_nbits,
+                next_reward_una,
+                connected_workers: stats_connected.load(Ordering::Relaxed),
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = stats::serve(listener, sample, stats::Config::default()).await {
+                warn!(error = %e, "public stats endpoint stopped");
+            }
+        });
+    }
+
     // Miner acceptor.
     //
     // Two independent ways the template producer can stop serving:
@@ -918,8 +1003,6 @@ async fn main() -> Result<()> {
         let dedup = dedup.clone();
         let utreexo_maturity_leaf_height = args.utreexo_maturity_leaf_height;
         tokio::spawn(async move {
-            conn_gauge.fetch_add(1, Ordering::Relaxed);
-            let _gauge = ConnGauge(conn_gauge);
             info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
                 Ok(s) => s,
@@ -928,6 +1011,13 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
+            // Counted only once the Noise handshake succeeds: a port scan
+            // or a TLS probe that opens a socket and leaves must not show
+            // up as a worker on the ops or public gauges. The guard is
+            // created here too, so the decrement matches on every exit
+            // path from this point.
+            conn_gauge.fetch_add(1, Ordering::Relaxed);
+            let _gauge = ConnGauge(conn_gauge);
             let miner_key = session.peer_static_key();
             info!(%peer, channel_id, miner = %hex::encode(miner_key), "noise handshake complete");
             if let Err(e) = serve_miner(
@@ -1038,10 +1128,14 @@ async fn serve_miner(
     session
         .write_frame(
             MSG_SETUP_CONNECTION_SUCCESS,
-            &dinero_sv2_codec::sv2::encode_setup_success_with_pool_version(&SetupConnectionSuccess {
-                used_version: PROTOCOL_VERSION,
-                flags: setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
-            }, setup.flags, env!("CARGO_PKG_VERSION"))?,
+            &dinero_sv2_codec::sv2::encode_setup_success_with_pool_version(
+                &SetupConnectionSuccess {
+                    used_version: PROTOCOL_VERSION,
+                    flags: setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
+                },
+                setup.flags,
+                env!("CARGO_PKG_VERSION"),
+            )?,
         )
         .await?;
     info!(
@@ -1207,11 +1301,27 @@ async fn serve_miner(
                 if let Some(st) =
                     derive_channel_shared(&bundle, channel_id, utreexo_maturity_leaf_height)
                 {
-                    push_shared_job(&mut session, channel_id, &st, &window, payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
+                    push_shared_job(
+                        &mut session,
+                        channel_id,
+                        &st,
+                        &window,
+                        payout_script,
+                        setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
+                    )
+                    .await?;
                     current_shared = Some(st);
                 }
             }
-            None => push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?,
+            None => {
+                push_job(
+                    &mut session,
+                    channel_id,
+                    &bundle.pt,
+                    setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
+                )
+                .await?
+            }
         }
         current = Some(bundle);
     }
@@ -1543,7 +1653,8 @@ async fn push_job(
         session.write_frame(MSG_COINBASE_CONTEXT, &payload).await?;
     }
 
-    let payload = dinero_sv2_codec::encode_job_height(&pt.wire, height_enabled.then_some(pt.height));
+    let payload =
+        dinero_sv2_codec::encode_job_height(&pt.wire, height_enabled.then_some(pt.height));
     session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
     debug!(
         template_id = pt.wire.template_id,
@@ -1577,7 +1688,10 @@ async fn push_shared_job(
         .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
         .await?;
     session
-        .write_frame(MSG_NEW_MINING_JOB, &dinero_sv2_codec::encode_job_height(&st.wire, height_enabled.then_some(st.height)))
+        .write_frame(
+            MSG_NEW_MINING_JOB,
+            &dinero_sv2_codec::encode_job_height(&st.wire, height_enabled.then_some(st.height)),
+        )
         .await?;
     let (bps, shares) = {
         let w = window.lock().expect("pplns window mutex");
@@ -1729,6 +1843,14 @@ async fn handle_share(
                 );
                 ledger.credit_block(miner_key);
                 ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
+                stats::blocks().record(stats::FoundBlock {
+                    height: u64::from(pt.height),
+                    hash: hex::encode(hash),
+                    time: stats::now_unix(),
+                    reward_una: pt.coinbase_value_una,
+                    status: "accepted".to_string(),
+                    outputs: Vec::new(),
+                });
             }
             Ok(SubmitBlockResult::Rejected(reason)) => {
                 warn!(
@@ -1895,9 +2017,15 @@ async fn handle_shared_share(
         // Serialize credit order with journal order. Keep the journal guard
         // through compaction, but release the window guard before disk I/O.
         let mut j = journal.lock().expect("pplns journal mutex");
-        j.credit(window, &WindowEntry {
-            payout_script: payout_script.to_vec(), weight, unix_ts: ts,
-        }).context("persisting share credit")?;
+        j.credit(
+            window,
+            &WindowEntry {
+                payout_script: payout_script.to_vec(),
+                weight,
+                unix_ts: ts,
+            },
+        )
+        .context("persisting share credit")?;
     }
 
     ledger.credit_share(miner_key);
@@ -1937,6 +2065,18 @@ async fn handle_shared_share(
                 );
                 ledger.credit_block(miner_key);
                 ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
+                stats::blocks().record(stats::FoundBlock {
+                    height: u64::from(st.height),
+                    hash: hex::encode(hash),
+                    time: stats::now_unix(),
+                    reward_una: st.outputs.iter().map(|o| o.value_una).sum(),
+                    status: "accepted".to_string(),
+                    outputs: st
+                        .outputs
+                        .iter()
+                        .map(|o| (hex::encode(&o.script_pubkey), o.value_una))
+                        .collect(),
+                });
             }
             Ok(SubmitBlockResult::Rejected(reason)) => {
                 warn!(
@@ -2086,11 +2226,21 @@ async fn handle_extended_share(
     }
 
     let expected_dnrs = mapper::state_commitment_root(&pt.coinbase_full_hex)?;
-    let dnrs_valid = mapper::valid_state_commitment_outputs(expected_dnrs,
-        ext.coinbase_outputs.iter().map(|o| (o.value_una, o.script_pubkey.as_slice())));
+    let dnrs_valid = mapper::valid_state_commitment_outputs(
+        expected_dnrs,
+        ext.coinbase_outputs
+            .iter()
+            .map(|o| (o.value_una, o.script_pubkey.as_slice())),
+    );
     if !dnrs_valid {
         ledger.reject(miner_key);
-        send_share_error(session, channel_id, ext.sequence_number, "bad-dnrs-upgrade-miner").await?;
+        send_share_error(
+            session,
+            channel_id,
+            ext.sequence_number,
+            "bad-dnrs-upgrade-miner",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2220,6 +2370,14 @@ async fn handle_extended_share(
                     info!("★ extended-share block ACCEPTED by dinerod");
                     ledger.credit_block(miner_key);
                     ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
+                    stats::blocks().record(stats::FoundBlock {
+                        height: u64::from(pt.height),
+                        hash: hex::encode(hash),
+                        time: stats::now_unix(),
+                        reward_una: pt.coinbase_value_una,
+                        status: "accepted".to_string(),
+                        outputs: Vec::new(),
+                    });
                 }
                 Ok(SubmitBlockResult::Rejected(reason)) => {
                     warn!(reason, "dinerod rejected our extended-share block");
@@ -2433,6 +2591,39 @@ mod cli_tests {
             !b.ops_allow_payout_change && !b.ops_allow_fee_change,
             "enabling bans must not enable the money-routing verbs"
         );
+    }
+
+    // The public API advertises a stratum endpoint to strangers. Defaulting
+    // it to the internal --bind would publish "0.0.0.0:4444", so the flag is
+    // required the moment the listener is enabled — refused at parse time.
+    #[test]
+    fn public_stats_requires_an_advertised_stratum_address() {
+        assert!(Args::try_parse_from([
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--public-stats-bind",
+            "127.0.0.1:8080",
+        ])
+        .is_err());
+        let a = Args::try_parse_from([
+            "pool",
+            "--payout-address",
+            "din1pxx",
+            "--public-stats-bind",
+            "127.0.0.1:8080",
+            "--public-stratum-addr",
+            "pool.example.org:4444",
+        ])
+        .unwrap();
+        assert_eq!(a.public_stats_bind.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(
+            a.public_stratum_addr.as_deref(),
+            Some("pool.example.org:4444")
+        );
+        // Off by default, and the stratum flag alone is harmless.
+        let b = Args::try_parse_from(["pool", "--payout-address", "din1pxx"]).unwrap();
+        assert!(b.public_stats_bind.is_none());
     }
 
     #[test]

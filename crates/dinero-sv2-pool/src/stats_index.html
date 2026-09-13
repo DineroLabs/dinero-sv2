@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dinero pool</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1a1a; --muted: #666; --bg: #fafafa; --card: #fff; --line: #e3e3e3; --accent: #b8860b; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececec; --muted: #9a9a9a; --bg: #101010; --card: #181818; --line: #2a2a2a; --accent: #e0b040; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 2rem 0 .75rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; }
+  .card .k { font-size: .75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 1.45rem; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: .15rem; }
+  .card .s { font-size: .8rem; color: var(--muted); }
+  code, pre { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .75rem 1rem; overflow-x: auto; margin: .35rem 0 1rem; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: .8rem; }
+  td.hash { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .8rem; max-width: 0; width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .wrap { overflow-x: auto; }
+  a { color: var(--accent); }
+  #err { color: #c0392b; display: none; margin: 1rem 0; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Dinero pool</h1>
+  <p class="sub">Shared (PPLNS) Stratum V2 pool &middot; stratum <code id="stratum">&hellip;</code> &middot; fee <span id="fee">&hellip;</span></p>
+
+  <div class="grid">
+    <div class="card"><div class="k">Shared hashrate</div><div class="v" id="hashrate">&hellip;</div><div class="s">PPLNS shares, last 10 minutes</div></div>
+    <div class="card"><div class="k">Miners</div><div class="v" id="miners">&hellip;</div><div class="s"><span id="workers">&hellip;</span> connected workers</div></div>
+    <div class="card"><div class="k">Last block</div><div class="v" id="lastblock">&hellip;</div><div class="s" id="lastblockage">&hellip;</div></div>
+    <div class="card"><div class="k">Blocks found</div><div class="v" id="blocks24">&hellip;</div><div class="s"><span id="blockstotal">&hellip;</span> all time</div></div>
+    <div class="card"><div class="k">Network</div><div class="v" id="height">&hellip;</div><div class="s">difficulty <span id="difficulty">&hellip;</span></div></div>
+  </div>
+  <p id="err">Could not load <code>/api/stats</code>.</p>
+
+  <h2>Start mining</h2>
+  <p>Install with one pasted command, then run the miner with your own <code>din1p&hellip;</code> reward address. No node, no config file, no chain sync.</p>
+  <p><strong>macOS / Linux / Chromebook</strong></p>
+  <pre>curl -fsSL https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.sh | sh
+cd "$HOME/.local/bin" &amp;&amp; ./dinero-miner --address "YOUR_DIN1_ADDRESS" --reward-mode shared --threads 2</pre>
+  <p><strong>Windows (PowerShell)</strong></p>
+  <pre>irm https://raw.githubusercontent.com/DineroLabs/dinero-sv2/main/scripts/install.ps1 | iex
+cd "$env:LOCALAPPDATA\DineroMiner\bin"; .\dinero-miner.exe --address "YOUR_DIN1_ADDRESS" --reward-mode shared --threads 2</pre>
+  <p>More at <a href="https://dinerolabs.org">dinerolabs.org</a> and <a href="https://github.com/DineroLabs/dinero-sv2">github.com/DineroLabs/dinero-sv2</a>.</p>
+
+  <h2>Recent blocks</h2>
+  <div class="wrap"><table>
+    <thead><tr><th>Height</th><th>When</th><th>Reward</th><th>Hash</th></tr></thead>
+    <tbody id="blocks"><tr><td colspan="4">&hellip;</td></tr></tbody>
+  </table></div>
+
+  <h2>API</h2>
+  <p>Read-only JSON, cross-origin friendly, no key needed:
+    <code><a href="/api/stats">/api/stats</a></code>,
+    <code><a href="/api/blocks?limit=50">/api/blocks?limit=N</a></code>,
+    <code>/api/miner/&lt;din1p&hellip;&gt;</code>.</p>
+
+  <footer>Updated <span id="updated">&hellip;</span>. Refreshes every 30 seconds.</footer>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function hs(n) {
+    var u = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s"], i = 0; n = Number(n) || 0;
+    while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+    return (i ? n.toFixed(2) : Math.round(n)) + " " + u[i];
+  }
+  function ago(t) {
+    if (!t) return "";
+    var s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (s < 90) return s + "s ago";
+    if (s < 5400) return Math.round(s / 60) + " min ago";
+    if (s < 172800) return (s / 3600).toFixed(1) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  }
+  function din(una) { return (Number(una) / 1e8).toFixed(4) + " DIN"; }
+  function diff(d) { d = Number(d) || 0; return d >= 1e6 ? d.toExponential(2) : d.toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function load() {
+    fetch("/api/stats", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (s) {
+      $("err").style.display = "none";
+      $("stratum").textContent = s.stratum;
+      $("fee").textContent = (s.fee_bps / 100).toFixed(2) + "% (" + s.payout_scheme + ")";
+      $("hashrate").textContent = hs(s.pool_hashrate_hs);
+      $("miners").textContent = s.miners;
+      $("workers").textContent = s.workers;
+      $("lastblock").textContent = s.last_block_height == null ? "none yet" : "#" + s.last_block_height;
+      $("lastblockage").textContent = s.last_block_time ? ago(s.last_block_time) : "";
+      $("blocks24").textContent = s.blocks_found_24h + " / 24h";
+      $("blockstotal").textContent = s.blocks_found_total;
+      $("height").textContent = "#" + s.network_height;
+      $("difficulty").textContent = diff(s.network_difficulty);
+      $("updated").textContent = new Date(s.updated_at * 1000).toLocaleTimeString();
+    }).catch(function () { $("err").style.display = "block"; });
+    fetch("/api/blocks?limit=10", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (bs) {
+      var tb = $("blocks");
+      if (!bs.length) { tb.innerHTML = '<tr><td colspan="4">No blocks found yet.</td></tr>'; return; }
+      tb.innerHTML = bs.map(function (b) {
+        return "<tr><td>#" + esc(b.height) + "</td><td>" + esc(ago(b.time)) + "</td><td>" + esc(din(b.reward_una)) + '</td><td class="hash" title="' + esc(b.hash) + '">' + esc(b.hash) + "</td></tr>";
+      }).join("");
+    }).catch(function () {});
+  }
+  load();
+  setInterval(load, 30000);
+})();
+</script>
+</body>
+</html>

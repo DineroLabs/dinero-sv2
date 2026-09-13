@@ -23,8 +23,11 @@ pub fn compute_split(weights: &HashMap<Vec<u8>, u128>, p: &SplitParams) -> Vec<C
     let pot = p.reward_una - fee_una;
 
     // Deterministic order: weight desc, then script asc.
-    let mut ranked: Vec<(&Vec<u8>, u128)> =
-        weights.iter().map(|(k, v)| (k, *v)).filter(|(_, w)| *w > 0).collect();
+    let mut ranked: Vec<(&Vec<u8>, u128)> = weights
+        .iter()
+        .map(|(k, v)| (k, *v))
+        .filter(|(_, w)| *w > 0)
+        .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     ranked.truncate(p.max_outputs);
 
@@ -36,14 +39,20 @@ pub fn compute_split(weights: &HashMap<Vec<u8>, u128>, p: &SplitParams) -> Vec<C
         for (script, w) in &ranked {
             let v = ((u128::from(pot) * w) / elected_total) as u64;
             if v > 0 && v >= p.dust_una {
-                outs.push(CoinbaseOutput { value_una: v, script_pubkey: (*script).clone() });
+                outs.push(CoinbaseOutput {
+                    value_una: v,
+                    script_pubkey: (*script).clone(),
+                });
                 paid += v;
             }
         }
     }
     if outs.is_empty() && pot > 0 {
         // Empty window (or everything dusted): finder takes the pot.
-        outs.push(CoinbaseOutput { value_una: pot, script_pubkey: p.finder_script.to_vec() });
+        outs.push(CoinbaseOutput {
+            value_una: pot,
+            script_pubkey: p.finder_script.to_vec(),
+        });
         paid = pot;
     }
 
@@ -63,10 +72,17 @@ pub fn compute_split(weights: &HashMap<Vec<u8>, u128>, p: &SplitParams) -> Vec<C
             }
         }
     }
-    let fee_total = if remainder > 0 && !remainder_absorbed { fee_una + remainder } else { fee_una };
+    let fee_total = if remainder > 0 && !remainder_absorbed {
+        fee_una + remainder
+    } else {
+        fee_una
+    };
     // Never emit a zero-value output.
     if fee_total > 0 {
-        outs.push(CoinbaseOutput { value_una: fee_total, script_pubkey: p.fee_script.to_vec() });
+        outs.push(CoinbaseOutput {
+            value_una: fee_total,
+            script_pubkey: p.fee_script.to_vec(),
+        });
     }
 
     assert_eq!(
@@ -90,7 +106,10 @@ pub fn compute_split(weights: &HashMap<Vec<u8>, u128>, p: &SplitParams) -> Vec<C
 pub fn merge_duplicate_outputs(outputs: Vec<CoinbaseOutput>) -> Vec<CoinbaseOutput> {
     let mut merged: Vec<CoinbaseOutput> = Vec::with_capacity(outputs.len());
     for o in outputs {
-        match merged.iter_mut().find(|e| e.script_pubkey == o.script_pubkey) {
+        match merged
+            .iter_mut()
+            .find(|e| e.script_pubkey == o.script_pubkey)
+        {
             Some(existing) => existing.value_una += o.value_una,
             None => merged.push(o),
         }
@@ -120,7 +139,10 @@ mod tests {
             finder_script: &s(1),
         };
         let outs = compute_split(&w, &p);
-        assert_eq!(outs.iter().map(|o| o.value_una).sum::<u64>(), 10_000_000_000);
+        assert_eq!(
+            outs.iter().map(|o| o.value_una).sum::<u64>(),
+            10_000_000_000
+        );
         let fee = outs.iter().find(|o| o.script_pubkey == s(9)).unwrap();
         assert!(fee.value_una >= 200_000_000); // ≥2% (may absorb rounding)
         let a = outs.iter().find(|o| o.script_pubkey == s(1)).unwrap();
@@ -146,7 +168,10 @@ mod tests {
         let outs = compute_split(&w, &p);
         // ≤ 20 contributor outputs + 1 fee output:
         assert!(outs.len() <= 21);
-        assert_eq!(outs.iter().map(|o| o.value_una).sum::<u64>(), 10_000_000_000);
+        assert_eq!(
+            outs.iter().map(|o| o.value_una).sum::<u64>(),
+            10_000_000_000
+        );
         assert!(!outs.iter().any(|o| o.script_pubkey == s(200)));
     }
 
@@ -164,11 +189,17 @@ mod tests {
         let outs = compute_split(&w, &p);
         assert_eq!(outs.len(), 2);
         assert_eq!(
-            outs.iter().find(|o| o.script_pubkey == s(7)).unwrap().value_una,
+            outs.iter()
+                .find(|o| o.script_pubkey == s(7))
+                .unwrap()
+                .value_una,
             9_800_000_000
         );
         assert_eq!(
-            outs.iter().find(|o| o.script_pubkey == s(9)).unwrap().value_una,
+            outs.iter()
+                .find(|o| o.script_pubkey == s(9))
+                .unwrap()
+                .value_una,
             200_000_000
         );
     }
@@ -177,7 +208,11 @@ mod tests {
     /// exactly to the reward. Shared by every test below (F3).
     fn assert_split_invariant(outs: &[CoinbaseOutput], reward_una: u64) {
         for o in outs {
-            assert!(o.value_una > 0, "zero-value output emitted: {:?}", o.script_pubkey);
+            assert!(
+                o.value_una > 0,
+                "zero-value output emitted: {:?}",
+                o.script_pubkey
+            );
         }
         assert_eq!(outs.iter().map(|o| o.value_una).sum::<u64>(), reward_una);
     }
@@ -223,7 +258,10 @@ mod tests {
         };
         let outs = compute_split(&w, &p);
         assert_split_invariant(&outs, 10_000_000);
-        assert!(!outs.iter().any(|o| o.script_pubkey == s(2)), "dusted B must not appear");
+        assert!(
+            !outs.iter().any(|o| o.script_pubkey == s(2)),
+            "dusted B must not appear"
+        );
         let a = outs.iter().find(|o| o.script_pubkey == s(1)).unwrap();
         assert_eq!(a.value_una, 9_702_000);
         let fee = outs.iter().find(|o| o.script_pubkey == s(9)).unwrap();
@@ -250,11 +288,17 @@ mod tests {
         assert_split_invariant(&outs, 10_000_000_000);
         assert_eq!(outs.len(), 2);
         assert_eq!(
-            outs.iter().find(|o| o.script_pubkey == s(7)).unwrap().value_una,
+            outs.iter()
+                .find(|o| o.script_pubkey == s(7))
+                .unwrap()
+                .value_una,
             9_800_000_000
         );
         assert_eq!(
-            outs.iter().find(|o| o.script_pubkey == s(9)).unwrap().value_una,
+            outs.iter()
+                .find(|o| o.script_pubkey == s(9))
+                .unwrap()
+                .value_una,
             200_000_000
         );
     }
@@ -290,8 +334,14 @@ mod tests {
         // (finder's pot share + the fee slice) that must collapse into
         // one before build_shared_template sees them.
         let outs = vec![
-            CoinbaseOutput { value_una: 9_800_000_000, script_pubkey: s(9) },
-            CoinbaseOutput { value_una: 200_000_000, script_pubkey: s(9) },
+            CoinbaseOutput {
+                value_una: 9_800_000_000,
+                script_pubkey: s(9),
+            },
+            CoinbaseOutput {
+                value_una: 200_000_000,
+                script_pubkey: s(9),
+            },
         ];
         let merged = merge_duplicate_outputs(outs);
         assert_eq!(merged.len(), 1);
@@ -302,9 +352,18 @@ mod tests {
     #[test]
     fn merge_duplicate_outputs_preserves_order_and_non_dupes() {
         let outs = vec![
-            CoinbaseOutput { value_una: 100, script_pubkey: s(1) },
-            CoinbaseOutput { value_una: 50, script_pubkey: s(2) },
-            CoinbaseOutput { value_una: 25, script_pubkey: s(1) },
+            CoinbaseOutput {
+                value_una: 100,
+                script_pubkey: s(1),
+            },
+            CoinbaseOutput {
+                value_una: 50,
+                script_pubkey: s(2),
+            },
+            CoinbaseOutput {
+                value_una: 25,
+                script_pubkey: s(1),
+            },
         ];
         let merged = merge_duplicate_outputs(outs);
         assert_eq!(merged.len(), 2);
@@ -331,7 +390,11 @@ mod tests {
             finder_script: &s(9),
         };
         let outs = compute_split(&w, &p);
-        assert_eq!(outs.len(), 2, "compute_split emits two same-script outputs pre-merge");
+        assert_eq!(
+            outs.len(),
+            2,
+            "compute_split emits two same-script outputs pre-merge"
+        );
         let merged = merge_duplicate_outputs(outs);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].script_pubkey, s(9));
