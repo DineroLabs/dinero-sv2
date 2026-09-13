@@ -1417,7 +1417,9 @@ impl Emitter {
                     // deliberately NOT surfaced as a lifecycle line — job churn would
                     // spam the permanent history; the feed itself shows the work.
                 }
-                "set_new_prev_hash" => { /* same: silent in FX mode */ }
+                "set_new_prev_hash" => fx.set_mining_parent_hash(
+                    data.get("prev_hash").and_then(|v| v.as_str()),
+                ),
                 "share_submitted" => {
                     if data.get("meets_block_target").and_then(|v| v.as_bool()).unwrap_or(false) {
                         fx.on_block(data.get("hash").and_then(|v| v.as_str()).unwrap_or(""), &now_hms());
@@ -1434,7 +1436,7 @@ impl Emitter {
                     &lifecycle_line(event, data), None, None,
                     data.get("max_target").and_then(|v| v.as_str()).map(str::to_string), false),
                 "session_end" => {
-                    fx.set_mining_height(None);
+                    fx.clear_mining_job();
                     fx.set_software_versions(env!("CARGO_PKG_VERSION"), "disconnected");
                     fx.lifecycle_state(&lifecycle_line(event, data), Some("OFFLINE"), None, None, false);
                 },

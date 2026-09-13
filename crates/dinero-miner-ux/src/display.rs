@@ -23,6 +23,33 @@ fn fit_plain(line: &str, width: usize) -> String {
     }
 }
 
+/// Keep both ends of a block hash visible when its dashboard column is too
+/// narrow for all 64 hexadecimal characters. The prefix is useful for quick
+/// visual matching while the suffix prevents two similar-looking hashes from
+/// being mistaken for one another.
+fn compact_hash(hash: &str, width: usize) -> String {
+    let len = hash.chars().count();
+    if len <= width {
+        return hash.to_string();
+    }
+    if width < 4 {
+        return hash.chars().take(width).collect();
+    }
+
+    let suffix_len = 8.min(width - 2);
+    let prefix_len = width - suffix_len - 1;
+    let prefix: String = hash.chars().take(prefix_len).collect();
+    let suffix: String = hash
+        .chars()
+        .rev()
+        .take(suffix_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
+}
+
 fn box_row(content: &str, width: usize) -> String {
     let inner = width.saturating_sub(2);
     let fitted = fit_plain(content, inner);
@@ -367,6 +394,7 @@ pub struct FeedWindow {
     pub miner_version: String,
     pub pool_version: String,
     pub mining_height: Option<u64>,
+    pub mining_parent_hash: Option<String>,
     pub stats: SessionStats,
     pub backend: Option<String>,
     pub last_block: Option<String>,
@@ -399,6 +427,7 @@ impl FeedWindow {
             miner_version: "unknown".into(),
             pool_version: "pending".into(),
             mining_height: None,
+            mining_parent_hash: None,
             stats: SessionStats::default(),
             backend: None,
             last_block: None,
@@ -563,12 +592,21 @@ impl FeedWindow {
         let uptime = self.stats.started.map(|s| Display::format_duration(s.elapsed().as_secs()))
             .unwrap_or_else(|| "0s".to_string());
         let channel = self.channel.map(|v| format!("#{v}")).unwrap_or_else(|| "--".to_string());
+        let parent_label = " PARENT HASH  ";
+        let parent_width = width.saturating_sub(3) / 2;
+        let parent_hash_width = parent_width.saturating_sub(parent_label.chars().count());
+        let parent_hash = self
+            .mining_parent_hash
+            .as_deref()
+            .map(|hash| compact_hash(hash, parent_hash_width))
+            .unwrap_or_else(|| "unavailable".into());
         for row in [
             box_split(&format!(" NODE  {}", self.pool), &format!(" LINK  {secure}"), width),
             box_split(&format!(" MODE  {} · PPLNS", self.reward_mode.to_uppercase()),
                       &format!(" WORKER  {worker} · {} threads", self.threads), width),
             box_split(&format!(" CHAN  {channel}"), &format!(" UPTIME  {uptime}"), width),
-            box_split("", &format!(" MINING HEIGHT  {}", self.mining_height.map(|h| h.to_string()).unwrap_or_else(|| "unavailable".into())), width),
+            box_split(&format!("{parent_label}{parent_hash}"),
+                      &format!(" MINING HEIGHT  {}", self.mining_height.map(|h| h.to_string()).unwrap_or_else(|| "unavailable".into())), width),
         ] {
             output.push_str(&theme_line(&row, colors));
             output.push_str("\x1b[K\n");
@@ -709,15 +747,26 @@ mod tests {
     }
 
     #[test]
-    fn mining_height_is_directly_below_uptime() {
+    fn mining_height_and_parent_hash_are_directly_below_uptime() {
         for width in [60, 80, 120, 180] {
             let mut window = FeedWindow::new();
             window.mining_height = Some(111000);
+            window.mining_parent_hash = Some(
+                "0000000049d29100570bc46c5615968a7156b1d1eeb6ee1ef41f7d467f2a237b".into(),
+            );
             let frame = window.repaint(width, false);
             let lines = frame.lines().collect::<Vec<_>>();
             let uptime = lines.iter().position(|l| l.contains("UPTIME")).unwrap();
             assert!(lines[uptime + 1].contains("MINING HEIGHT"));
+            assert!(lines[uptime + 1].contains("PARENT HASH"));
+            assert!(lines[uptime + 1].contains("00000"));
+            assert!(lines[uptime + 1].contains("7f2a237b"));
             if width >= 80 { assert!(lines[uptime + 1].contains("111000")); }
+            if width >= 180 {
+                assert!(lines[uptime + 1].contains(
+                    "0000000049d29100570bc46c5615968a7156b1d1eeb6ee1ef41f7d467f2a237b"
+                ));
+            }
             window.mining_height = None;
             assert!(window.repaint(120, false).contains("MINING HEIGHT  unavailable"));
         }

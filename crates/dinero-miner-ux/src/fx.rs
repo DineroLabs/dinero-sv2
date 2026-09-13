@@ -60,6 +60,16 @@ impl FxScreen {
         self.inner.lock().unwrap().window.mining_height = height;
     }
 
+    pub fn set_mining_parent_hash(&self, hash: Option<&str>) {
+        self.inner.lock().unwrap().window.mining_parent_hash = hash.map(str::to_owned);
+    }
+
+    pub fn clear_mining_job(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.window.mining_height = None;
+        inner.window.mining_parent_hash = None;
+    }
+
     pub fn new(out: Box<dyn Write + Send>, cfg: FxConfig) -> Self {
         let mut window = FeedWindow::with_session(
             cfg.pool.clone(), cfg.reward_mode.clone(), cfg.threads, cfg.pinned,
