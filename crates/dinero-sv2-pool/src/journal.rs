@@ -30,13 +30,24 @@ impl WindowJournal {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir:?}"))?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
             .with_context(|| format!("open journal {path:?}"))?;
-        Ok(Self { path: path.to_path_buf(), writer: BufWriter::new(file), appends_since_compact: 0, failed: false })
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: BufWriter::new(file),
+            appends_since_compact: 0,
+            failed: false,
+        })
     }
 
     pub fn append(&mut self, entry: &WindowEntry) -> Result<()> {
-        anyhow::ensure!(!self.failed, "journal requires recovery after an I/O failure");
+        anyhow::ensure!(
+            !self.failed,
+            "journal requires recovery after an I/O failure"
+        );
         let result = (|| -> Result<()> {
             serde_json::to_writer(&mut self.writer, entry)?;
             self.writer.write_all(b"\n")?;
@@ -44,7 +55,9 @@ impl WindowJournal {
             self.writer.get_ref().sync_data()?;
             Ok(())
         })();
-        if result.is_err() { self.failed = true; }
+        if result.is_err() {
+            self.failed = true;
+        }
         result?;
         self.appends_since_compact += 1;
         Ok(())
@@ -53,14 +66,23 @@ impl WindowJournal {
     /// Caller holds the journal mutex across this entire operation. This is
     /// the sole live credit path, keeping persistence, memory and snapshots
     /// in one order without holding the window mutex during disk writes.
-    pub fn credit(&mut self, window: &std::sync::Mutex<PplnsWindow>, entry: &WindowEntry) -> Result<()> {
+    pub fn credit(
+        &mut self,
+        window: &std::sync::Mutex<PplnsWindow>,
+        entry: &WindowEntry,
+    ) -> Result<()> {
         self.append(entry)?;
         {
             let mut w = window.lock().expect("pplns window mutex");
             w.record(entry.payout_script.clone(), entry.weight, entry.unix_ts);
         }
         if self.should_compact() {
-            let entries = window.lock().expect("pplns window mutex").entries().cloned().collect::<Vec<_>>();
+            let entries = window
+                .lock()
+                .expect("pplns window mutex")
+                .entries()
+                .cloned()
+                .collect::<Vec<_>>();
             if let Err(e) = self.compact(&entries) {
                 warn!(error = %e, "pplns journal compact failed");
             }
@@ -81,14 +103,18 @@ impl WindowJournal {
     }
 
     fn recover_records(path: &Path, target_secs: u64, legacy_history: bool) -> Result<PplnsWindow> {
-        if !path.exists() { return Ok(PplnsWindow::new(target_secs)); }
+        if !path.exists() {
+            return Ok(PplnsWindow::new(target_secs));
+        }
         let mut reader = BufReader::new(File::open(path)?);
         let mut window = PplnsWindow::new(target_secs);
         let mut line = Vec::new();
         let mut index = 0;
         loop {
             line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 { break; }
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
             // Only an unterminated final append can be a crash-torn write.
             // Startup rewrites the recovered prefix before accepting shares.
             if !line.ends_with(b"\n") {
@@ -101,8 +127,14 @@ impl WindowJournal {
             if value.get("checkpoint_version").is_some() {
                 anyhow::ensure!(index == 0, "checkpoint must be first journal record");
                 let checkpoint: Checkpoint = serde_json::from_slice(&line)?;
-                anyhow::ensure!(checkpoint.checkpoint_version == 1, "unknown journal checkpoint version");
-                anyhow::ensure!(checkpoint.entries.len() <= PplnsWindow::CAP, "oversized checkpoint");
+                anyhow::ensure!(
+                    checkpoint.checkpoint_version == 1,
+                    "unknown journal checkpoint version"
+                );
+                anyhow::ensure!(
+                    checkpoint.entries.len() <= PplnsWindow::CAP,
+                    "oversized checkpoint"
+                );
                 window = PplnsWindow::restore(checkpoint.entries, target_secs);
             } else {
                 anyhow::ensure!(index > 0 || legacy_history,
@@ -116,14 +148,20 @@ impl WindowJournal {
     }
 
     pub fn compact(&mut self, entries: &[WindowEntry]) -> Result<()> {
-        anyhow::ensure!(!self.failed, "journal requires recovery after an I/O failure");
+        anyhow::ensure!(
+            !self.failed,
+            "journal requires recovery after an I/O failure"
+        );
         let tmp = self.path.with_extension("jsonl.tmp");
         {
             let mut w = BufWriter::new(File::create(&tmp)?);
-            serde_json::to_writer(&mut w, &Checkpoint {
-                checkpoint_version: 1,
-                entries: entries.to_vec(),
-            })?;
+            serde_json::to_writer(
+                &mut w,
+                &Checkpoint {
+                    checkpoint_version: 1,
+                    entries: entries.to_vec(),
+                },
+            )?;
             w.write_all(b"\n")?;
             w.flush()?;
             w.get_ref().sync_all()?;
@@ -133,7 +171,13 @@ impl WindowJournal {
         // Switch descriptors immediately: never append to the unlinked old file.
         self.writer = BufWriter::new(file);
         #[cfg(unix)]
-        File::open(self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?.sync_all()?;
+        File::open(
+            self.path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?
+        .sync_all()?;
 
         self.appends_since_compact = 0;
         Ok(())
@@ -144,7 +188,9 @@ impl WindowJournal {
 mod tests {
     use super::*;
 
-    fn snapshot(w: &PplnsWindow) -> Vec<WindowEntry> { w.entries().cloned().collect() }
+    fn snapshot(w: &PplnsWindow) -> Vec<WindowEntry> {
+        w.entries().cloned().collect()
+    }
 
     #[test]
     fn restart_and_compaction_match_uninterrupted_credits() {
@@ -157,21 +203,33 @@ mod tests {
         for i in 0..16000 {
             // Rate changes, quiet gaps, multiple contributors and weights.
             ts += if i % 4000 < 2000 { 30 } else { 1 };
-            let e = WindowEntry { payout_script: vec![(i % 7) as u8], weight: (i % 13 + 1) as u128, unix_ts: ts };
+            let e = WindowEntry {
+                payout_script: vec![(i % 7) as u8],
+                weight: (i % 13 + 1) as u128,
+                unix_ts: ts,
+            };
             live.record(e.payout_script.clone(), e.weight, e.unix_ts);
             journal.append(&e).unwrap();
             if i % 997 == 0 {
                 let recovered = WindowJournal::recover(&path, 14400).unwrap();
                 assert_eq!(snapshot(&live), snapshot(&recovered), "restart at {i}");
                 assert_eq!(live.weights(), recovered.weights());
-                for script in 0..7 { assert_eq!(live.miner_bps(&[script]), recovered.miner_bps(&[script])); }
+                for script in 0..7 {
+                    assert_eq!(live.miner_bps(&[script]), recovered.miner_bps(&[script]));
+                }
                 journal.compact(&snapshot(&recovered)).unwrap();
                 drop(journal);
                 journal = WindowJournal::open(&path).unwrap();
-                assert_eq!(snapshot(&live), snapshot(&WindowJournal::recover(&path, 14400).unwrap()));
+                assert_eq!(
+                    snapshot(&live),
+                    snapshot(&WindowJournal::recover(&path, 14400).unwrap())
+                );
             }
         }
-        assert_eq!(snapshot(&live), snapshot(&WindowJournal::recover(&path, 14400).unwrap()));
+        assert_eq!(
+            snapshot(&live),
+            snapshot(&WindowJournal::recover(&path, 14400).unwrap())
+        );
     }
 
     #[test]
@@ -183,7 +241,11 @@ mod tests {
         let mut ts = 0;
         for i in 0..5000 {
             ts += if i < 3000 { 30 } else { 1 };
-            let e = WindowEntry { payout_script: vec![(i % 3) as u8], weight: 1, unix_ts: ts };
+            let e = WindowEntry {
+                payout_script: vec![(i % 3) as u8],
+                weight: 1,
+                unix_ts: ts,
+            };
             live.record(e.payout_script.clone(), e.weight, e.unix_ts);
             serde_json::to_writer(&mut journal.writer, &e).unwrap();
             journal.writer.write_all(b"\n").unwrap();
@@ -203,18 +265,33 @@ mod tests {
         let journal = Arc::new(Mutex::new(WindowJournal::open(&path).unwrap()));
         journal.lock().unwrap().compact(&[]).unwrap();
         let window = Arc::new(Mutex::new(PplnsWindow::new(14400)));
-        let threads = (0..4).map(|miner| {
-            let journal = journal.clone(); let window = window.clone();
-            std::thread::spawn(move || {
-                for i in 0..25 {
-                    let mut j = journal.lock().unwrap();
-                    // Force frequent compaction through the production path.
-                    if i % 7 == 0 { j.appends_since_compact = WindowJournal::COMPACT_EVERY; }
-                    j.credit(&window, &WindowEntry { payout_script: vec![miner], weight: 3, unix_ts: i }).unwrap();
-                }
+        let threads = (0..4)
+            .map(|miner| {
+                let journal = journal.clone();
+                let window = window.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let mut j = journal.lock().unwrap();
+                        // Force frequent compaction through the production path.
+                        if i % 7 == 0 {
+                            j.appends_since_compact = WindowJournal::COMPACT_EVERY;
+                        }
+                        j.credit(
+                            &window,
+                            &WindowEntry {
+                                payout_script: vec![miner],
+                                weight: 3,
+                                unix_ts: i,
+                            },
+                        )
+                        .unwrap();
+                    }
+                })
             })
-        }).collect::<Vec<_>>();
-        for thread in threads { thread.join().unwrap(); }
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
         let live = window.lock().unwrap();
         let recovered = WindowJournal::recover(&path, 14400).unwrap();
         assert_eq!(live.len(), 100);
@@ -227,10 +304,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.jsonl");
         let mut j = WindowJournal::open(&path).unwrap();
-        let entries = vec![WindowEntry { payout_script: vec![2], weight: 9, unix_ts: 1 }];
+        let entries = vec![WindowEntry {
+            payout_script: vec![2],
+            weight: 9,
+            unix_ts: 1,
+        }];
         j.compact(&entries).unwrap();
         std::fs::write(path.with_extension("jsonl.tmp"), b"{incomplete replacement").unwrap();
-        assert_eq!(snapshot(&WindowJournal::recover(&path, 14400).unwrap()), entries);
+        assert_eq!(
+            snapshot(&WindowJournal::recover(&path, 14400).unwrap()),
+            entries
+        );
     }
 
     #[cfg(unix)]
@@ -240,9 +324,17 @@ mod tests {
         let mut j = WindowJournal::open(&dir.path().join("j.jsonl")).unwrap();
         // A read-only descriptor gives a deterministic write failure.
         j.writer = BufWriter::new(File::open(dir.path().join("j.jsonl")).unwrap());
-        let entry = WindowEntry { payout_script: vec![1], weight: 1, unix_ts: 1 };
+        let entry = WindowEntry {
+            payout_script: vec![1],
+            weight: 1,
+            unix_ts: 1,
+        };
         assert!(j.append(&entry).is_err());
-        assert!(j.append(&entry).unwrap_err().to_string().contains("requires recovery"));
+        assert!(j
+            .append(&entry)
+            .unwrap_err()
+            .to_string()
+            .contains("requires recovery"));
         assert!(j.compact(&[]).is_err());
     }
 
@@ -251,10 +343,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.jsonl");
         let mut journal = WindowJournal::open(&path).unwrap();
-        let entries = vec![WindowEntry { payout_script: vec![1], weight: 7, unix_ts: 10 }];
+        let entries = vec![WindowEntry {
+            payout_script: vec![1],
+            weight: 7,
+            unix_ts: 10,
+        }];
         journal.compact(&entries).unwrap();
         drop(journal);
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{torn").unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{torn")
+            .unwrap();
         let recovered = WindowJournal::recover(&path, 14400).unwrap();
         assert_eq!(snapshot(&recovered), entries);
         let mut journal = WindowJournal::open(&path).unwrap();
@@ -267,7 +368,12 @@ mod tests {
     fn corrupt_complete_record_fails_instead_of_discarding_credit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.jsonl");
-        for bytes in [b"{bad}\n".as_slice(), b"{\xff}\n", b"{torn", b"{\"checkpoint_version\":2,\"entries\":[]}\n"] {
+        for bytes in [
+            b"{bad}\n".as_slice(),
+            b"{\xff}\n",
+            b"{torn",
+            b"{\"checkpoint_version\":2,\"entries\":[]}\n",
+        ] {
             std::fs::write(&path, bytes).unwrap();
             assert!(WindowJournal::recover(&path, 14400).is_err());
         }

@@ -43,7 +43,9 @@ pub fn inject_scriptsig_extranonce(coinbase_prefix: &[u8], extranonce: u32) -> R
     i += 4;
     let (input_count, n) = read_varint(p, i)?;
     if input_count != 1 {
-        return Err(anyhow!("coinbase must have exactly 1 input, got {input_count}"));
+        return Err(anyhow!(
+            "coinbase must have exactly 1 input, got {input_count}"
+        ));
     }
     i += n;
     need(i, 36)?; // prevout txid + index
@@ -90,14 +92,8 @@ fn read_varint(p: &[u8], at: usize) -> Result<(u64, usize)> {
     match p.get(at) {
         None => Err(anyhow!("varint truncated at byte {at}")),
         Some(&b) if b < 0xfd => Ok((b as u64, 1)),
-        Some(&0xfd) => Ok((
-            u16::from_le_bytes(take(2)?.try_into().unwrap()) as u64,
-            3,
-        )),
-        Some(&0xfe) => Ok((
-            u32::from_le_bytes(take(4)?.try_into().unwrap()) as u64,
-            5,
-        )),
+        Some(&0xfd) => Ok((u16::from_le_bytes(take(2)?.try_into().unwrap()) as u64, 3)),
+        Some(&0xfe) => Ok((u32::from_le_bytes(take(4)?.try_into().unwrap()) as u64, 5)),
         Some(&0xff) => Ok((u64::from_le_bytes(take(8)?.try_into().unwrap()), 9)),
         _ => unreachable!(),
     }

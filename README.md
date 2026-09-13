@@ -202,13 +202,14 @@ daemon endpoint, or any configuration; `/status`, `/payout-address`,
 `Access-Control-Allow-Origin: *` on GET and are served from one sample
 rendered every 10 s. Abuse limits: 60 requests/minute per client (429 +
 `Retry-After` beyond that; when the peer is loopback — a local reverse
-proxy — the client is the first hop of `X-Forwarded-For`/`X-Real-IP`,
-otherwise the peer itself, so a direct client cannot pick its own bucket;
+proxy — the client is `X-Real-IP`, else the *last* hop of
+`X-Forwarded-For` (the one the proxy appended; earlier hops are
+client-supplied), otherwise the peer itself, so no client can pick its own bucket;
 IPv6 is bucketed by /64), at most 256 concurrent connections (extra ones
 are closed on accept), and a 10 s deadline per connection. It speaks plain
 HTTP; put a TLS reverse proxy in front of it for
 `https://pool.example.org/api/stats` and make sure the proxy sets
-`X-Forwarded-For`.
+`X-Real-IP $remote_addr` (nginx) or appends to `X-Forwarded-For`.
 
 Found blocks are appended to `found-blocks.jsonl` next to the PPLNS
 journal so `blocks_found_total` and `/api/blocks` survive a restart.

@@ -182,12 +182,18 @@ async fn an_undeclared_newer_payload_is_not_readable_by_an_older_client() {
         "daemon_headers":0,"template_height":0,"template_id":0,"template_prev_hash":"h",
         "last_template_at_unix":0,"last_share":null,"last_block":null,"rejection_reasons":{}}"#;
     let parsed: OpsStatus = serde_json::from_str(raw_json).expect("parses");
-    assert_eq!(parsed.schema_min_compatible, None, "absence must survive parsing");
+    assert_eq!(
+        parsed.schema_min_compatible, None,
+        "absence must survive parsing"
+    );
     assert!(
         !parsed.readable_by(2),
         "an undeclared schema-3 payload must not claim compatibility it never stated"
     );
-    assert!(parsed.readable_by(3), "a client of its own schema can read it");
+    assert!(
+        parsed.readable_by(3),
+        "a client of its own schema can read it"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +215,10 @@ async fn a_declared_newer_payload_is_readable_by_the_clients_it_names() {
     assert!(additive.readable_by(2), "an additive bump stays readable");
 
     let breaking: OpsStatus = serde_json::from_str(&with("3")).expect("parses");
-    assert!(!breaking.readable_by(2), "a breaking change locks out older clients");
+    assert!(
+        !breaking.readable_by(2),
+        "a breaking change locks out older clients"
+    );
     assert!(breaking.readable_by(3));
 }
 

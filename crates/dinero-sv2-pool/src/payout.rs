@@ -57,7 +57,8 @@ pub fn store(path: &Path, addr: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{addr}\n")).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, format!("{addr}\n"))
+        .with_context(|| format!("writing {}", tmp.display()))?;
     restrict(&tmp)?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
@@ -88,7 +89,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "payout-test-{}-{:?}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -116,7 +120,13 @@ mod tests {
     #[test]
     fn a_corrupt_file_falls_back_to_the_flag() {
         let d = tmpdir();
-        for junk in ["", "   \n", "not-an-address", "din1p", "bc1pqqqqqqqqqqqqqqqqqqqqqqqqqqq"] {
+        for junk in [
+            "",
+            "   \n",
+            "not-an-address",
+            "din1p",
+            "bc1pqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+        ] {
             let p = d.join("payout-address");
             std::fs::write(&p, junk).unwrap();
             assert_eq!(

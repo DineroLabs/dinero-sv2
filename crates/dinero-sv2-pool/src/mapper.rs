@@ -179,7 +179,10 @@ pub fn state_commitment_root(coinbase_hex: &str) -> Result<Option<[u8; 32]>> {
     for (value, script) in outputs {
         if script.len() >= 6 && script[0] == 0x6a && &script[2..6] == b"DNRS" {
             anyhow::ensure!(root.is_none(), "duplicate DNRS");
-            anyhow::ensure!(value == 0 && script.len() == 39 && script[1] == 37 && script[6] == 1, "malformed DNRS");
+            anyhow::ensure!(
+                value == 0 && script.len() == 39 && script[1] == 37 && script[6] == 1,
+                "malformed DNRS"
+            );
             root = Some(script[7..39].try_into().unwrap());
         }
     }
@@ -187,13 +190,19 @@ pub fn state_commitment_root(coinbase_hex: &str) -> Result<Option<[u8; 32]>> {
 }
 
 /// Check a miner's supplied commitment before crediting or submitting work.
-pub fn valid_state_commitment_outputs<'a>(expected: Option<[u8; 32]>, outputs: impl IntoIterator<Item = (u64, &'a [u8])>) -> bool {
-    let candidates: Vec<_> = outputs.into_iter().filter(|(_, s)| s.len() >= 6 && s[0] == 0x6a && &s[2..6] == b"DNRS").collect();
+pub fn valid_state_commitment_outputs<'a>(
+    expected: Option<[u8; 32]>,
+    outputs: impl IntoIterator<Item = (u64, &'a [u8])>,
+) -> bool {
+    let candidates: Vec<_> = outputs
+        .into_iter()
+        .filter(|(_, s)| s.len() >= 6 && s[0] == 0x6a && &s[2..6] == b"DNRS")
+        .collect();
     match expected {
         Some(root) => {
             let output = dinero_sv2_jd::coinbase::state_commitment_output(root);
             candidates.len() == 1 && candidates[0].0 == 0 && candidates[0].1 == output.script_pubkey
-        },
+        }
         None => candidates.is_empty(),
     }
 }
@@ -584,20 +593,32 @@ pub(crate) mod tests {
 
     #[test]
     fn miner_dnrs_must_match_exactly_once() {
-        let good = dinero_sv2_jd::coinbase::state_commitment_output([7;32]);
-        let check = |root, outs: &[(u64, Vec<u8>)]| valid_state_commitment_outputs(root, outs.iter().map(|(v,s)| (*v,s.as_slice())));
-        assert!(check(Some([7;32]), &[(0,good.script_pubkey.clone())]));
+        let good = dinero_sv2_jd::coinbase::state_commitment_output([7; 32]);
+        let check = |root, outs: &[(u64, Vec<u8>)]| {
+            valid_state_commitment_outputs(root, outs.iter().map(|(v, s)| (*v, s.as_slice())))
+        };
+        assert!(check(Some([7; 32]), &[(0, good.script_pubkey.clone())]));
         assert!(check(None, &[]));
-        assert!(!check(Some([7;32]), &[]));
-        assert!(!check(None, &[(0,good.script_pubkey.clone())]));
-        assert!(!check(Some([8;32]), &[(0,good.script_pubkey.clone())]));
-        assert!(!check(Some([7;32]), &[(1,good.script_pubkey.clone())]));
-        assert!(!check(Some([7;32]), &[(0,good.script_pubkey.clone()),(0,good.script_pubkey.clone())]));
-        for i in [1usize,6,7,38] {
-            let mut changed = good.script_pubkey.clone(); changed[i] ^= 1;
-            assert!(!check(Some([7;32]), &[(0,changed)]));
+        assert!(!check(Some([7; 32]), &[]));
+        assert!(!check(None, &[(0, good.script_pubkey.clone())]));
+        assert!(!check(Some([8; 32]), &[(0, good.script_pubkey.clone())]));
+        assert!(!check(Some([7; 32]), &[(1, good.script_pubkey.clone())]));
+        assert!(!check(
+            Some([7; 32]),
+            &[
+                (0, good.script_pubkey.clone()),
+                (0, good.script_pubkey.clone())
+            ]
+        ));
+        for i in [1usize, 6, 7, 38] {
+            let mut changed = good.script_pubkey.clone();
+            changed[i] ^= 1;
+            assert!(!check(Some([7; 32]), &[(0, changed)]));
         }
-        assert!(!check(Some([7;32]), &[(0,good.script_pubkey[..6].to_vec())]));
+        assert!(!check(
+            Some([7; 32]),
+            &[(0, good.script_pubkey[..6].to_vec())]
+        ));
     }
 
     #[test]

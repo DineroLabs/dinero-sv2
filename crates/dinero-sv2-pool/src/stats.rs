@@ -539,10 +539,12 @@ impl Default for Config {
 /// The address a request should be rate limited as.
 ///
 /// Behind a local reverse proxy every peer is loopback, so the proxy's
-/// `X-Forwarded-For` (first hop) or `X-Real-IP` is the client. From any
-/// other peer those headers are attacker-controlled and ignored: a direct
-/// client cannot choose its own bucket. Unparseable values fall back to
-/// the peer.
+/// `X-Real-IP`, else the **last** hop of `X-Forwarded-For`, is the client.
+/// The last hop is the one the trusted proxy appended (nginx's
+/// `$proxy_add_x_forwarded_for`); earlier hops are whatever the client
+/// sent and would let it pick its own bucket. From any non-loopback peer
+/// both headers are attacker-controlled and ignored. Unparseable values
+/// fall back to the peer.
 pub fn client_ip(peer: IpAddr, head: &str) -> IpAddr {
     if !peer.is_loopback() {
         return peer;
@@ -558,14 +560,13 @@ pub fn client_ip(peer: IpAddr, head: &str) -> IpAddr {
         };
         let name = name.trim();
         if name.eq_ignore_ascii_case("x-forwarded-for") && forwarded.is_none() {
-            forwarded = value.split(',').next().map(str::trim);
+            forwarded = value.rsplit(',').next().map(str::trim);
         } else if name.eq_ignore_ascii_case("x-real-ip") && real.is_none() {
             real = Some(value.trim());
         }
     }
-    forwarded
-        .and_then(|v| v.parse().ok())
-        .or_else(|| real.and_then(|v| v.parse().ok()))
+    real.and_then(|v| v.parse().ok())
+        .or_else(|| forwarded.and_then(|v| v.parse().ok()))
         .unwrap_or(peer)
 }
 
@@ -1249,10 +1250,14 @@ mod tests {
         let real = "GET / HTTP/1.1\r\nx-real-ip: 203.0.113.8\r\n\r\n";
         let none = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
         let junk = "GET / HTTP/1.1\r\nX-Forwarded-For: not-an-ip\r\n\r\n";
-        assert_eq!(client_ip(lo, xff), "203.0.113.9".parse::<IpAddr>().unwrap());
+        let both = "GET / HTTP/1.1\r\nX-Forwarded-For: 203.0.113.9, 10.0.0.1\r\nX-Real-IP: 203.0.113.8\r\n\r\n";
+        // Last hop wins: the first hop is client-supplied when the proxy appends.
+        assert_eq!(client_ip(lo, xff), "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(lo6, xff), "10.0.0.1".parse::<IpAddr>().unwrap());
+        // X-Real-IP is preferred over the chain when both are present.
         assert_eq!(
-            client_ip(lo6, xff),
-            "203.0.113.9".parse::<IpAddr>().unwrap()
+            client_ip(lo, both),
+            "203.0.113.8".parse::<IpAddr>().unwrap()
         );
         assert_eq!(
             client_ip(lo, real),

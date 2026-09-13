@@ -80,8 +80,10 @@ impl RegtestDaemon {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let datadir =
-            PathBuf::from(format!("/tmp/dinero-sv2-regression-{}-{nanos}", std::process::id()));
+        let datadir = PathBuf::from(format!(
+            "/tmp/dinero-sv2-regression-{}-{nanos}",
+            std::process::id()
+        ));
         if datadir.exists() {
             std::fs::remove_dir_all(&datadir).ok();
         }
@@ -127,7 +129,10 @@ impl RegtestDaemon {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        bail!("timed out waiting for cookie at {}", self.cookie_path.display())
+        bail!(
+            "timed out waiting for cookie at {}",
+            self.cookie_path.display()
+        )
     }
 }
 
@@ -265,7 +270,10 @@ async fn submitblock_rejects_tampered_utreexo_root() -> Result<()> {
 
     // Create a regtest wallet so we have an address to mine to.
     let create = rpc
-        .call_raw("wallet.createhd", serde_json::json!(["regtestw", "", false]))
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["regtestw", "", false]),
+        )
         .await
         .context("createhd")?;
     let address = create
@@ -427,7 +435,10 @@ async fn side_chain_tampered_utreexo_root() -> Result<()> {
     )?;
 
     let create = rpc
-        .call_raw("wallet.createhd", serde_json::json!(["regtestw", "", false]))
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["regtestw", "", false]),
+        )
         .await
         .context("createhd")?;
     let address = create
@@ -544,10 +555,7 @@ async fn side_chain_tampered_utreexo_root() -> Result<()> {
             //                        Reorg-time backstop broken;
             //                        mainnet safety gap.
             let _ = rpc
-                .call_raw(
-                    "invalidateblock",
-                    serde_json::json!([tip_before_str]),
-                )
+                .call_raw("invalidateblock", serde_json::json!([tip_before_str]))
                 .await
                 .context("invalidateblock")?;
 
@@ -638,7 +646,10 @@ async fn side_chain_tampered_utreexo_root_multi_tx() -> Result<()> {
     )?;
 
     let create = rpc
-        .call_raw("wallet.createhd", serde_json::json!(["regtestw", "", false]))
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["regtestw", "", false]),
+        )
         .await
         .context("createhd")?;
     let address = create
@@ -663,10 +674,7 @@ async fn side_chain_tampered_utreexo_root_multi_tx() -> Result<()> {
     // 2. Create a transaction that spends the mature coinbase.
     //    Any send to self at modest amount works.
     let send_resp = rpc
-        .call_raw(
-            "sendtoaddress",
-            serde_json::json!([address.clone(), 1.0]),
-        )
+        .call_raw("sendtoaddress", serde_json::json!([address.clone(), 1.0]))
         .await
         .context("sendtoaddress")?;
     eprintln!("sendtoaddress -> {send_resp}");

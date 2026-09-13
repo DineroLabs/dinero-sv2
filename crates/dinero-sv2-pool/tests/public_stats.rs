@@ -492,7 +492,8 @@ async fn the_sample_is_cached_for_the_configured_ttl() {
 async fn loopback_peers_are_keyed_by_the_forwarded_client_address() {
     let addr = start_public(1).await;
     let req = |hdr: &str| format!("GET /api/stats HTTP/1.1\r\nHost: x\r\n{hdr}\r\n\r\n");
-    let a = raw(&addr, &req("X-Forwarded-For: 203.0.113.1, 10.0.0.1")).await;
+    // First hop is client-supplied when the proxy appends; the LAST hop is the client.
+    let a = raw(&addr, &req("X-Forwarded-For: 10.0.0.9, 203.0.113.1")).await;
     assert_eq!(status_line(&a), "HTTP/1.1 200 OK", "{a}");
     let b = raw(&addr, &req("X-Forwarded-For: 203.0.113.2")).await;
     assert_eq!(

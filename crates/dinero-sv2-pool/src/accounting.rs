@@ -104,16 +104,26 @@ impl PplnsWindow {
     pub const CAP: usize = 50_000;
 
     pub fn new(target_secs: u64) -> Self {
-        Self { entries: VecDeque::new(), target_secs }
+        Self {
+            entries: VecDeque::new(),
+            target_secs,
+        }
     }
 
     pub fn restore(entries: Vec<WindowEntry>, target_secs: u64) -> Self {
         // A checkpoint is already the exact live window; do not evict twice.
-        Self { entries: entries.into(), target_secs }
+        Self {
+            entries: entries.into(),
+            target_secs,
+        }
     }
 
     pub fn record(&mut self, payout_script: Vec<u8>, weight: u128, unix_ts: u64) {
-        self.entries.push_back(WindowEntry { payout_script, weight, unix_ts });
+        self.entries.push_back(WindowEntry {
+            payout_script,
+            weight,
+            unix_ts,
+        });
         self.evict();
     }
 
@@ -145,16 +155,26 @@ impl PplnsWindow {
     }
 
     pub fn total_weight(&self) -> u128 {
-        self.entries.iter().fold(0u128, |acc, e| acc.saturating_add(e.weight))
+        self.entries
+            .iter()
+            .fold(0u128, |acc, e| acc.saturating_add(e.weight))
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
     pub fn miner_bps(&self, payout_script: &[u8]) -> u32 {
         let total = self.total_weight();
-        if total == 0 { return 0; }
-        let mine: u128 = self.entries.iter()
+        if total == 0 {
+            return 0;
+        }
+        let mine: u128 = self
+            .entries
+            .iter()
             .filter(|e| e.payout_script == payout_script)
             .fold(0u128, |acc, e| acc.saturating_add(e.weight));
         ((mine.saturating_mul(10_000)) / total) as u32
@@ -199,8 +219,13 @@ mod tests {
 
     #[test]
     fn share_weight_is_monotonic_in_difficulty() {
-        let mut easy = [0xFFu8; 32]; easy[0] = 0x00; easy[1] = 0x0F;   // 000f ff…
-        let mut hard = [0xFFu8; 32]; hard[0] = 0x00; hard[1] = 0x00; hard[2] = 0x3F; // 00003f…
+        let mut easy = [0xFFu8; 32];
+        easy[0] = 0x00;
+        easy[1] = 0x0F; // 000f ff…
+        let mut hard = [0xFFu8; 32];
+        hard[0] = 0x00;
+        hard[1] = 0x00;
+        hard[2] = 0x3F; // 00003f…
         assert!(share_weight(&hard) > share_weight(&easy));
         assert!(share_weight(&easy) > 0);
     }

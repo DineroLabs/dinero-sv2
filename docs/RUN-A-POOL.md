@@ -191,9 +191,11 @@ pool.example.org {
 }
 ```
 
-Caddy and nginx (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`)
-pass the client address along; the pool rate-limits by that header only
-when the connection comes from loopback, which is exactly this setup. Open
+Caddy and nginx (`proxy_set_header X-Real-IP $remote_addr;` plus
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) pass the
+client address along; the pool prefers `X-Real-IP` and otherwise the *last*
+`X-Forwarded-For` hop (the one your proxy appended), and only when the
+connection comes from loopback, which is exactly this setup. Open
 only 443 to the world. Once it answers, email the URL
 `https://pool.example.org/api/stats` to the aggregators.
 

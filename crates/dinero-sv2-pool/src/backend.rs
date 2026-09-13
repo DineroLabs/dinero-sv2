@@ -337,7 +337,10 @@ mod tests {
         );
         assert_eq!(normalize_chainwork("0X0000AB"), Some("ab".into()));
         // Bare hex must keep working: both forms are valid input.
-        assert_eq!(normalize_chainwork("00003f6855a7bb73"), Some("3f6855a7bb73".into()));
+        assert_eq!(
+            normalize_chainwork("00003f6855a7bb73"),
+            Some("3f6855a7bb73".into())
+        );
     }
 
     #[test]
