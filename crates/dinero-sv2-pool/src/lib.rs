@@ -20,5 +20,6 @@ pub mod payout;
 pub mod rpc;
 pub mod shared_template;
 pub mod split;
+pub mod stats;
 pub mod supervisor;
 pub mod target;

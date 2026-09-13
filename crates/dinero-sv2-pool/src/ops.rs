@@ -1135,7 +1135,7 @@ mod tests {
 
 /// Read the request head (up to `\r\n\r\n`), refusing anything larger
 /// than `MAX_HEAD_BYTES`. Returns `None` on EOF/oversize/timeout.
-async fn read_head(sock: &mut TcpStream) -> Option<Vec<u8>> {
+pub(crate) async fn read_head(sock: &mut TcpStream) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
     loop {

@@ -144,6 +144,50 @@ Note the endpoint reports **operations**, not earnings. Your fee is
 on-chain — read it from the coinbase of blocks your pool found, which is
 the only source that cannot be wrong.
 
+### Public stats page and API (optional)
+
+If you want miners — and aggregator sites like MiningPoolStats or
+minerstat — to see your pool, turn on the public stats listener. It is a
+**separate**, unauthenticated, read-only endpoint; it is off by default.
+Add two flags to `ExecStart` in
+`/etc/systemd/system/dinero-sv2-pool.service`:
+
+```
+  --public-stats-bind 0.0.0.0:8080 \
+  --public-stratum-addr pool.example.org:4444 \
+```
+
+then `systemctl daemon-reload && systemctl restart dinero-sv2-pool` and
+
+```sh
+curl -s http://127.0.0.1:8080/api/stats
+```
+
+Routes: `/` (HTML: hashrate, miners, last block, install one-liners),
+`/api/stats`, `/api/blocks?limit=N`, `/api/miner/<din1p…>`. The full JSON
+contract is in the README under "Public stats API".
+
+What it can and cannot do: `GET`/`HEAD` only, nothing takes a body, no
+token, and no ops route exists on it — `/status`, `/payout-address`,
+`/fee-bps`, `/ban` all 404 there, and `/api/*` 404s on the ops listener.
+It never shows your payout address, fee or ban controls, daemon endpoint,
+or configuration. Answers come from one cached sample per 10 s and each
+client IP gets 60 requests per minute, so a scraper cannot make the pool
+do work.
+
+It is plain HTTP. For `https://pool.example.org/`, put a reverse proxy
+with TLS in front — for example, with Caddy:
+
+```
+pool.example.org {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+(bind `--public-stats-bind 127.0.0.1:8080` in that case, and open only
+443 to the world). Once it answers, email the URL
+`https://pool.example.org/api/stats` to the aggregators.
+
 ## If it stops
 
 The pool exits non-zero (so systemd restarts it) when its template

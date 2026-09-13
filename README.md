@@ -157,6 +157,47 @@ locally. The pool reassembled the candidate from the miner's submitted
 outputs, applied the same Utreexo math, and got the same 32 bytes.
 Neither side's result relied on the other.
 
+## Public stats API
+
+The pool can serve a second, **unauthenticated, read-only** HTTP listener
+for aggregator sites (MiningPoolStats, minerstat) and for a human landing
+on the pool's hostname. It is OFF unless you pass `--public-stats-bind`:
+
+```sh
+dinero-sv2-pool ... --public-stats-bind 0.0.0.0:8080 --public-stratum-addr pool.example.org:4444
+```
+
+| Route | Returns |
+| --- | --- |
+| `GET /` | A small HTML page: hashrate, miners, last block, recent blocks, install one-liners. Fetches `/api/stats` from the browser. |
+| `GET /api/stats` | `{ pool_hashrate_hs, miners, workers, blocks_found_24h, blocks_found_total, last_block_height, last_block_hash, last_block_time, fee_bps, payout_scheme: "PPLNS", min_payout_una, stratum, network_height, network_difficulty, updated_at }` |
+| `GET /api/blocks?limit=N` | Newest first, `N` clamped to 1..100 (default 50): `[{ height, hash, time, reward_una, status }]` |
+| `GET /api/miner/<din1p…>` | `{ address, hashrate_hs, shares_1h, window_bps, pending_una, paid_una, last_share_time }` — **404** for any address that never submitted a share. There is no miner listing. |
+
+Field notes: `pool_hashrate_hs` and `hashrate_hs` are expected hashes per
+second from shares in the last 10 minutes (share weight is calibrated to
+expected hashes). `miners` is distinct payout addresses with a share in the
+last 10 minutes; `workers` is connected Stratum sessions. `pending_una` is
+the address's estimated slice of the *next* block at its current PPLNS
+standing (reward less fee, times `window_bps`) — PPLNS holds no balance.
+`paid_una` sums coinbase outputs to that address in blocks the pool built
+and dinerod accepted. `network_difficulty` uses the Bitcoin `0x1d00ffff`
+convention. Times are Unix seconds; amounts are una.
+
+Safe to expose: every route is `GET`/`HEAD` only, nothing takes a body, and
+the listener shares **no token, route, or code path** with the operator
+endpoint. It cannot show the payout address, fee controls, ban controls,
+daemon endpoint, or any configuration; `/status`, `/payout-address`,
+`/fee-bps`, `/ban` are 404 on it, and `/api/*` is 404 on the ops listener
+(`crates/dinero-sv2-pool/tests/public_stats.rs` pins both). Responses carry
+`Access-Control-Allow-Origin: *` on GET, are computed from one cached
+sample per 10 s, and each client IP is limited to 60 requests/minute
+(429 + `Retry-After` beyond that). It speaks plain HTTP; put a TLS reverse
+proxy in front of it for `https://pool.example.org/api/stats`.
+
+Found blocks are appended to `found-blocks.jsonl` next to the PPLNS
+journal so `blocks_found_total` and `/api/blocks` survive a restart.
+
 ## Phase history
 
 Each phase is one commit. `git log --oneline` reads like a story from
