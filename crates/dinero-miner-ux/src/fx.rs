@@ -60,8 +60,18 @@ impl FxScreen {
         self.inner.lock().unwrap().window.mining_height = height;
     }
 
-    pub fn set_mining_parent_hash(&self, hash: Option<&str>) {
-        self.inner.lock().unwrap().window.mining_parent_hash = hash.map(str::to_owned);
+    /// Store an SV2 wire-order hash in the conventional node/explorer order.
+    /// The structured `set_new_prev_hash` event intentionally preserves wire
+    /// bytes for compatibility, while the dashboard is for human comparison.
+    pub fn set_mining_parent_hash(&self, wire_hash: Option<&str>) {
+        let display_hash = wire_hash.map(|hash| match hex::decode(hash) {
+            Ok(mut bytes) if bytes.len() == 32 => {
+                bytes.reverse();
+                hex::encode(bytes)
+            }
+            _ => hash.to_owned(),
+        });
+        self.inner.lock().unwrap().window.mining_parent_hash = display_hash;
     }
 
     pub fn clear_mining_job(&self) {
@@ -430,6 +440,27 @@ mod tests {
         assert!(plain.contains("0xabcd0001"));
         assert!(plain.contains("07070707"), "hash prefix rendered");
         assert!(plain.contains("MH/s"), "status line painted");
+    }
+
+    #[test]
+    fn parent_hash_uses_conventional_explorer_byte_order_and_clears() {
+        let (fx, _) = screen_with_buffer();
+        fx.set_mining_height(Some(111765));
+        fx.set_mining_parent_hash(Some(
+            "3f4016ffc4da4dd17b582330101b45d57291dc0dfd080d395f58bc6300000000",
+        ));
+        {
+            let inner = fx.inner.lock().unwrap();
+            assert_eq!(inner.window.mining_height, Some(111765));
+            assert_eq!(
+                inner.window.mining_parent_hash.as_deref(),
+                Some("0000000063bc585f390d08fd0ddc9172d5451b103023587bd14ddac4ff16403f")
+            );
+        }
+        fx.clear_mining_job();
+        let inner = fx.inner.lock().unwrap();
+        assert_eq!(inner.window.mining_height, None);
+        assert_eq!(inner.window.mining_parent_hash, None);
     }
 
     #[test]
