@@ -1614,7 +1614,7 @@ impl Emitter {
             OutputMode::Human(state) => emit_human(state, event, data),
             OutputMode::Fx(fx) => match event {
                 "session_end" => {
-                    fx.set_mining_height(None);
+                    fx.clear_mining_job();
                     fx.set_software_versions(env!("CARGO_PKG_VERSION"), "disconnected");
                     fx.lifecycle(&lifecycle_line(event, data));
                 },
@@ -1642,7 +1642,9 @@ impl Emitter {
                     // deliberately NOT surfaced as a lifecycle line — job churn would
                     // spam the permanent history; the feed itself shows the work.
                 }
-                "set_new_prev_hash" => { /* same: silent in FX mode */ }
+                "set_new_prev_hash" => fx.set_mining_parent_hash(
+                    data.get("prev_hash").and_then(|v| v.as_str()),
+                ),
                 "share_submitted" => {
                     if data.get("meets_block_target").and_then(|v| v.as_bool()).unwrap_or(false) {
                         fx.on_block(data.get("hash").and_then(|v| v.as_str()).unwrap_or(""), &now_hms());

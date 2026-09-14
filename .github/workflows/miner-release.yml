@@ -213,11 +213,13 @@ jobs:
             ```
 
             The interactive dashboard keeps Dinero pinned at the top, displays
-            the complete reward address, and devotes 31 rows to full 256-bit
-            candidate hashes. It also shows Noise NX security, pool/channel
-            state, accepted and rejected shares, session work, reconnect health,
-            and a timestamped network feed. `Ctrl-C` restores the original shell.
-            No node or chain sync is required. Verify downloads against
+            the complete reward address, the current mining height, and the
+            active parent-block hash so miners can detect a pool working on a
+            different chain tip. It devotes 31 rows to full 256-bit candidate
+            hashes and also shows Noise NX security, pool/channel state,
+            accepted and rejected shares, session work, reconnect health, and a
+            timestamped network feed. `Ctrl-C` restores the original shell. No
+            node or chain sync is required. Verify downloads against
             `SHA256SUMS`.
 
             **Behavior change:** an unspecified `--reward-mode` now resolves
