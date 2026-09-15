@@ -27,25 +27,32 @@ jobs:
         working-directory: sv2
         run: |
           cargo test --locked --workspace
-          cargo build --locked -p dinero-sv2-miner
+          cargo build --locked --release -p dinero-sv2-miner
       - name: Build pinned activation daemon
         working-directory: core
         run: |
           OPENSSL_VERSION=3.5.7 bash scripts/build-openssl-vendored.sh
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDINERO_USE_VENDORED_DEPS=ON -DDINERO_ENABLE_PORTMAPPING=OFF -DENABLE_GRPC=OFF
-          cmake --build build --target dinerod -j2
-          DINEROD="$PWD/build/dinerod" python3 tests/integration/test_template_exclusions.py
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDINERO_USE_VENDORED_DEPS=ON -DDINERO_ENABLE_PORTMAPPING=OFF -DENABLE_GRPC=OFF -DENABLE_GPU_MINING=OFF
+          cmake --build build --target dinerod test_block_template_determinism -j2
+          ctest --test-dir build --output-on-failure -R '^(BlockTemplateDeterminism|MiningTemplateExclusions)$'
+          ALLOWED="ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libm.so.6 libstdc++.so.6 libudev.so.1"
+          for dependency in $(objdump -p build/dinerod | awk '/NEEDED/{print $2}'); do
+            case " $ALLOWED " in
+              *" $dependency "*) ;;
+              *) echo "Unexpected daemon dependency: $dependency"; exit 1 ;;
+            esac
+          done
       - name: Real shared and solo mining across activation
         working-directory: sv2
         env:
           DINEROD_BIN: ${{ github.workspace }}/core/build/dinerod
-          DINEROMINER_BIN: ${{ github.workspace }}/sv2/target/debug/dinero-sv2-miner
+          DINEROMINER_BIN: ${{ github.workspace }}/sv2/target/release/dinero-sv2-miner
         run: |
           set -o pipefail
-          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e shared_block_coinbase_pays_window_contributors -- --ignored --nocapture 2>&1 | tee shared-dnrs.log
-          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e shared_pool_confirms_unshield_with_transparent_inputs_in_same_template -- --ignored --nocapture 2>&1 | tee shielded-dnrs.log
-          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs -- --ignored --nocapture 2>&1 | tee recovery-dnrs.log
-          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e solo_miner_preserves_dnrs_through_pool -- --ignored --nocapture 2>&1 | tee solo-dnrs.log
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e shared_block_coinbase_pays_window_contributors -- --ignored --nocapture 2>&1 | tee shared-dnrs.log
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e shared_pool_confirms_unshield_with_transparent_inputs_in_same_template -- --ignored --nocapture 2>&1 | tee shielded-dnrs.log
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs -- --ignored --nocapture 2>&1 | tee recovery-dnrs.log
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e solo_miner_preserves_dnrs_through_pool -- --ignored --nocapture 2>&1 | tee solo-dnrs.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
