@@ -1,5 +1,9 @@
 # Pool proof and shielded transaction recovery
 
+Current candidate versions and release-preparation findings are in the
+[paired release review](pool-recovery-release-review.md). That review also
+corrected a spent-input DNRF omission and strengthened its regression coverage.
+
 ## Findings
 
 The pool's existing empty-input guard already skips proof RPCs for transactions

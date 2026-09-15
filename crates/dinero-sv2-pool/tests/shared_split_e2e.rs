@@ -681,7 +681,7 @@ fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
 }
 
 /// Parse the first transaction of a block's raw hex (128-byte Dinero header
-/// + tx count varint + segwit-form coinbase tx) into its output list:
+/// followed by a tx count varint and segwit-form coinbase) into its output list:
 /// `(value_una, script_pubkey)` pairs, read directly off the consensus
 /// bytes the daemon actually stored (`getblock <hash> 0`) — independent
 /// of any RPC convenience/decode layer.

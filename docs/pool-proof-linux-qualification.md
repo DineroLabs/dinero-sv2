@@ -1,5 +1,10 @@
 # Pool proof recovery: Linux qualification
 
+This records the initial qualification through pool commit `8119b9b`. The later
+[paired release review](pool-recovery-release-review.md) covers versioned
+candidates and the additional spent-input DNRF correction; use its artifact
+record for rollout decisions.
+
 ## Scope and source identity
 
 Qualification uses the companion daemon commit
