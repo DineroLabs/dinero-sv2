@@ -102,28 +102,9 @@ pub fn build_shared_template(
         });
     }
     if requires_filter_commitment(pt.height as u64) {
-        // Daemon filter-input rule (verified 2026-07-09 against the
-        // dinero-v8 daemon source, not just the brief's sketch):
-        // ConnectTip's accept-time filter rebuild collects every
-        // non-empty output scriptPubKey across the block EXCEPT ones
-        // starting with OP_RETURN (0x6a) — see
-        // src/daemon/services/chainstate_service.cpp:12962-12969
-        // (`if (!out.scriptPubKey.empty() && out.scriptPubKey[0] !=
-        // 0x6a)`), and the block assembler mirrors the identical rule
-        // at src/mining/block_assembler.cpp:556-563. The gate is the
-        // OP_RETURN prefix, NOT output value — a hypothetical
-        // zero-value non-OP_RETURN output would still enter the
-        // filter. In this builder's construction the only zero-value
-        // outputs are DNRW/DNRF themselves (both OP_RETURN), so
-        // filtering by script prefix and filtering by `value_una > 0`
-        // happen to coincide here, but the script-prefix rule is what
-        // we mirror since it's what the daemon actually enforces.
-        // Existing single-payout JD miners already build their GCS
-        // filter over just `[payout_script]` — see
-        // crates/dinero-sv2-miner/src/main.rs:531
-        // (`gcs_build(&tmpl.prev_block_hash, &[&payout_script])`) —
-        // which implicitly excludes their own OP_RETURN commitments
-        // and is exactly the daemon rule confirmed above.
+        // Match the daemon's full filter: non-OP_RETURN output scripts plus
+        // chain-backed spent input scripts. In-block spent scripts already
+        // occur among transaction outputs; GCS deduplicates repeated scripts.
         let script_refs: Vec<&[u8]> = outputs
             .iter()
             .filter(|o| o.script_pubkey.first() != Some(&0x6a))
@@ -134,6 +115,12 @@ pub fn build_shared_template(
                     .flat_map(|tx| tx.outputs.iter())
                     .filter(|(_, script)| !script.is_empty() && script[0] != 0x6a)
                     .map(|(_, script)| script.as_slice()),
+            )
+            .chain(
+                pt.spent_input_scripts
+                    .iter()
+                    .filter(|script| !script.is_empty())
+                    .map(Vec::as_slice),
             )
             .collect();
         let (encoded_filter, _) = gcs_build(&pt.wire.prev_block_hash, &script_refs);

@@ -680,12 +680,12 @@ fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
     }
 }
 
-/// Parse a coinbase-only block's raw hex (128-byte Dinero header + tx
-/// count varint + one segwit-form coinbase tx) into its output list:
+/// Parse the first transaction of a block's raw hex (128-byte Dinero header
+/// + tx count varint + segwit-form coinbase tx) into its output list:
 /// `(value_una, script_pubkey)` pairs, read directly off the consensus
 /// bytes the daemon actually stored (`getblock <hash> 0`) — independent
 /// of any RPC convenience/decode layer.
-fn parse_coinbase_only_block_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+fn parse_block_coinbase_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8>)>> {
     let bytes = hex::decode(block_hex).context("block hex decode")?;
     if bytes.len() < 128 {
         bail!(
@@ -696,8 +696,8 @@ fn parse_coinbase_only_block_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8
     let mut cur = 128usize;
     let (tx_count, n) = read_compact_size(&bytes, cur)?;
     cur += n;
-    if tx_count != 1 {
-        bail!("expected a coinbase-only block (1 tx), got {tx_count}");
+    if tx_count == 0 {
+        bail!("block has no coinbase");
     }
     let tx = &bytes[cur..];
 
@@ -1000,7 +1000,7 @@ async fn run_shared_split_scenario(
     let block_hex = block_hex
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("getblock verbosity=0: not a string: {block_hex}"))?;
-    let outputs = parse_coinbase_only_block_outputs(block_hex)
+    let outputs = parse_block_coinbase_outputs(block_hex)
         .context("parsing coinbase outputs from raw block hex")?;
 
     let find_value = |script: &[u8]| -> Option<u64> {
@@ -1331,7 +1331,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
     let raw = rpc
         .call_raw("getblock", serde_json::json!([hash, 0]))
         .await?;
-    let outputs = parse_coinbase_only_block_outputs(raw.as_str().context("raw block")?)?;
+    let outputs = parse_block_coinbase_outputs(raw.as_str().context("raw block")?)?;
     let dnrs = dinero_sv2_jd::coinbase::state_commitment_output(expected);
     assert!(outputs
         .iter()
@@ -1396,6 +1396,18 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
         "missing transparent inputs"
     );
     let expected_dnrs = mapper::state_commitment_root(&mapped.coinbase_full_hex)?;
+    let mut spent_scripts = Vec::new();
+    for tx in &mapped.mempool_txs {
+        for (id, vout) in &tx.inputs {
+            let display = hex::encode(id.iter().rev().copied().collect::<Vec<_>>());
+            let proof = rpc.get_utxo_proof_updates(&[(display, *vout)]).await?;
+            spent_scripts.push(hex::decode(
+                proof["proofs"][0]["script_pubkey"]
+                    .as_str()
+                    .context("spent script from daemon proof")?,
+            )?);
+        }
+    }
     let dir = tempfile::tempdir()?;
     let pool = PoolProcess::spawn(
         "127.0.0.1:29992".parse()?,
@@ -1448,6 +1460,31 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
     ensure!(
         expected_dnrs.as_ref().map(|r| r.as_slice()) == Some(root.as_slice()),
         "pool changed shielded state commitment"
+    );
+    // Acceptance alone is insufficient: the daemon currently logs a DNRF
+    // hash mismatch without rejecting. Check the stored coinbase commitment
+    // against the full output-plus-spent-input filter independently.
+    let raw = rpc
+        .call_raw("getblock", serde_json::json!([tip, 0]))
+        .await?;
+    let coinbase_outputs = parse_block_coinbase_outputs(raw.as_str().context("raw block")?)?;
+    let scripts: Vec<&[u8]> = coinbase_outputs
+        .iter()
+        .chain(mapped.mempool_txs.iter().flat_map(|tx| tx.outputs.iter()))
+        .filter(|(_, script)| !script.is_empty() && script[0] != 0x6a)
+        .map(|(_, script)| script.as_slice())
+        .chain(spent_scripts.iter().map(Vec::as_slice))
+        .collect();
+    let (filter, _) =
+        dinero_sv2_jd::block_filter::gcs_build(&mapped.wire.prev_block_hash, &scripts);
+    let expected_dnrf = dinero_sv2_jd::filter_commitment::build_dnrf_script(
+        &dinero_sv2_jd::block_filter::gcs_filter_hash(&filter),
+    );
+    ensure!(
+        coinbase_outputs
+            .iter()
+            .any(|(_, script)| *script == expected_dnrf),
+        "stored DNRF omits spent scripts or differs from the full block filter"
     );
     eprintln!("shared pool confirmed unshield {unshield_id} and shield {second_id} in block {tip}");
     Ok(())

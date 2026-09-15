@@ -76,6 +76,7 @@ fn parse_proof(
 
 struct Selection {
     proofs: Vec<Vec<DeletionTarget>>,
+    input_scripts: Vec<Vec<Vec<u8>>>,
     dropped: HashSet<usize>,
 }
 
@@ -94,6 +95,7 @@ async fn prove_transactions(
     let mut requests = Vec::new();
     let mut selection = Selection {
         proofs: vec![vec![]; txs.len()],
+        input_scripts: vec![vec![]; txs.len()],
         dropped: HashSet::new(),
     };
     for (i, tx) in txs.iter().enumerate() {
@@ -130,8 +132,20 @@ async fn prove_transactions(
         match validated {
             Ok(proofs) => {
                 for ((index, outpoint), proof) in batch.iter().zip(proofs) {
-                    match parse_proof(&proof, outpoint, pre) {
-                        Ok(p) => selection.proofs[*index].push(p),
+                    let validated = parse_proof(&proof, outpoint, pre).and_then(|target| {
+                        let script = hex::decode(
+                            proof["script_pubkey"]
+                                .as_str()
+                                .context("missing spent script")?,
+                        )
+                        .context("invalid spent script hex")?;
+                        Ok((target, script))
+                    });
+                    match validated {
+                        Ok((p, script)) => {
+                            selection.proofs[*index].push(p);
+                            selection.input_scripts[*index].push(script);
+                        }
                         Err(error) => {
                             tracing::warn!(txid = %display_txid(&txs[*index].txid_raw), error = %error, "excluding transaction after proof failure");
                             selection.dropped.insert(*index);
@@ -220,6 +234,7 @@ pub async fn prepare_template(
             let mut state = pre;
             state.apply_deletions(&selection.proofs.into_iter().flatten().collect::<Vec<_>>())?;
             pt.utreexo_pre_block = Some(state);
+            pt.spent_input_scripts = selection.input_scripts.into_iter().flatten().collect();
             return Ok(pt);
         }
         excluded.extend(
@@ -279,6 +294,78 @@ mod tests {
     use dinero_sv2_jd::{commitment, UtreexoAccumulatorState};
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn shared_filter_commits_to_spent_input_script_absent_from_outputs() {
+        let mut pre = UtreexoAccumulatorState::empty();
+        pre.add_leaf([9; 32]).unwrap();
+        let mut pt = mapper::tests::fixture_pool_template();
+        pt.height = 20000;
+        pt.utreexo_pre_block = Some(pre.clone());
+        pt.mempool_txs = vec![MempoolTx {
+            inputs: vec![([8; 32], 0)],
+            outputs: vec![(123, vec![0x52])],
+            ..unshield()
+        }];
+        pt.merkle_path = vec![[7; 32]];
+        let (rpc, server) = fake_rpc(vec![json!({
+            "status":"updated", "root_to":hex::encode(commitment(&pre).unwrap()),
+            "proofs":[{"success":true,"txid":hex::encode([8;32]),"vout":0,
+                "leaf_hash":hex::encode([9;32]),"position":0,"num_leaves":1,
+                "siblings":[],"script_pubkey":"53"}]
+        })])
+        .await;
+        let prepared = prepare_template(&rpc, pt, "test-address").await.unwrap();
+        let built = crate::shared_template::build_shared_template(
+            &prepared,
+            vec![dinero_sv2_jd::CoinbaseOutput {
+                value_una: prepared.coinbase_value_una,
+                script_pubkey: vec![0x51],
+            }],
+            None,
+            20,
+        )
+        .unwrap();
+        let (filter, _) = dinero_sv2_jd::block_filter::gcs_build(
+            &prepared.wire.prev_block_hash,
+            &[&[0x51], &[0x52], &[0x53]],
+        );
+        let expected = dinero_sv2_jd::filter_commitment::build_dnrf_script(
+            &dinero_sv2_jd::block_filter::gcs_filter_hash(&filter),
+        );
+        assert!(
+            built.outputs.iter().any(|o| o.script_pubkey == expected),
+            "DNRF must include a spent input script even when no output reuses it"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_spent_script_excludes_the_transaction() {
+        let mut pre = UtreexoAccumulatorState::empty();
+        pre.add_leaf([9; 32]).unwrap();
+        for script in [Value::Null, json!("not-hex")] {
+            let (rpc, server) = fake_rpc(vec![json!({
+                "status":"updated", "root_to":hex::encode(commitment(&pre).unwrap()),
+                "proofs":[{"success":true,"txid":hex::encode([8;32]),"vout":0,
+                    "leaf_hash":hex::encode([9;32]),"position":0,"num_leaves":1,
+                    "siblings":[],"script_pubkey":script}]
+            })])
+            .await;
+            let selection = prove_transactions(
+                &rpc,
+                &pre,
+                &[MempoolTx {
+                    inputs: vec![([8; 32], 0)],
+                    ..unshield()
+                }],
+            )
+            .await
+            .unwrap();
+            assert_eq!(selection.dropped, HashSet::from([0]));
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn proof_verification_rejects_bad_identity_shape_and_stale_forest() {
@@ -492,6 +579,7 @@ mod tests {
             outputs: vec![(40, vec![0x53])],
         };
         pt.mempool_txs = vec![bad, child, unshield()];
+        pt.spent_input_scripts = vec![vec![0x54]];
         let original_value = pt.coinbase_value_una;
         let mut filtered = mapper::tests::fixture();
         filtered["coinbasevalue"] = json!(original_value - 15);
@@ -502,6 +590,7 @@ mod tests {
             .await
             .expect("one bad tx must not stop template production");
         assert_eq!(built.mempool_txs.len(), 1);
+        assert!(built.spent_input_scripts.is_empty());
         assert_eq!(built.mempool_txs[0].txid_raw, [7; 32]);
         assert_eq!(built.coinbase_value_una, original_value - 15);
         assert_eq!(built.merkle_path, vec![[7; 32]]);
@@ -554,7 +643,7 @@ mod tests {
         let mut pre = UtreexoAccumulatorState::empty();
         pre.add_leaf(leaf).unwrap();
         let (rpc, server) = fake_rpc(vec![json!({"status":"updated", "root_to":hex::encode(commitment(&pre).unwrap()), "proofs":[{
-            "success":true, "txid":hex::encode([8;32]), "vout":2, "leaf_hash":hex::encode(leaf), "position":0, "num_leaves":1, "siblings":[]
+            "success":true, "txid":hex::encode([8;32]), "vout":2, "leaf_hash":hex::encode(leaf), "position":0, "num_leaves":1, "siblings":[], "script_pubkey":"53"
         }]})]).await;
         let transparent = mapper::MempoolTx {
             txid_raw: [10; 32],

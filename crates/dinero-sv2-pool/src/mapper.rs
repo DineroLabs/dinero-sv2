@@ -51,6 +51,9 @@ pub struct PoolTemplate {
     /// Transactions in daemon-selected block order. Transparent inputs need
     /// chain-tip proofs unless they spend an earlier transaction in this block.
     pub mempool_txs: Vec<MempoolTx>,
+    /// Chain-backed spent scripts returned with the selected input proofs.
+    /// DNRF includes these as well as all non-OP_RETURN block output scripts.
+    pub spent_input_scripts: Vec<Vec<u8>>,
 }
 
 /// One mempool tx: the daemon's serialized form + identity + the leaf
@@ -365,6 +368,7 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
         merkle_path,
         coinbase_txid_raw,
         mempool_txs,
+        spent_input_scripts: Vec::new(),
     })
 }
 
