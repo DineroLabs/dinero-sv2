@@ -3,14 +3,14 @@
 //! roots itself. Shared miners grind the header verbatim.
 
 use anyhow::{anyhow, Context, Result};
-use dinero_sv2_common::NewTemplateDinero;
+use dinero_sv2_common::{sha256d, NewTemplateDinero};
 use dinero_sv2_jd::{
     assemble_stripped_coinbase,
     block_filter::{gcs_build, gcs_filter_hash},
     commitment, compute_root,
     filter_commitment::{build_dnrf_script, requires_filter_commitment},
     leaf_hash_for_height,
-    witness_commitment::{build_dnrw_script_coinbase_only, requires_witness_commitment},
+    witness_commitment::{build_dnrw_script, requires_witness_commitment, witness_merkle_root},
     CoinbaseOutput,
 };
 
@@ -22,6 +22,8 @@ use crate::mapper::PoolTemplate;
 /// final — the miner grinds nonce/timestamp/version only.
 #[derive(Debug)]
 pub struct SharedTemplate {
+    /// Exact transaction bytes paired with this job, including across refreshes.
+    pub mempool_tx_data: Vec<Vec<u8>>,
     pub height: u32,
     /// Miner-facing wire message: `merkle_root` + `utreexo_root` are
     /// the pool's own recomputation over the split coinbase, not the
@@ -40,7 +42,7 @@ pub struct SharedTemplate {
 /// Assemble a pool-owned coinbase from a PPLNS `split_outputs` list
 /// (value outputs only — no DNRW/DNRF), append the mandatory witness
 /// and filter commitments, and recompute both header roots against
-/// `pt`'s pre-block Utreexo state and merkle path.
+/// `pt`'s post-deletion Utreexo state and merkle path.
 ///
 /// `split_outputs` must sum exactly to `pt.coinbase_value_una`;
 /// `compute_split` no longer guarantees a fee output or forbids
@@ -70,10 +72,6 @@ pub fn build_shared_template(
             pt.coinbase_value_una
         ));
     }
-    if !pt.mempool_txs.is_empty() {
-        // Shared jobs are coinbase-only for now (spec: out of scope).
-        return Err(anyhow!("shared templates are coinbase-only"));
-    }
     let pre_block = pt
         .utreexo_pre_block
         .as_ref()
@@ -90,14 +88,17 @@ pub fn build_shared_template(
         outputs.push(dinero_sv2_jd::coinbase::state_commitment_output(root));
     }
 
-    // DNRW (coinbase-only constant): witness merkle root is fixed at
-    // sha256d(64 zero bytes) because a coinbase-only block's witness
-    // leaf is the BIP-141 zero convention and there are no mempool
-    // wtxids to fold in.
+    // Coinbase witness leaf is zero; transaction leaves hash the unchanged
+    // full serializations, including shielded witness/bundle bytes.
     if requires_witness_commitment(pt.height as u64) {
         outputs.push(CoinbaseOutput {
             value_una: 0,
-            script_pubkey: build_dnrw_script_coinbase_only(),
+            script_pubkey: build_dnrw_script(&witness_merkle_root(
+                &pt.mempool_txs
+                    .iter()
+                    .map(|tx| sha256d(&tx.data))
+                    .collect::<Vec<_>>(),
+            )),
         });
     }
     if requires_filter_commitment(pt.height as u64) {
@@ -127,6 +128,13 @@ pub fn build_shared_template(
             .iter()
             .filter(|o| o.script_pubkey.first() != Some(&0x6a))
             .map(|o| o.script_pubkey.as_slice())
+            .chain(
+                pt.mempool_txs
+                    .iter()
+                    .flat_map(|tx| tx.outputs.iter())
+                    .filter(|(_, script)| !script.is_empty() && script[0] != 0x6a)
+                    .map(|(_, script)| script.as_slice()),
+            )
             .collect();
         let (encoded_filter, _) = gcs_build(&pt.wire.prev_block_hash, &script_refs);
         let dnrf = build_dnrf_script(&gcs_filter_hash(&encoded_filter));
@@ -169,6 +177,12 @@ pub fn build_shared_template(
             ))
             .context("shared template add_leaf")?;
     }
+    crate::mempool::add_transaction_outputs(
+        &mut state,
+        &pt.mempool_txs,
+        pt.height,
+        utreexo_maturity_leaf_height,
+    )?;
     let utreexo_root = commitment(&state).context("shared template commitment")?;
     let merkle_root = compute_root(coinbase_txid, &pt.merkle_path);
 
@@ -183,10 +197,12 @@ pub fn build_shared_template(
     let wire = NewTemplateDinero {
         merkle_root,
         utreexo_root,
+        coinbase_outputs_commitment: sha256d(&full_coinbase),
         ..pt.wire.clone()
     };
 
     Ok(SharedTemplate {
+        mempool_tx_data: pt.mempool_txs.iter().map(|tx| tx.data.clone()).collect(),
         height: pt.height,
         wire,
         coinbase_full_hex: hex::encode(full_coinbase),
@@ -198,6 +214,83 @@ pub fn build_shared_template(
 mod tests {
     use super::*;
     use dinero_sv2_jd::UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET;
+
+    #[test]
+    fn shared_template_includes_unshield_and_commits_to_its_bytes_and_outputs() {
+        let mut pt = crate::mapper::tests::fixture_pool_template();
+        pt.height = 20000;
+        pt.mempool_txs.push(crate::mapper::MempoolTx {
+            data: vec![6, 0, 0, 0, 0, 1, 0],
+            txid_raw: [7; 32],
+            inputs: vec![],
+            outputs: vec![(123, vec![0x52])],
+        });
+        pt.merkle_path = vec![[7; 32]];
+        let pay = CoinbaseOutput {
+            value_una: pt.coinbase_value_una,
+            script_pubkey: vec![0x51],
+        };
+        let built = build_shared_template(
+            &pt,
+            vec![pay],
+            Some(3),
+            UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+        )
+        .unwrap();
+        let expected = dinero_sv2_jd::witness_commitment::build_dnrw_script(
+            &dinero_sv2_jd::witness_commitment::witness_merkle_root(&[dinero_sv2_common::sha256d(
+                &pt.mempool_txs[0].data,
+            )]),
+        );
+        assert!(built.outputs.iter().any(|o| o.script_pubkey == expected));
+        let (filter, _) = gcs_build(&pt.wire.prev_block_hash, &[&[0x51], &[0x52]]);
+        assert!(built
+            .outputs
+            .iter()
+            .any(|o| o.script_pubkey == build_dnrf_script(&gcs_filter_hash(&filter))));
+        let prefix =
+            crate::extranonce::inject_scriptsig_extranonce(&pt.coinbase_prefix, 3).unwrap();
+        let (_, coinbase_id) =
+            assemble_stripped_coinbase(&prefix, &built.outputs, &pt.coinbase_suffix);
+        let mut expected_state = pt.utreexo_pre_block.clone().unwrap();
+        for (i, output) in built.outputs.iter().enumerate() {
+            expected_state
+                .add_leaf(leaf_hash_for_height(
+                    &coinbase_id,
+                    i as u32,
+                    output.value_una,
+                    &output.script_pubkey,
+                    pt.height,
+                    true,
+                    UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+                ))
+                .unwrap();
+        }
+        expected_state
+            .add_leaf(leaf_hash_for_height(
+                &[7; 32],
+                0,
+                123,
+                &[0x52],
+                pt.height,
+                false,
+                UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET,
+            ))
+            .unwrap();
+        assert_eq!(
+            built.wire.utreexo_root,
+            commitment(&expected_state).unwrap()
+        );
+        assert_eq!(
+            built.wire.merkle_root,
+            compute_root(coinbase_id, &[[7; 32]])
+        );
+        assert_eq!(built.mempool_tx_data, vec![pt.mempool_txs[0].data.clone()]);
+        assert_eq!(
+            built.wire.coinbase_outputs_commitment,
+            sha256d(&hex::decode(&built.coinbase_full_hex).unwrap())
+        );
+    }
 
     #[test]
     fn shared_dnrs_preserves_daemon_root_and_rejects_bad_candidates() {
@@ -467,26 +560,6 @@ mod tests {
         let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
             .unwrap_err();
         assert!(err.to_string().contains("utreexo pre-block"));
-    }
-
-    #[test]
-    fn rejects_nonempty_mempool() {
-        let mut pt = crate::mapper::tests::fixture_pool_template();
-        // Fixture has empty mempool_txs; push a dummy one to trigger rejection.
-        pt.mempool_txs.push(crate::mapper::MempoolTx {
-            data: vec![0x01, 0x02, 0x03], // minimal dummy tx bytes
-            txid_raw: [0x42u8; 32],
-            inputs: vec![],
-            outputs: vec![],
-        });
-
-        let outputs = vec![CoinbaseOutput {
-            value_una: pt.coinbase_value_una,
-            script_pubkey: vec![0x51, 0x20, 0x01],
-        }];
-        let err = build_shared_template(&pt, outputs, None, UTREEXO_MATURITY_LEAF_HEIGHT_MAINNET)
-            .unwrap_err();
-        assert!(err.to_string().contains("coinbase-only"));
     }
 
     #[test]

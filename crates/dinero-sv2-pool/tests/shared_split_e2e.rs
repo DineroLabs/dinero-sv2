@@ -75,7 +75,7 @@
 //!   mainnet-identical) makes this test — and any non-mainnet
 //!   deployment — possible. See the task-7 report for detail.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use dinero_sv2_codec::{
     decode_new_template, decode_open_standard_mining_channel_success,
     decode_setup_connection_success, decode_submit_shares_error,
@@ -1314,5 +1314,117 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
         .any(|(v, s)| *v == 0 && *s == dnrs.script_pubkey));
     assert!(outputs.iter().any(|(v, s)| *v > 0 && *s == script));
     eprintln!("solo miner (gpu={gpu}) -> pool -> daemon: accepted DNRS block {hash}");
+    Ok(())
+}
+
+/// Regression for the September proof/template refusal incident. Uses real
+/// shielded transactions and the production pool process, not a hand-built
+/// block submitted by the test in place of the pool.
+#[tokio::test]
+#[ignore = "requires DINEROD_BIN; mines an isolated regtest chain"]
+async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template() -> Result<()> {
+    let daemon = RegtestDaemon::spawn_at_dnrs(29991, 1)?;
+    daemon.wait_for_cookie()?;
+    let rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(60),
+    )?;
+    let wallet = rpc
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["proof-regression", "", false]),
+        )
+        .await?;
+    let address = wallet["first_address"].as_str().context("wallet address")?;
+    mine_blocks(&rpc, address, 101).await?;
+    let shield = rpc
+        .call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    ensure!(shield["txid"].as_str().is_some(), "shield failed: {shield}");
+    mine_blocks(&rpc, address, 1).await?;
+    let unshield = rpc
+        .call_raw("wallet.unshield", serde_json::json!([1.0]))
+        .await?;
+    let unshield_id = unshield["txid"].as_str().context("unshield txid")?;
+    // A second shield supplies transparent inputs, exercising the complete
+    // proof RPC while the unshield contributes only transparent outputs.
+    let second = rpc
+        .call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    let second_id = second["txid"].as_str().context("second shield txid")?;
+    let gbt = rpc.get_block_template(address).await?;
+    let mapped = mapper::map_template(&gbt, 1)?;
+    ensure!(
+        mapped.mempool_txs.len() == 2,
+        "daemon omitted test transactions: {}",
+        gbt["transactions"]
+    );
+    ensure!(
+        mapped
+            .mempool_txs
+            .iter()
+            .any(|tx| tx.inputs.is_empty() && !tx.outputs.is_empty()),
+        "missing zero-input unshield"
+    );
+    ensure!(
+        mapped.mempool_txs.iter().any(|tx| !tx.inputs.is_empty()),
+        "missing transparent inputs"
+    );
+    let expected_dnrs = mapper::state_commitment_root(&mapped.coinbase_full_hex)?;
+    let dir = tempfile::tempdir()?;
+    let pool = PoolProcess::spawn(
+        "127.0.0.1:29992".parse()?,
+        &daemon.rpc_url,
+        &daemon.cookie_path,
+        address,
+        &dir.path().join("journal"),
+        &dir.path().join("key"),
+        dir.path().join("pool.log"),
+    )?;
+    pool.wait_ready().await?;
+    let mut miner = MinerConn::connect(pool.bind, payout_script(0xA5), 1)
+        .await
+        .with_context(|| format!("shared handshake: {}", pool.tail_log()))?;
+    miner.find_and_submit_block().await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if rpc
+            .call_raw("getblockcount", serde_json::json!([]))
+            .await?
+            .as_u64()
+            == Some(103)
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "pool failed to confirm unshield: {}",
+            pool.tail_log()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let tip = rpc.get_best_block_hash().await?;
+    let block = rpc
+        .call_raw("getblock", serde_json::json!([tip, 1]))
+        .await?;
+    let txids = block["tx"].as_array().context("block txids")?;
+    ensure!(
+        txids.contains(&serde_json::json!(unshield_id))
+            && txids.contains(&serde_json::json!(second_id)),
+        "pool dropped shielded transactions: {block}"
+    );
+    // The daemon validates DNRS on acceptance; independently compare its
+    // current full state digest (the tip marker contains only the tree root).
+    let info = rpc
+        .call_raw("daemon.shieldedroot", serde_json::json!([]))
+        .await?;
+    let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
+    root.reverse();
+    ensure!(
+        expected_dnrs.as_ref().map(|r| r.as_slice()) == Some(root.as_slice()),
+        "pool changed shielded state commitment"
+    );
+    eprintln!("shared pool confirmed unshield {unshield_id} and shield {second_id} in block {tip}");
     Ok(())
 }

@@ -42,6 +42,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p dinero-sv2-pool --test shared_split_e2e shared_block_coinbase_pays_window_contributors -- --ignored --nocapture 2>&1 | tee shared-dnrs.log
+          cargo test --locked -p dinero-sv2-pool --test shared_split_e2e shared_pool_confirms_unshield_with_transparent_inputs_in_same_template -- --ignored --nocapture 2>&1 | tee shielded-dnrs.log
           cargo test --locked -p dinero-sv2-pool --test shared_split_e2e solo_miner_preserves_dnrs_through_pool -- --ignored --nocapture 2>&1 | tee solo-dnrs.log
       - uses: actions/upload-artifact@v4
         if: always()

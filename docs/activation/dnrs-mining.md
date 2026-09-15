@@ -9,9 +9,12 @@ changes affect transparent coinbase outputs and their Utreexo/filter roots;
 they do not authorize recomputing or omitting DNRS. Missing, malformed,
 duplicate or nonzero-valued daemon commitments are refused. Extended shares
 must include exactly the same canonical zero-valued DNRS before crediting or
-submission. The pool no longer drops a template's transactions after Utreexo
-pre-state derivation fails: its coinbase commits to the original transaction
-set, so that fallback could invalidate DNRS, witness commitment and fee totals.
+submission. After a transaction proof failure the pool requests a new daemon
+template with `exclude_txids`, including descendants of the failed transaction.
+The daemon must rebuild DNRS, witness/filter commitments, fees and header roots.
+The pool verifies the exclusions and parent before publishing. Backends that
+ignore this extension fail closed. See [proof recovery](../pool-proof-recovery.md)
+for the companion daemon requirement and validation evidence.
 
 CoinbaseContext has an optional, exactly 32-byte trailing root extension.
 Absent extension retains the old wire encoding. A present extension contains
