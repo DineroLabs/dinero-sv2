@@ -34,12 +34,12 @@ and transparent descendants before commitment generation, recalculates fees,
 and leaves the mempool intact. IDs must be 64 hexadecimal characters; the
 request limit is 10,000 entries. Exclusion does not refill template capacity.
 
-The DNRS CI workflow pins that daemon commit and runs both the daemon regression
-and real pool recovery test. **Publish the daemon commit before publishing this
-pool follow-up**, so the pinned checkout resolves. Both commits are currently
-local; neither component has been deployed. Existing backends ignore the extra
-request field; the pool detects that and refuses recovery. Ordinary mixed
-shield/unshield inclusion works with the existing v8.1.12 daemon.
+The DNRS CI workflow pins that daemon commit and runs the daemon regressions
+and optimized pool recovery tests. Both development branches were published in
+daemon-first order so the pinned checkout resolves. Neither component has been
+deployed. Existing backends ignore the extra request field; the pool detects
+that and refuses recovery. Ordinary mixed shield/unshield inclusion works with
+the existing v8.1.12 daemon.
 
 A parent shielded tree root is not a replacement DNRS. DNRS covers the full
 shielded state, including nullifiers and height-dependent anchor history.
@@ -89,7 +89,9 @@ Recorded validation on this branch:
   allowed and all other warnings denied.
 - Workspace formatting has pre-existing differences in unrelated files;
   changed Rust files pass `rustfmt --check` with child-module traversal disabled.
-- Production rollout and Linux qualification were not performed.
+- Linux qualification is recorded in
+  [the qualification report](pool-proof-linux-qualification.md).
+  Production rollout has not been performed.
 
 ### Companion daemon recovery validation
 
