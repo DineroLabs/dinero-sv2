@@ -27,11 +27,19 @@ of those IDs survived, the parent and height stayed fixed, and DNRS remains
 present when required. Four attempts and a 45-second overall timeout bound
 recovery. It never edits a daemon coinbase to pretend a transaction was removed.
 
-**The companion daemon extension is not implemented in this Rust branch.**
-Existing backends ignore the extra request field; the pool detects that and
-refuses the recovery template. The normal mixed shield/unshield path works
-against the existing v8.1.12 daemon. Full exclusion recovery requires the daemon
-extension before deployment and an end-to-end fault-injection acceptance test.
+The companion daemon extension is implemented in dinero-v8 commit
+`b53bc958b3360ca9b8f52aa0488714fec51e68f0` on
+`codex/pool-template-exclusions`. Its assembler removes requested transactions
+and transparent descendants before commitment generation, recalculates fees,
+and leaves the mempool intact. IDs must be 64 hexadecimal characters; the
+request limit is 10,000 entries. Exclusion does not refill template capacity.
+
+The DNRS CI workflow pins that daemon commit and runs both the daemon regression
+and real pool recovery test. **Publish the daemon commit before publishing this
+pool follow-up**, so the pinned checkout resolves. Both commits are currently
+local; neither component has been deployed. Existing backends ignore the extra
+request field; the pool detects that and refuses recovery. Ordinary mixed
+shield/unshield inclusion works with the existing v8.1.12 daemon.
 
 A parent shielded tree root is not a replacement DNRS. DNRS covers the full
 shielded state, including nullifiers and height-dependent anchor history.
@@ -73,7 +81,7 @@ No production node, wallet, pool service, or mempool was changed.
 
 Recorded validation on this branch:
 
-- `cargo test --workspace`: 438 passed, 8 opt-in tests ignored.
+- `cargo test --locked --workspace`: 438 passed, 9 opt-in tests ignored.
 - Explicit real-process tests passed: mixed unshield/shield inclusion (height
   103), shared contributor payouts (height 26), CPU solo DNRS (height 2).
 - Strict Clippy encounters an existing `items_after_test_module` warning in
@@ -82,3 +90,31 @@ Recorded validation on this branch:
 - Workspace formatting has pre-existing differences in unrelated files;
   changed Rust files pass `rustfmt --check` with child-module traversal disabled.
 - Production rollout and Linux qualification were not performed.
+
+### Companion daemon recovery validation
+
+```sh
+DINEROD_BIN=/absolute/path/to/patched/dinerod cargo test --locked \
+  -p dinero-sv2-pool --test shared_split_e2e \
+  shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs \
+  -- --ignored --nocapture
+```
+
+This regression fails against the old daemon at the exclusion-support check.
+With the companion patch, a local proxy forwards real RPCs and deliberately
+fails an otherwise valid input proof for a shield transaction. The actual pool
+requests that transaction's exclusion and mines the remaining unshield in block
+103. The daemon accepts the block with a rebuilt DNRS; the failed shield remains
+in the mempool. Both this recovery test and normal mixed inclusion pass against
+the patched daemon.
+
+Daemon tests separately validate malformed parameters, duplicate/uppercase and
+unknown IDs, descendant closure, fee subtraction, unchanged ordinary selection,
+and externally accepted filtered and all-excluded blocks. A retained shield is
+then confirmed through an ordinary template. Existing daemon GBT/coordinator
+mining, DNRS persistence and dormant controls also pass.
+
+Mempool retention does not guarantee future transaction validity: tests observed
+that an unshield's old anchor can become invalid after another shielded tree
+update. Recovery preserves the existing validation rules and does not repair or
+rebroadcast such transactions.

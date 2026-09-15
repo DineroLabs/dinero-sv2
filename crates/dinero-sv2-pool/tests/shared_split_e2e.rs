@@ -1428,3 +1428,229 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
     eprintln!("shared pool confirmed unshield {unshield_id} and shield {second_id} in block {tip}");
     Ok(())
 }
+
+/// Forward to the real daemon, but fail one selected chain-input proof. This
+/// exercises recovery without corrupting the wallet, mempool or consensus state.
+struct FaultyProofProxy {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+    failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    exclusions: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Drop for FaultyProofProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FaultyProofProxy {
+    async fn spawn(rpc: RpcClient, bad_txid: String, bad_vout: u32) -> Result<Self> {
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exclusions = Arc::new(Mutex::new(Vec::new()));
+        let observed_failures = failures.clone();
+        let observed_exclusions = exclusions.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let rpc = rpc.clone();
+                let bad_txid = bad_txid.clone();
+                let failures = observed_failures.clone();
+                let exclusions = observed_exclusions.clone();
+                connections.spawn(async move {
+                    let handle = async {
+                        let mut request = Vec::new();
+                        let (body_start, content_length) = loop {
+                            let mut buf = [0; 4096];
+                            let n = stream.read(&mut buf).await?;
+                            ensure!(n > 0 && request.len() < 2_000_000, "invalid proxy request");
+                            request.extend_from_slice(&buf[..n]);
+                            if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                                let headers = std::str::from_utf8(&request[..end])?;
+                                let length = headers.lines().find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok()).flatten()
+                                }).context("proxy content length")?;
+                                ensure!(length < 2_000_000, "proxy body too large");
+                                break (end + 4, length);
+                            }
+                        };
+                        while request.len() < body_start + content_length {
+                            let mut buf = [0; 4096];
+                            let n = stream.read(&mut buf).await?;
+                            ensure!(n > 0, "truncated proxy body");
+                            request.extend_from_slice(&buf[..n]);
+                        }
+                        let call: serde_json::Value = serde_json::from_slice(
+                            &request[body_start..body_start + content_length])?;
+                        let method = call["method"].as_str().context("proxy method")?;
+                        if method == "getblocktemplate" && call["params"][0]["exclude_txids"].is_array() {
+                            exclusions.lock().unwrap().push(call["params"][0]["exclude_txids"].clone());
+                        }
+                        let response = match rpc.call_raw(method, call["params"].clone()).await {
+                            Ok(mut result) => {
+                                if method == "getproofupdates" {
+                                    if let Some(proofs) = result["proofs"].as_array_mut() {
+                                        for proof in proofs {
+                                            if proof["txid"] == bad_txid && proof["vout"] == bad_vout {
+                                                ensure!(proof["success"] == true, "fixture proof already failed: {proof}");
+                                                proof["success"] = serde_json::json!(false);
+                                                proof["error"] = serde_json::json!("injected per-transaction proof failure");
+                                                failures.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                }
+                                serde_json::json!({"result":result,"error":null,"id":call["id"]})
+                            }
+                            Err(error) => serde_json::json!({"result":null,"error":error.to_string(),"id":call["id"]}),
+                        };
+                        let body = serde_json::to_vec(&response)?;
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await?;
+                        stream.write_all(&body).await?;
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(60), handle).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("proof proxy request failed: {error:#}"),
+                        Err(error) => eprintln!("proof proxy timed out: {error}"),
+                    }
+                });
+                while connections.try_join_next().is_some() {}
+            }
+        });
+        Ok(Self {
+            url,
+            task,
+            failures,
+            exclusions,
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DINEROD_BIN with getblocktemplate exclude_txids support"]
+async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Result<()> {
+    let daemon = RegtestDaemon::spawn_at_dnrs(29995, 1)?;
+    daemon.wait_for_cookie()?;
+    let rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(60),
+    )?;
+    let wallet = rpc
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["proof-failure", "", false]),
+        )
+        .await?;
+    let address = wallet["first_address"].as_str().context("wallet address")?;
+    mine_blocks(&rpc, address, 101).await?;
+    rpc.call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    mine_blocks(&rpc, address, 1).await?;
+    let unshield = rpc
+        .call_raw("wallet.unshield", serde_json::json!([1.0]))
+        .await?;
+    let unshield_id = unshield["txid"].as_str().context("unshield txid")?;
+    let shield = rpc
+        .call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    let shield_id = shield["txid"].as_str().context("shield txid")?;
+    let original = mapper::map_template(&rpc.get_block_template(address).await?, 1)?;
+    ensure!(
+        original.mempool_txs.len() == 2,
+        "fixture requires two transactions"
+    );
+    let input = original
+        .mempool_txs
+        .iter()
+        .find_map(|tx| tx.inputs.first())
+        .context("shield input")?;
+    let mut input_id = input.0;
+    input_id.reverse();
+    let proxy = FaultyProofProxy::spawn(rpc.clone(), hex::encode(input_id), input.1).await?;
+    let dir = tempfile::tempdir()?;
+    let pool = PoolProcess::spawn(
+        "127.0.0.1:29996".parse()?,
+        &proxy.url,
+        &daemon.cookie_path,
+        address,
+        &dir.path().join("journal"),
+        &dir.path().join("key"),
+        dir.path().join("pool.log"),
+    )?;
+    pool.wait_ready().await?;
+    let mut miner = MinerConn::connect(pool.bind, payout_script(0xB6), 1)
+        .await
+        .with_context(|| format!("recovery shared handshake: {}", pool.tail_log()))?;
+    miner.find_and_submit_block().await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rpc
+        .call_raw("getblockcount", serde_json::json!([]))
+        .await?
+        .as_u64()
+        != Some(103)
+    {
+        ensure!(
+            Instant::now() < deadline,
+            "proof recovery did not mine: {}",
+            pool.tail_log()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    ensure!(
+        proxy.failures.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "proof fault not exercised"
+    );
+    ensure!(
+        proxy
+            .exclusions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ids| ids == &serde_json::json!([shield_id])),
+        "pool did not request the bad transaction's exclusion"
+    );
+    let tip = rpc.get_best_block_hash().await?;
+    let block = rpc
+        .call_raw("getblock", serde_json::json!([tip, 1]))
+        .await?;
+    let txids = block["tx"].as_array().context("block txids")?;
+    ensure!(
+        txids.len() == 2
+            && txids.contains(&serde_json::json!(unshield_id))
+            && !txids.contains(&serde_json::json!(shield_id)),
+        "wrong recovery transaction set: {block}"
+    );
+    let mempool = rpc.call_raw("getrawmempool", serde_json::json!([])).await?;
+    ensure!(
+        mempool
+            .as_array()
+            .context("mempool")?
+            .contains(&serde_json::json!(shield_id)),
+        "excluded transaction was evicted: {mempool}"
+    );
+    let info = rpc
+        .call_raw("daemon.shieldedroot", serde_json::json!([]))
+        .await?;
+    let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
+    root.reverse();
+    ensure!(
+        mapper::state_commitment_root(&original.coinbase_full_hex)?
+            .as_ref()
+            .map(|r| r.as_slice())
+            != Some(root.as_slice()),
+        "recovery reused original DNRS"
+    );
+    eprintln!("pool recovered from injected proof failure: included unshield {unshield_id}, retained shield {shield_id} in mempool; block {tip}");
+    Ok(())
+}
