@@ -234,7 +234,15 @@ impl PoolProcess {
         key_path: &Path,
         stderr_log: PathBuf,
     ) -> Result<Self> {
-        let binary = env!("CARGO_BIN_EXE_dinero-sv2-pool");
+        // Candidate qualification supplies the already-packaged executable.
+        // Cargo's binary remains the default for source-level process tests.
+        let binary = std::env::var("DINEROPOOL_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_dinero-sv2-pool").to_owned());
+        anyhow::ensure!(
+            Path::new(&binary).is_file(),
+            "pool binary not found: {binary}"
+        );
+        eprintln!("pool process executable: {binary}");
         let stderr_file = std::fs::File::create(&stderr_log).context("creating pool stderr log")?;
 
         let child = Command::new(binary)
