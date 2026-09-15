@@ -175,17 +175,33 @@ impl RegtestDaemon {
         })
     }
 
-    fn wait_for_cookie(&self) -> Result<()> {
+    async fn wait_for_rpc(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_error = "cookie not available".to_owned();
         while Instant::now() < deadline {
+            // The cookie is written before the HTTP listener starts. Wait for
+            // an actual RPC response so a fast test cannot race daemon startup.
             if self.cookie_path.exists() {
-                return Ok(());
+                match RpcClient::with_timeout(
+                    self.rpc_url.clone(),
+                    Auth::Cookie(self.cookie_path.display().to_string()),
+                    Duration::from_secs(1),
+                ) {
+                    Ok(rpc) => match rpc.call_raw("getblockcount", serde_json::json!([])).await {
+                        Ok(value) if value.as_u64().is_some() => return Ok(()),
+                        Ok(value) => {
+                            last_error = format!("unexpected block count response: {value}")
+                        }
+                        Err(error) => last_error = format!("{error:#}"),
+                    },
+                    Err(error) => last_error = format!("{error:#}"),
+                }
             }
-            std::thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         bail!(
-            "timed out waiting for cookie at {}",
-            self.cookie_path.display()
+            "timed out waiting for daemon RPC at {}: {last_error}",
+            self.rpc_url
         )
     }
 }
@@ -767,7 +783,7 @@ async fn run_shared_split_scenario(
     let started = Instant::now();
 
     let daemon = RegtestDaemon::spawn(daemon_port).context("spawn regtest dinerod")?;
-    daemon.wait_for_cookie().context("wait for cookie")?;
+    daemon.wait_for_rpc().await.context("wait for RPC")?;
     let rpc = RpcClient::new(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
@@ -1200,7 +1216,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
     // CPU and GPU cases may run concurrently in the ignored-test suite.
     let (rpc_port, pool_port) = if gpu { (29987, 29988) } else { (29985, 29986) };
     let daemon = RegtestDaemon::spawn_at_dnrs(rpc_port, 2)?;
-    daemon.wait_for_cookie()?;
+    daemon.wait_for_rpc().await?;
     let rpc = RpcClient::new(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
@@ -1324,7 +1340,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
 #[ignore = "requires DINEROD_BIN; mines an isolated regtest chain"]
 async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template() -> Result<()> {
     let daemon = RegtestDaemon::spawn_at_dnrs(29991, 1)?;
-    daemon.wait_for_cookie()?;
+    daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
@@ -1540,7 +1556,7 @@ impl FaultyProofProxy {
 #[ignore = "requires DINEROD_BIN with getblocktemplate exclude_txids support"]
 async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Result<()> {
     let daemon = RegtestDaemon::spawn_at_dnrs(29995, 1)?;
-    daemon.wait_for_cookie()?;
+    daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
