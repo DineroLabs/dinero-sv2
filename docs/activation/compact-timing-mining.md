@@ -1,7 +1,7 @@
 # Compact proofs and 60-second mining preparation
 
 Qualification candidate, not a deployed release. Pair this source with daemon
-commit `6714004b985e601d296ef1f5fe7d7440df0142aa` (Dinero v8 PR #767).
+commit `a5652a6afa4838c842030bb6de6890633df8f06b` (Dinero v8 PR #769).
 That daemon combines the compact format/vector/sanitizer stack with the dormant
 60-second ASERT and 0.5 DIN tail rules. Production activation remains disabled.
 
@@ -92,6 +92,60 @@ interpreting successful compilation or ignored tests as qualification.
 
 These are local regtest compatibility results, not Linux/GPU-family or live
 network qualification. CI starts from genesis with the pinned daemon source.
+
+## PoW-enforced compatibility
+
+The Linux workflow also runs `pow_enforced_compact_cpu_worker` from genesis
+and `pow_enforced_compact_pool_proof_recovery` with a shorter 125-block chain.
+The latter injects a proof RPC failure, requires daemon-assisted exclusion,
+retains the excluded transaction in the mempool, and checks real work and the
+accepted block’s exact DNRS against the resulting shielded state.
+The matching `pow_enforced_compact_gpu_worker` entry requires a physical GPU.
+Both use `--regtest-enforce-pow` and require the RPC to explicitly report that
+mode before funding; an older daemon cannot silently ignore the option and
+pass. They retain the real DNRW threshold (10,670) and all the existing compact
+bytes, DNRS/DNRW/DNRF, payout and fee assertions. The stored pool headers are
+also hashed independently and checked against the unchanged template target.
+
+```sh
+cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e pow_enforced_compact_cpu_worker -- --ignored --exact --nocapture
+cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e pow_enforced_compact_gpu_worker -- --ignored --exact --nocapture
+```
+
+The daemon's new mode enforces hash and canonical ASERT checks at admission and
+binds a fresh datadir to its consensus profile. Logs are siblings of the datadir
+so logging itself cannot violate the fresh-directory guard. For local
+iteration only, `DINERO_POW_MINING_FIXTURE` may name a stopped, disposable
+PoW-profile fixture; ordinary `DINERO_MINING_FIXTURE` is deliberately ignored in
+these cases. Profile mismatches fail at startup. CI always starts fresh.
+
+This fixture activates the 60-second arithmetic at height 1. The fixed genesis
+is old and the resulting target stays at the easy limit, so this qualifies
+actual work enforcement and compact mining, **not production cadence, retarget
+responsiveness, sustainable throughput or stale-share rates**. The core's
+`PowEnforcedRegtest` separately tests the timing boundary with a historical-time
+prefix, invalid hash/wrong-bits rejection and full/CSN recovery. The ordinary
+pool activation-boundary cases remain in CI alongside this test.
+
+### Local PoW results, 2026-09-17
+
+- Downloaded Mac ARM CPU 0.2.13: passed in 646.79s, including a fresh 10,670-block
+  setup and accepted compact shield/unshield at 10,671/10,672.
+- Downloaded Mac ARM GPU 0.2.13 on physical Apple M4 Max Metal: passed in 665.58s,
+  with its own fresh history and both compact transaction shapes accepted.
+- PoW-enforced injected-proof recovery: passed in 33.83s. Existing ordinary
+  compact and legacy mixed-transaction recovery cases also passed with the
+  stronger stored-DNRS and header-hash assertions.
+- Independent Python SHA-256d/target checks accepted all four worker blocks
+  and rejected an invalid-nonce mutation of each. All three recovery blocks
+  also passed independent hash/target checks.
+- An unchanged older daemon failed the explicit PoW-mode assertion before
+  funding, as intended. Standard Rust workspace: 440 passed.
+
+Workers came from candidate workflow 35227320641, source
+`5f3054367646d4abc667d501e01669ff24979e14`. Pool and daemon were local native
+builds; this is not downloaded-Linux-pool or final-release-artifact qualification.
+The daemon source was #769; Linux paired qualification remains a separate CI gate.
 
 ## Throughput finding
 
