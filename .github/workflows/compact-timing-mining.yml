@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   mining:
+    name: Linux compact pool and CPU
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -15,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: DineroLabs/dinero-v8
-          ref: 8f6609e829d5d0895debf4db4cb4b07ebf459172
+          ref: 6714004b985e601d296ef1f5fe7d7440df0142aa
           submodules: recursive
           path: core
       - uses: dtolnay/rust-toolchain@stable
@@ -71,5 +72,6 @@ jobs:
             sv2/mining-sha256.txt
             /tmp/dinero-worker-lifecycle-*/
             /tmp/dinero-compact-pool-*/
+            /tmp/dinero-proof-recovery-*/
             /tmp/dinero-sv2-shared-split-e2e-*/stdout.log
             /tmp/dinero-sv2-shared-split-e2e-*/stderr.log

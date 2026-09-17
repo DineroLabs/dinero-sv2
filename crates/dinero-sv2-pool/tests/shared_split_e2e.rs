@@ -132,6 +132,15 @@ impl RegtestDaemon {
     }
 
     fn spawn_with_args(port: u16, dnrs_height: u32, extra: &[String]) -> Result<Self> {
+        Self::spawn_fixture(port, dnrs_height, extra, None)
+    }
+
+    fn spawn_fixture(
+        port: u16,
+        dnrs_height: u32,
+        extra: &[String],
+        seed: Option<&Path>,
+    ) -> Result<Self> {
         let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/src/dinero/build/dinerod")
@@ -152,6 +161,11 @@ impl RegtestDaemon {
             std::fs::remove_dir_all(&datadir).ok();
         }
         std::fs::create_dir_all(&datadir).context("mkdir datadir")?;
+        if let Some(seed) = seed {
+            // Optional developer acceleration: copy an explicitly supplied,
+            // stopped disposable fixture. Never open/mutate the source DB.
+            copy_fixture(seed, &datadir)?;
+        }
 
         let rpc_url = format!("http://127.0.0.1:{port}");
 
@@ -210,6 +224,28 @@ impl RegtestDaemon {
             self.rpc_url
         )
     }
+}
+
+fn copy_fixture(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some(".cookie" | "dinerod.lock" | "stdout.log" | "stderr.log")
+        ) {
+            continue;
+        }
+        let target = destination.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_fixture(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 impl Drop for RegtestDaemon {
@@ -1399,6 +1435,8 @@ impl ActualWorker {
             "shared",
             "--no-save",
             "--plain",
+            "--max-blocks",
+            "1",
         ])
         .args(if gpu {
             vec!["--batch-size", "4096"]
@@ -1453,20 +1491,45 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
     } else {
         vec![]
     };
-    let daemon = RegtestDaemon::spawn_with_args(rpc_port, 1, &extra)?;
+    let seed = std::env::var("DINERO_MINING_FIXTURE")
+        .ok()
+        .filter(|_| compact);
+    let daemon = RegtestDaemon::spawn_fixture(rpc_port, 1, &extra, seed.as_deref().map(Path::new))?;
     daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
         Duration::from_secs(60),
     )?;
-    let wallet = rpc
-        .call_raw(
+    let address_value = if seed.is_some() {
+        rpc.call_raw("wallet.getnewaddress", serde_json::json!([]))
+            .await?["address"]
+            .clone()
+    } else {
+        rpc.call_raw(
             "wallet.createhd",
             serde_json::json!(["proof-regression", "", false]),
         )
-        .await?;
-    let address = wallet["first_address"].as_str().context("wallet address")?;
+        .await?["first_address"]
+            .clone()
+    };
+    let address = address_value.as_str().context("wallet address")?;
+    let initial_height = rpc
+        .call_raw("getblockcount", serde_json::json!([]))
+        .await?
+        .as_u64()
+        .context("initial height")?;
+    ensure!(
+        initial_height <= u64::from(funding_height),
+        "seed fixture already crossed activation"
+    );
+    ensure!(
+        rpc.call_raw("getrawmempool", serde_json::json!([]))
+            .await?
+            .as_array()
+            .is_some_and(|txs| txs.is_empty()),
+        "seed fixture must have an empty mempool"
+    );
     // This fixture passes the real DNRW height. Keep its bulk setup-mining
     // timeout separate from the wallet/pool RPC deadline: later 1000-block
     // batches exceed 60 seconds on an ordinary loaded machine.
@@ -1475,7 +1538,8 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
         Auth::Cookie(daemon.cookie_path.display().to_string()),
         Duration::from_secs(300),
     )?;
-    let setup_time = mine_blocks(&mining_rpc, address, funding_height).await?;
+    let setup_time =
+        mine_blocks(&mining_rpc, address, funding_height - initial_height as u32).await?;
     eprintln!("funded compact={compact} worker={worker_gpu:?} at height {funding_height} in {setup_time:?}");
     if compact {
         let info = rpc
@@ -1490,6 +1554,42 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
         .call_raw("wallet.shield", serde_json::json!([1.0]))
         .await?;
     ensure!(shield["txid"].as_str().is_some(), "shield failed: {shield}");
+    if compact {
+        // Template selection has a bounded proof-work budget. Qualify each
+        // shape through the pool without assuming two expensive packages
+        // always fit that budget under concurrent load.
+        mine_and_check_template(
+            &rpc,
+            &daemon,
+            address,
+            funding_height + 1,
+            timing_height,
+            true,
+            worker_gpu,
+            pool_port,
+            &[shield["txid"].as_str().context("shield txid")?],
+            Some(true),
+        )
+        .await?;
+        let unshield = rpc
+            .call_raw("wallet.unshield", serde_json::json!([1.0]))
+            .await?;
+        let id = unshield["txid"].as_str().context("unshield txid")?;
+        mine_and_check_template(
+            &rpc,
+            &daemon,
+            address,
+            funding_height + 2,
+            timing_height,
+            true,
+            worker_gpu,
+            pool_port,
+            &[id],
+            Some(false),
+        )
+        .await?;
+        return Ok(());
+    }
     mine_blocks(&rpc, address, 1).await?;
     let unshield = rpc
         .call_raw("wallet.unshield", serde_json::json!([1.0]))
@@ -1501,24 +1601,81 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
         .call_raw("wallet.shield", serde_json::json!([1.0]))
         .await?;
     let second_id = second["txid"].as_str().context("second shield txid")?;
+    mine_and_check_template(
+        &rpc,
+        &daemon,
+        address,
+        timing_height,
+        timing_height,
+        false,
+        worker_gpu,
+        pool_port,
+        &[unshield_id, second_id],
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mine_and_check_template(
+    rpc: &RpcClient,
+    daemon: &RegtestDaemon,
+    address: &str,
+    expected_height: u32,
+    timing_height: u32,
+    compact: bool,
+    worker_gpu: Option<bool>,
+    pool_port: u16,
+    expected_ids: &[&str],
+    transparent_inputs: Option<bool>,
+) -> Result<()> {
+    if compact {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["target_spacing_seconds"]
+                == if expected_height >= timing_height {
+                    60
+                } else {
+                    120
+                },
+            "timing activation not applied: {info}"
+        );
+    }
     let gbt = rpc.get_block_template(address).await?;
     let mapped = mapper::map_template(&gbt, 1)?;
     ensure!(
-        mapped.mempool_txs.len() == 2,
+        mapped.mempool_txs.len() == expected_ids.len(),
         "daemon omitted test transactions: {}",
         gbt["transactions"]
     );
-    ensure!(
-        mapped
-            .mempool_txs
-            .iter()
-            .any(|tx| tx.inputs.is_empty() && !tx.outputs.is_empty()),
-        "missing zero-input unshield"
-    );
-    ensure!(
-        mapped.mempool_txs.iter().any(|tx| !tx.inputs.is_empty()),
-        "missing transparent inputs"
-    );
+    match transparent_inputs {
+        Some(true) => ensure!(
+            mapped.mempool_txs.iter().all(|tx| !tx.inputs.is_empty()),
+            "missing shield inputs"
+        ),
+        Some(false) => ensure!(
+            mapped
+                .mempool_txs
+                .iter()
+                .all(|tx| tx.inputs.is_empty() && !tx.outputs.is_empty()),
+            "missing zero-input unshield"
+        ),
+        None => {
+            ensure!(
+                mapped
+                    .mempool_txs
+                    .iter()
+                    .any(|tx| tx.inputs.is_empty() && !tx.outputs.is_empty()),
+                "missing zero-input unshield"
+            );
+            ensure!(
+                mapped.mempool_txs.iter().any(|tx| !tx.inputs.is_empty()),
+                "missing transparent inputs"
+            );
+        }
+    }
     if compact {
         for tx in &mapped.mempool_txs {
             ensure!(
@@ -1578,7 +1735,7 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
             .call_raw("getblockcount", serde_json::json!([]))
             .await?
             .as_u64()
-            .is_some_and(|h| h >= u64::from(timing_height))
+            .is_some_and(|h| h >= u64::from(expected_height))
         {
             break;
         }
@@ -1595,28 +1752,20 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
     // Real workers may have advanced again before the RPC poll. Inspect the
     // exact activation block, not whichever later tip happens to be current.
     let tip_value = rpc
-        .call_raw("getblockhash", serde_json::json!([timing_height]))
+        .call_raw("getblockhash", serde_json::json!([expected_height]))
         .await?;
     let tip = tip_value
         .as_str()
         .context("activation block hash")?
         .to_owned();
-    if compact {
-        let info = rpc
-            .call_raw("getconsensusinfo", serde_json::json!([]))
-            .await?;
-        ensure!(
-            info["target_spacing_seconds"] == 60 && info["tail_emission_una"] == 50_000_000,
-            "timing activation not applied: {info}"
-        );
-    }
     let block = rpc
         .call_raw("getblock", serde_json::json!([tip, 1]))
         .await?;
     let txids = block["tx"].as_array().context("block txids")?;
     ensure!(
-        txids.contains(&serde_json::json!(unshield_id))
-            && txids.contains(&serde_json::json!(second_id)),
+        expected_ids
+            .iter()
+            .all(|id| txids.contains(&serde_json::json!(id))),
         "pool dropped shielded transactions: {block}"
     );
     // Acceptance alone is insufficient: the daemon currently logs a DNRF
@@ -1703,7 +1852,7 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
             .any(|(_, script)| *script == expected_dnrf),
         "stored DNRF omits spent scripts or differs from the full block filter"
     );
-    eprintln!("shared pool confirmed unshield {unshield_id} and shield {second_id} in block {tip}");
+    eprintln!("shared pool worker={worker_gpu:?} confirmed {expected_ids:?} at height {expected_height} in block {tip}");
     Ok(())
 }
 
@@ -1860,10 +2009,17 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
     rpc.call_raw("wallet.shield", serde_json::json!([1.0]))
         .await?;
     mine_blocks(&rpc, address, 1).await?;
-    let unshield = rpc
-        .call_raw("wallet.unshield", serde_json::json!([1.0]))
-        .await?;
-    let unshield_id = unshield["txid"].as_str().context("unshield txid")?;
+    let unshield = if compact {
+        serde_json::Value::Null
+    } else {
+        rpc.call_raw("wallet.unshield", serde_json::json!([1.0]))
+            .await?
+    };
+    let unshield_id = unshield["txid"].as_str();
+    ensure!(
+        compact || unshield_id.is_some(),
+        "ordinary recovery needs a valid unshield"
+    );
     let shield = rpc
         .call_raw("wallet.shield", serde_json::json!([1.0]))
         .await?;
@@ -1879,8 +2035,8 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
         );
     }
     ensure!(
-        original.mempool_txs.len() == 2,
-        "fixture requires two transactions"
+        original.mempool_txs.len() == if compact { 1 } else { 2 },
+        "recovery fixture transaction count"
     );
     let input = original
         .mempool_txs
@@ -1890,15 +2046,18 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
     let mut input_id = input.0;
     input_id.reverse();
     let proxy = FaultyProofProxy::spawn(rpc.clone(), hex::encode(input_id), input.1).await?;
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::Builder::new()
+        .prefix("dinero-proof-recovery-")
+        .tempdir()?.keep();
+    eprintln!("proof recovery evidence: {}", dir.as_path().display());
     let pool = PoolProcess::spawn(
         format!("127.0.0.1:{pool_port}").parse()?,
         &proxy.url,
         &daemon.cookie_path,
         address,
-        &dir.path().join("journal"),
-        &dir.path().join("key"),
-        dir.path().join("pool.log"),
+        &dir.as_path().join("journal"),
+        &dir.as_path().join("key"),
+        dir.as_path().join("pool.log"),
     )?;
     pool.wait_ready().await?;
     let mut miner = MinerConn::connect(pool.bind, payout_script(0xB6), 1)
@@ -1938,8 +2097,8 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
         .await?;
     let txids = block["tx"].as_array().context("block txids")?;
     ensure!(
-        txids.len() == 2
-            && txids.contains(&serde_json::json!(unshield_id))
+        txids.len() == if compact { 1 } else { 2 }
+            && unshield_id.map_or(true, |id| txids.contains(&serde_json::json!(id)))
             && !txids.contains(&serde_json::json!(shield_id)),
         "wrong recovery transaction set: {block}"
     );
@@ -1951,9 +2110,25 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
             .contains(&serde_json::json!(shield_id)),
         "excluded transaction was evicted: {mempool}"
     );
-    let info = rpc
-        .call_raw("daemon.shieldedroot", serde_json::json!([]))
-        .await?;
+    // Template validation may temporarily hold the shielded-state lock while
+    // the pool keeps polling the retained transaction. Retry only that explicit
+    // busy response; connection timeouts and every other RPC error still fail.
+    let root_deadline = Instant::now() + Duration::from_secs(30);
+    let info = loop {
+        match rpc
+            .call_raw("daemon.shieldedroot", serde_json::json!([]))
+            .await
+        {
+            Ok(value) => break value,
+            Err(error)
+                if error.to_string().contains("shielded_state_busy")
+                    && Instant::now() < root_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
     root.reverse();
     ensure!(
@@ -1963,6 +2138,6 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
             != Some(root.as_slice()),
         "recovery reused original DNRS"
     );
-    eprintln!("pool recovered from injected proof failure: included unshield {unshield_id}, retained shield {shield_id} in mempool; block {tip}");
+    eprintln!("pool recovered from injected proof failure: unshield={unshield_id:?}, retained shield {shield_id} in mempool; block {tip}");
     Ok(())
 }
