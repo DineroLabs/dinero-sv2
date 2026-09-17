@@ -1129,7 +1129,31 @@ async fn run_session(
                 if found.meets_block_target {
                     blocks_found += 1;
                     if args.max_blocks > 0 && blocks_found >= args.max_blocks {
-                        break Ok(blocks_found);
+                        // Stop hashing, but keep the transport alive until the
+                        // pool acknowledges this exact final submission. Closing
+                        // first can make its ACK fail before it submits the block.
+                        generation.fetch_add(1, Ordering::SeqCst);
+                        let acknowledged = tokio::time::timeout(Duration::from_secs(30), async {
+                            while let Some(frame) = frame_rx.recv().await {
+                                if frame.msg_type == MSG_SUBMIT_SHARES_SUCCESS {
+                                    let ack = decode_submit_shares_success(&frame.payload)?;
+                                    if ack.channel_id == channel_id && ack.last_sequence_number >= seq {
+                                        return Ok(());
+                                    }
+                                } else if frame.msg_type == MSG_SUBMIT_SHARES_ERROR {
+                                    let error = decode_submit_shares_error(&frame.payload)?;
+                                    if error.channel_id == channel_id && error.sequence_number == seq {
+                                        anyhow::bail!("final share rejected: {}", String::from_utf8_lossy(&error.error_code));
+                                    }
+                                }
+                            }
+                            anyhow::bail!("pool closed before acknowledging final share")
+                        }).await;
+                        break match acknowledged {
+                            Ok(Ok(())) => Ok(blocks_found),
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Err(anyhow::anyhow!("timed out awaiting final share acknowledgement")),
+                        };
                     }
                 }
             }
