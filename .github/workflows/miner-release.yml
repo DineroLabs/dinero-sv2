@@ -16,6 +16,15 @@ name: miner-release
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_source:
+        description: 'Full reviewed commit SHA; Actions artifacts only'
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - '.github/workflows/miner-release.yml'
+      - 'scripts/test_miner_candidate_identity.py'
   push:
     tags: ["miner-v*"]
 
@@ -23,7 +32,22 @@ permissions:
   contents: write
 
 jobs:
+  candidate-contract:
+    name: Miner candidate identity guard
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install PyYAML==6.0.3
+      - run: python3 scripts/test_miner_candidate_identity.py
+
   build:
+    if: github.event_name != 'pull_request'
+    needs: candidate-contract
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     # `release` environment carries the Azure OIDC federation for Windows
@@ -88,14 +112,28 @@ jobs:
             gpu: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_source || github.ref }}
 
-      - name: Require release version identity
-        if: github.event_name == 'push'
+      - name: Require immutable source and version identity
         shell: bash
+        env:
+          CANDIDATE_SOURCE: ${{ inputs.candidate_source }}
         run: |
-          VERSION="${GITHUB_REF_NAME#miner-v}"
-          test "$(sed -n 's/^version     = "\([^"]*\)"/\1/p' crates/dinero-sv2-miner/Cargo.toml)" = "$VERSION"
-          test "$(sed -n 's/^version     = "\([^"]*\)"/\1/p' crates/dinero-sv2-gpu-miner/Cargo.toml)" = "$VERSION"
+          CPU_VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' crates/dinero-sv2-miner/Cargo.toml)"
+          GPU_VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' crates/dinero-sv2-gpu-miner/Cargo.toml)"
+          [[ "$CPU_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$CPU_VERSION" = "$GPU_VERSION"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [[ "$CANDIDATE_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+            test "$GITHUB_REF_TYPE" != tag
+            test "$(git rev-parse HEAD)" = "$CANDIDATE_SOURCE"
+            echo "candidate=$CANDIDATE_SOURCE version=$CPU_VERSION"
+          else
+            test "$GITHUB_EVENT_NAME" = push
+            test "$GITHUB_REF_TYPE" = tag
+            test "$GITHUB_REF_NAME" = "miner-v$CPU_VERSION"
+          fi
 
       - name: Require Windows signing identity
         if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
@@ -163,6 +201,40 @@ jobs:
           files-folder: ${{ github.workspace }}\dist
           files-folder-filter: exe
 
+      - uses: actions/setup-python@v5
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          python-version: '3.12'
+
+      - name: Record candidate provenance and final hashes
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+          CANDIDATE_BIN: ${{ matrix.bin }}
+          CANDIDATE_EXT: ${{ matrix.ext }}
+        run: |
+          python - <<'PY_CANDIDATE'
+          import hashlib, json, os, pathlib, subprocess
+          target, binary, ext = (os.environ[k] for k in ('CANDIDATE_TARGET', 'CANDIDATE_BIN', 'CANDIDATE_EXT'))
+          metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1']))
+          version = next(p['version'] for p in metadata['packages'] if p['name'] == binary)
+          path = pathlib.Path('dist') / f'{binary}-{target}{ext}'
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          record = {'schema': 1, 'repository': 'DineroLabs/dinero-sv2',
+                    'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                    'workflow_commit': os.environ['GITHUB_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'],
+                    'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'component': binary,
+                    'version': version, 'target': target, 'asset': path.name, 'sha256': digest,
+                    'size_bytes': path.stat().st_size, 'runtime_qualified': False}
+          receipt = path.parent / f'candidate-{binary}-{target}.json'
+          receipt.write_text(json.dumps(record, indent=2) + '\n')
+          receipt_hash = hashlib.sha256(receipt.read_bytes()).hexdigest()
+          (path.parent / f'SHA256SUMS-{binary}-{target}').write_text(
+              f'{digest}  {path.name}\n{receipt_hash}  {receipt.name}\n')
+          print(json.dumps(record, indent=2))
+          PY_CANDIDATE
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bin }}-${{ matrix.target }}
@@ -170,7 +242,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     name: assemble SHA256SUMS + publish
     needs: build
     runs-on: ubuntu-latest
