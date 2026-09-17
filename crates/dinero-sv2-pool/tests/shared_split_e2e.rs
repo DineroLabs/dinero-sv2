@@ -75,7 +75,7 @@
 //!   mainnet-identical) makes this test — and any non-mainnet
 //!   deployment — possible. See the task-7 report for detail.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use dinero_sv2_codec::{
     decode_new_template, decode_open_standard_mining_channel_success,
     decode_setup_connection_success, decode_submit_shares_error,
@@ -128,6 +128,19 @@ impl RegtestDaemon {
     }
 
     fn spawn_at_dnrs(port: u16, dnrs_height: u32) -> Result<Self> {
+        Self::spawn_with_args(port, dnrs_height, &[])
+    }
+
+    fn spawn_with_args(port: u16, dnrs_height: u32, extra: &[String]) -> Result<Self> {
+        Self::spawn_fixture(port, dnrs_height, extra, None)
+    }
+
+    fn spawn_fixture(
+        port: u16,
+        dnrs_height: u32,
+        extra: &[String],
+        seed: Option<&Path>,
+    ) -> Result<Self> {
         let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/src/dinero/build/dinerod")
@@ -148,6 +161,11 @@ impl RegtestDaemon {
             std::fs::remove_dir_all(&datadir).ok();
         }
         std::fs::create_dir_all(&datadir).context("mkdir datadir")?;
+        if let Some(seed) = seed {
+            // Optional developer acceleration: copy an explicitly supplied,
+            // stopped disposable fixture. Never open/mutate the source DB.
+            copy_fixture(seed, &datadir)?;
+        }
 
         let rpc_url = format!("http://127.0.0.1:{port}");
 
@@ -160,9 +178,11 @@ impl RegtestDaemon {
             .arg(format!("--rpcport={port}"))
             .arg("--rpcbind=127.0.0.1")
             .arg("--listen=0")
+            .arg("--connect=127.0.0.1:1")
+            .args(extra)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(std::fs::File::create(datadir.join("stdout.log"))?)
+            .stderr(std::fs::File::create(datadir.join("stderr.log"))?)
             .spawn()
             .context("spawning dinerod")?;
 
@@ -175,19 +195,57 @@ impl RegtestDaemon {
         })
     }
 
-    fn wait_for_cookie(&self) -> Result<()> {
+    async fn wait_for_rpc(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_error = "cookie not available".to_owned();
         while Instant::now() < deadline {
+            // The cookie is written before the HTTP listener starts. Wait for
+            // an actual RPC response so a fast test cannot race daemon startup.
             if self.cookie_path.exists() {
-                return Ok(());
+                match RpcClient::with_timeout(
+                    self.rpc_url.clone(),
+                    Auth::Cookie(self.cookie_path.display().to_string()),
+                    Duration::from_secs(1),
+                ) {
+                    Ok(rpc) => match rpc.call_raw("getblockcount", serde_json::json!([])).await {
+                        Ok(value) if value.as_u64().is_some() => return Ok(()),
+                        Ok(value) => {
+                            last_error = format!("unexpected block count response: {value}")
+                        }
+                        Err(error) => last_error = format!("{error:#}"),
+                    },
+                    Err(error) => last_error = format!("{error:#}"),
+                }
             }
-            std::thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         bail!(
-            "timed out waiting for cookie at {}",
-            self.cookie_path.display()
+            "timed out waiting for daemon RPC at {}: {last_error}",
+            self.rpc_url
         )
     }
+}
+
+fn copy_fixture(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some(".cookie" | "dinerod.lock" | "stdout.log" | "stderr.log")
+        ) {
+            continue;
+        }
+        let target = destination.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_fixture(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 impl Drop for RegtestDaemon {
@@ -218,7 +276,15 @@ impl PoolProcess {
         key_path: &Path,
         stderr_log: PathBuf,
     ) -> Result<Self> {
-        let binary = env!("CARGO_BIN_EXE_dinero-sv2-pool");
+        // Candidate qualification supplies the already-packaged executable.
+        // Cargo's binary remains the default for source-level process tests.
+        let binary = std::env::var("DINEROPOOL_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_dinero-sv2-pool").to_owned());
+        anyhow::ensure!(
+            Path::new(&binary).is_file(),
+            "pool binary not found: {binary}"
+        );
+        eprintln!("pool process executable: {binary}");
         let stderr_file = std::fs::File::create(&stderr_log).context("creating pool stderr log")?;
 
         let child = Command::new(binary)
@@ -656,12 +722,12 @@ fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
     }
 }
 
-/// Parse a coinbase-only block's raw hex (128-byte Dinero header + tx
-/// count varint + one segwit-form coinbase tx) into its output list:
+/// Parse the first transaction of a block's raw hex (128-byte Dinero header
+/// followed by a tx count varint and segwit-form coinbase) into its output list:
 /// `(value_una, script_pubkey)` pairs, read directly off the consensus
 /// bytes the daemon actually stored (`getblock <hash> 0`) — independent
 /// of any RPC convenience/decode layer.
-fn parse_coinbase_only_block_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+fn parse_block_coinbase_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8>)>> {
     let bytes = hex::decode(block_hex).context("block hex decode")?;
     if bytes.len() < 128 {
         bail!(
@@ -672,8 +738,8 @@ fn parse_coinbase_only_block_outputs(block_hex: &str) -> Result<Vec<(u64, Vec<u8
     let mut cur = 128usize;
     let (tx_count, n) = read_compact_size(&bytes, cur)?;
     cur += n;
-    if tx_count != 1 {
-        bail!("expected a coinbase-only block (1 tx), got {tx_count}");
+    if tx_count == 0 {
+        bail!("block has no coinbase");
     }
     let tx = &bytes[cur..];
 
@@ -767,7 +833,7 @@ async fn run_shared_split_scenario(
     let started = Instant::now();
 
     let daemon = RegtestDaemon::spawn(daemon_port).context("spawn regtest dinerod")?;
-    daemon.wait_for_cookie().context("wait for cookie")?;
+    daemon.wait_for_rpc().await.context("wait for RPC")?;
     let rpc = RpcClient::new(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
@@ -976,7 +1042,7 @@ async fn run_shared_split_scenario(
     let block_hex = block_hex
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("getblock verbosity=0: not a string: {block_hex}"))?;
-    let outputs = parse_coinbase_only_block_outputs(block_hex)
+    let outputs = parse_block_coinbase_outputs(block_hex)
         .context("parsing coinbase outputs from raw block hex")?;
 
     let find_value = |script: &[u8]| -> Option<u64> {
@@ -1200,7 +1266,7 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
     // CPU and GPU cases may run concurrently in the ignored-test suite.
     let (rpc_port, pool_port) = if gpu { (29987, 29988) } else { (29985, 29986) };
     let daemon = RegtestDaemon::spawn_at_dnrs(rpc_port, 2)?;
-    daemon.wait_for_cookie()?;
+    daemon.wait_for_rpc().await?;
     let rpc = RpcClient::new(
         daemon.rpc_url.clone(),
         Auth::Cookie(daemon.cookie_path.display().to_string()),
@@ -1307,12 +1373,771 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
     let raw = rpc
         .call_raw("getblock", serde_json::json!([hash, 0]))
         .await?;
-    let outputs = parse_coinbase_only_block_outputs(raw.as_str().context("raw block")?)?;
+    let outputs = parse_block_coinbase_outputs(raw.as_str().context("raw block")?)?;
     let dnrs = dinero_sv2_jd::coinbase::state_commitment_output(expected);
     assert!(outputs
         .iter()
         .any(|(v, s)| *v == 0 && *s == dnrs.script_pubkey));
     assert!(outputs.iter().any(|(v, s)| *v > 0 && *s == script));
     eprintln!("solo miner (gpu={gpu}) -> pool -> daemon: accepted DNRS block {hash}");
+    Ok(())
+}
+
+/// Regression for the September proof/template refusal incident. Uses real
+/// shielded transactions and the production pool process, not a hand-built
+/// block submitted by the test in place of the pool.
+#[tokio::test]
+#[ignore = "requires DINEROD_BIN; mines an isolated regtest chain"]
+async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template() -> Result<()> {
+    run_shared_shielded_mining(false, None).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN; real pool and signed transactions"]
+async fn compact_timing_pool_mining() -> Result<()> {
+    run_shared_shielded_mining(true, None).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN and DINEROMINER_BIN"]
+async fn compact_timing_cpu_worker() -> Result<()> {
+    run_shared_shielded_mining(true, Some(false)).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN, DINEROGPUMINER_BIN and real GPU"]
+async fn compact_timing_gpu_worker() -> Result<()> {
+    run_shared_shielded_mining(true, Some(true)).await
+}
+
+struct ActualWorker {
+    child: Child,
+}
+impl ActualWorker {
+    fn spawn(
+        gpu: bool,
+        pool: SocketAddr,
+        pubkey: &str,
+        script: &[u8],
+        logs: &Path,
+    ) -> Result<Self> {
+        let binary = std::env::var(if gpu {
+            "DINEROGPUMINER_BIN"
+        } else {
+            "DINEROMINER_BIN"
+        })
+        .context("set the actual worker binary path")?;
+        let mut cmd = Command::new(binary);
+        cmd.args([
+            "--pool",
+            &pool.to_string(),
+            "--reward-mode",
+            "shared",
+            "--no-save",
+            "--plain",
+            "--max-blocks",
+            "1",
+        ])
+        .args(if gpu {
+            vec!["--batch-size", "4096"]
+        } else {
+            vec!["--threads", "1"]
+        })
+        .args([
+            "--server-pubkey",
+            pubkey,
+            "--payout-script-hex",
+            &hex::encode(script),
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(logs.join("worker-output.log"))?)
+        .stderr(std::fs::File::create(logs.join("worker.log"))?);
+        Ok(Self {
+            child: cmd.spawn()?,
+        })
+    }
+    fn stop(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        self.child.wait()?;
+        Ok(())
+    }
+}
+impl Drop for ActualWorker {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> Result<()> {
+    // Compact cases cross the real DNRW threshold too: acceptance below it
+    // cannot qualify the pool's witness commitment construction.
+    let funding_height = if compact { 10_670 } else { 101 };
+    let timing_height = funding_height + 2;
+    let (rpc_port, pool_port) = match (compact, worker_gpu) {
+        (false, _) => (29991, 29992),
+        (true, None) => (29881, 29882),
+        (true, Some(false)) => (29883, 29884),
+        (true, Some(true)) => (29885, 29886),
+    };
+    let extra = if compact {
+        vec![
+            "--consensus-shielded-epoch-reset-height=1".to_owned(),
+            "--consensus-shielded-spend-auth-height=2".to_owned(),
+            format!("--consensus-shielded-compact-height={}", funding_height + 1),
+            format!("--consensus-sixty-second-height={timing_height}"),
+        ]
+    } else {
+        vec![]
+    };
+    let seed = std::env::var("DINERO_MINING_FIXTURE")
+        .ok()
+        .filter(|_| compact);
+    let daemon = RegtestDaemon::spawn_fixture(rpc_port, 1, &extra, seed.as_deref().map(Path::new))?;
+    daemon.wait_for_rpc().await?;
+    let rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(60),
+    )?;
+    let address_value = if seed.is_some() {
+        rpc.call_raw("wallet.getnewaddress", serde_json::json!([]))
+            .await?["address"]
+            .clone()
+    } else {
+        rpc.call_raw(
+            "wallet.createhd",
+            serde_json::json!(["proof-regression", "", false]),
+        )
+        .await?["first_address"]
+            .clone()
+    };
+    let address = address_value.as_str().context("wallet address")?;
+    let initial_height = rpc
+        .call_raw("getblockcount", serde_json::json!([]))
+        .await?
+        .as_u64()
+        .context("initial height")?;
+    ensure!(
+        initial_height <= u64::from(funding_height),
+        "seed fixture already crossed activation"
+    );
+    ensure!(
+        rpc.call_raw("getrawmempool", serde_json::json!([]))
+            .await?
+            .as_array()
+            .is_some_and(|txs| txs.is_empty()),
+        "seed fixture must have an empty mempool"
+    );
+    // This fixture passes the real DNRW height. Keep its bulk setup-mining
+    // timeout separate from the wallet/pool RPC deadline: later 1000-block
+    // batches exceed 60 seconds on an ordinary loaded machine.
+    let mining_rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(300),
+    )?;
+    let setup_time =
+        mine_blocks(&mining_rpc, address, funding_height - initial_height as u32).await?;
+    eprintln!("funded compact={compact} worker={worker_gpu:?} at height {funding_height} in {setup_time:?}");
+    if compact {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["target_spacing_seconds"] == 120,
+            "fixture must begin under old timing: {info}"
+        );
+    }
+    let shield = rpc
+        .call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    ensure!(shield["txid"].as_str().is_some(), "shield failed: {shield}");
+    if compact {
+        // Template selection has a bounded proof-work budget. Qualify each
+        // shape through the pool without assuming two expensive packages
+        // always fit that budget under concurrent load.
+        mine_and_check_template(
+            &rpc,
+            &daemon,
+            address,
+            funding_height + 1,
+            timing_height,
+            true,
+            worker_gpu,
+            pool_port,
+            &[shield["txid"].as_str().context("shield txid")?],
+            Some(true),
+        )
+        .await?;
+        let unshield = rpc
+            .call_raw("wallet.unshield", serde_json::json!([1.0]))
+            .await?;
+        let id = unshield["txid"].as_str().context("unshield txid")?;
+        mine_and_check_template(
+            &rpc,
+            &daemon,
+            address,
+            funding_height + 2,
+            timing_height,
+            true,
+            worker_gpu,
+            pool_port,
+            &[id],
+            Some(false),
+        )
+        .await?;
+        return Ok(());
+    }
+    mine_blocks(&rpc, address, 1).await?;
+    let unshield = rpc
+        .call_raw("wallet.unshield", serde_json::json!([1.0]))
+        .await?;
+    let unshield_id = unshield["txid"].as_str().context("unshield txid")?;
+    // A second shield supplies transparent inputs, exercising the complete
+    // proof RPC while the unshield contributes only transparent outputs.
+    let second = rpc
+        .call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    let second_id = second["txid"].as_str().context("second shield txid")?;
+    mine_and_check_template(
+        &rpc,
+        &daemon,
+        address,
+        timing_height,
+        timing_height,
+        false,
+        worker_gpu,
+        pool_port,
+        &[unshield_id, second_id],
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mine_and_check_template(
+    rpc: &RpcClient,
+    daemon: &RegtestDaemon,
+    address: &str,
+    expected_height: u32,
+    timing_height: u32,
+    compact: bool,
+    worker_gpu: Option<bool>,
+    pool_port: u16,
+    expected_ids: &[&str],
+    transparent_inputs: Option<bool>,
+) -> Result<()> {
+    if compact {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["target_spacing_seconds"]
+                == if expected_height >= timing_height {
+                    60
+                } else {
+                    120
+                },
+            "timing activation not applied: {info}"
+        );
+    }
+    let gbt = rpc.get_block_template(address).await?;
+    let mapped = mapper::map_template(&gbt, 1)?;
+    ensure!(
+        mapped.mempool_txs.len() == expected_ids.len(),
+        "daemon omitted test transactions: {}",
+        gbt["transactions"]
+    );
+    match transparent_inputs {
+        Some(true) => ensure!(
+            mapped.mempool_txs.iter().all(|tx| !tx.inputs.is_empty()),
+            "missing shield inputs"
+        ),
+        Some(false) => ensure!(
+            mapped
+                .mempool_txs
+                .iter()
+                .all(|tx| tx.inputs.is_empty() && !tx.outputs.is_empty()),
+            "missing zero-input unshield"
+        ),
+        None => {
+            ensure!(
+                mapped
+                    .mempool_txs
+                    .iter()
+                    .any(|tx| tx.inputs.is_empty() && !tx.outputs.is_empty()),
+                "missing zero-input unshield"
+            );
+            ensure!(
+                mapped.mempool_txs.iter().any(|tx| !tx.inputs.is_empty()),
+                "missing transparent inputs"
+            );
+        }
+    }
+    if compact {
+        for tx in &mapped.mempool_txs {
+            ensure!(
+                tx.data.get(..4) == Some(&[6, 0, 0, 0x40]),
+                "fixture did not produce compact wire bytes"
+            );
+        }
+    }
+    let expected_dnrs = mapper::state_commitment_root(&mapped.coinbase_full_hex)?;
+    let mut spent_scripts = Vec::new();
+    for tx in &mapped.mempool_txs {
+        for (id, vout) in &tx.inputs {
+            let display = hex::encode(id.iter().rev().copied().collect::<Vec<_>>());
+            let proof = rpc.get_utxo_proof_updates(&[(display, *vout)]).await?;
+            spent_scripts.push(hex::decode(
+                proof["proofs"][0]["script_pubkey"]
+                    .as_str()
+                    .context("spent script from daemon proof")?,
+            )?);
+        }
+    }
+    let evidence_dir = tempfile::Builder::new()
+        .prefix("dinero-compact-pool-")
+        .tempdir()?
+        .keep();
+    eprintln!("pool evidence: {}", evidence_dir.display());
+    let key_path = evidence_dir.as_path().join("key");
+    let keys = dinero_sv2_transport::StaticKeys::load_or_generate(&key_path)?;
+    let pool = PoolProcess::spawn(
+        format!("127.0.0.1:{pool_port}").parse()?,
+        &daemon.rpc_url,
+        &daemon.cookie_path,
+        address,
+        &evidence_dir.as_path().join("journal"),
+        &key_path,
+        evidence_dir.as_path().join("pool.log"),
+    )?;
+    pool.wait_ready().await?;
+    let mut worker = if let Some(gpu) = worker_gpu {
+        Some(ActualWorker::spawn(
+            gpu,
+            pool.bind,
+            &keys.public_hex(),
+            &payout_script(0xA5),
+            evidence_dir.as_path(),
+        )?)
+    } else {
+        let mut miner = MinerConn::connect(pool.bind, payout_script(0xA5), 1)
+            .await
+            .with_context(|| format!("shared handshake: {}", pool.tail_log()))?;
+        miner.find_and_submit_block().await?;
+        None
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if rpc
+            .call_raw("getblockcount", serde_json::json!([]))
+            .await?
+            .as_u64()
+            .is_some_and(|h| h >= u64::from(expected_height))
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "pool failed to confirm unshield: {}",
+            pool.tail_log()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if let Some(worker) = worker.as_mut() {
+        worker.stop()?;
+    }
+    // Real workers may have advanced again before the RPC poll. Inspect the
+    // exact activation block, not whichever later tip happens to be current.
+    let tip_value = rpc
+        .call_raw("getblockhash", serde_json::json!([expected_height]))
+        .await?;
+    let tip = tip_value
+        .as_str()
+        .context("activation block hash")?
+        .to_owned();
+    let block = rpc
+        .call_raw("getblock", serde_json::json!([tip, 1]))
+        .await?;
+    let txids = block["tx"].as_array().context("block txids")?;
+    ensure!(
+        expected_ids
+            .iter()
+            .all(|id| txids.contains(&serde_json::json!(id))),
+        "pool dropped shielded transactions: {block}"
+    );
+    // Acceptance alone is insufficient: the daemon currently logs a DNRF
+    // hash mismatch without rejecting. Check the stored coinbase commitment
+    // against the full output-plus-spent-input filter independently.
+    let raw = rpc
+        .call_raw("getblock", serde_json::json!([tip, 0]))
+        .await?;
+    let coinbase_outputs = parse_block_coinbase_outputs(raw.as_str().context("raw block")?)?;
+    // Inspect the persisted block directly: the wallet transaction lookup is
+    // not a historical transaction index. This also pins the exact block if
+    // an actual worker has already advanced the tip again.
+    let raw_bytes = hex::decode(raw.as_str().context("raw block bytes")?)?;
+    for tx in &mapped.mempool_txs {
+        ensure!(
+            raw_bytes
+                .windows(tx.data.len())
+                .filter(|part| *part == tx.data)
+                .count()
+                == 1,
+            "mined compact transaction bytes changed"
+        );
+    }
+    let dnrs_script = dinero_sv2_jd::coinbase::state_commitment_output(
+        expected_dnrs.context("expected daemon DNRS")?,
+    )
+    .script_pubkey;
+    ensure!(
+        coinbase_outputs
+            .iter()
+            .filter(|(value, script)| *value == 0 && *script == dnrs_script)
+            .count()
+            == 1,
+        "pool changed the exact mined shielded state commitment"
+    );
+    let paid: u64 = coinbase_outputs.iter().map(|(value, _)| *value).sum();
+    ensure!(
+        paid == mapped.coinbase_value_una,
+        "payout sum differs from subsidy plus selected fees"
+    );
+    if compact {
+        let fees: u64 = gbt["transactions"]
+            .as_array()
+            .context("GBT transactions")?
+            .iter()
+            .map(|tx| tx["fee"].as_u64().context("GBT transaction fee"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        ensure!(
+            paid == 10_000_000_000 + fees,
+            "60-second activation changed the 100 DIN reward or lost fees"
+        );
+        let wtxids: Vec<_> = mapped
+            .mempool_txs
+            .iter()
+            .map(|tx| dinero_sv2_common::sha256d(&tx.data))
+            .collect();
+        let witness_script = dinero_sv2_jd::witness_commitment::build_dnrw_script(
+            &dinero_sv2_jd::witness_commitment::witness_merkle_root(&wtxids),
+        );
+        ensure!(
+            coinbase_outputs
+                .iter()
+                .any(|(value, script)| *value == 0 && *script == witness_script),
+            "stored DNRW differs from exact compact transaction bytes"
+        );
+    }
+    let scripts: Vec<&[u8]> = coinbase_outputs
+        .iter()
+        .chain(mapped.mempool_txs.iter().flat_map(|tx| tx.outputs.iter()))
+        .filter(|(_, script)| !script.is_empty() && script[0] != 0x6a)
+        .map(|(_, script)| script.as_slice())
+        .chain(spent_scripts.iter().map(Vec::as_slice))
+        .collect();
+    let (filter, _) =
+        dinero_sv2_jd::block_filter::gcs_build(&mapped.wire.prev_block_hash, &scripts);
+    let expected_dnrf = dinero_sv2_jd::filter_commitment::build_dnrf_script(
+        &dinero_sv2_jd::block_filter::gcs_filter_hash(&filter),
+    );
+    ensure!(
+        coinbase_outputs
+            .iter()
+            .any(|(_, script)| *script == expected_dnrf),
+        "stored DNRF omits spent scripts or differs from the full block filter"
+    );
+    eprintln!("shared pool worker={worker_gpu:?} confirmed {expected_ids:?} at height {expected_height} in block {tip}");
+    Ok(())
+}
+
+/// Forward to the real daemon, but fail one selected chain-input proof. This
+/// exercises recovery without corrupting the wallet, mempool or consensus state.
+struct FaultyProofProxy {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+    failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    exclusions: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Drop for FaultyProofProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FaultyProofProxy {
+    async fn spawn(rpc: RpcClient, bad_txid: String, bad_vout: u32) -> Result<Self> {
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exclusions = Arc::new(Mutex::new(Vec::new()));
+        let observed_failures = failures.clone();
+        let observed_exclusions = exclusions.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let rpc = rpc.clone();
+                let bad_txid = bad_txid.clone();
+                let failures = observed_failures.clone();
+                let exclusions = observed_exclusions.clone();
+                connections.spawn(async move {
+                    let handle = async {
+                        let mut request = Vec::new();
+                        let (body_start, content_length) = loop {
+                            let mut buf = [0; 4096];
+                            let n = stream.read(&mut buf).await?;
+                            ensure!(n > 0 && request.len() < 2_000_000, "invalid proxy request");
+                            request.extend_from_slice(&buf[..n]);
+                            if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                                let headers = std::str::from_utf8(&request[..end])?;
+                                let length = headers.lines().find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok()).flatten()
+                                }).context("proxy content length")?;
+                                ensure!(length < 2_000_000, "proxy body too large");
+                                break (end + 4, length);
+                            }
+                        };
+                        while request.len() < body_start + content_length {
+                            let mut buf = [0; 4096];
+                            let n = stream.read(&mut buf).await?;
+                            ensure!(n > 0, "truncated proxy body");
+                            request.extend_from_slice(&buf[..n]);
+                        }
+                        let call: serde_json::Value = serde_json::from_slice(
+                            &request[body_start..body_start + content_length])?;
+                        let method = call["method"].as_str().context("proxy method")?;
+                        if method == "getblocktemplate" && call["params"][0]["exclude_txids"].is_array() {
+                            exclusions.lock().unwrap().push(call["params"][0]["exclude_txids"].clone());
+                        }
+                        let response = match rpc.call_raw(method, call["params"].clone()).await {
+                            Ok(mut result) => {
+                                if method == "getproofupdates" {
+                                    if let Some(proofs) = result["proofs"].as_array_mut() {
+                                        for proof in proofs {
+                                            if proof["txid"] == bad_txid && proof["vout"] == bad_vout {
+                                                ensure!(proof["success"] == true, "fixture proof already failed: {proof}");
+                                                proof["success"] = serde_json::json!(false);
+                                                proof["error"] = serde_json::json!("injected per-transaction proof failure");
+                                                failures.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                }
+                                serde_json::json!({"result":result,"error":null,"id":call["id"]})
+                            }
+                            Err(error) => serde_json::json!({"result":null,"error":error.to_string(),"id":call["id"]}),
+                        };
+                        let body = serde_json::to_vec(&response)?;
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await?;
+                        stream.write_all(&body).await?;
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(60), handle).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("proof proxy request failed: {error:#}"),
+                        Err(error) => eprintln!("proof proxy timed out: {error}"),
+                    }
+                });
+                while connections.try_join_next().is_some() {}
+            }
+        });
+        Ok(Self {
+            url,
+            task,
+            failures,
+            exclusions,
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DINEROD_BIN with getblocktemplate exclude_txids support"]
+async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Result<()> {
+    run_pool_proof_recovery(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN; injected per-transaction proof failure"]
+async fn compact_timing_pool_proof_recovery() -> Result<()> {
+    run_pool_proof_recovery(true).await
+}
+
+async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
+    let (rpc_port, pool_port, funding_height) = if compact {
+        (29887, 29888, 123)
+    } else {
+        (29995, 29996, 101)
+    };
+    let extra = if compact {
+        vec![
+            "--consensus-shielded-epoch-reset-height=1".to_owned(),
+            "--consensus-shielded-spend-auth-height=2".to_owned(),
+            "--consensus-shielded-compact-height=124".to_owned(),
+            "--consensus-sixty-second-height=125".to_owned(),
+        ]
+    } else {
+        vec![]
+    };
+    let daemon = RegtestDaemon::spawn_with_args(rpc_port, 1, &extra)?;
+    daemon.wait_for_rpc().await?;
+    let rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(60),
+    )?;
+    let wallet = rpc
+        .call_raw(
+            "wallet.createhd",
+            serde_json::json!(["proof-failure", "", false]),
+        )
+        .await?;
+    let address = wallet["first_address"].as_str().context("wallet address")?;
+    mine_blocks(&rpc, address, funding_height).await?;
+    rpc.call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    mine_blocks(&rpc, address, 1).await?;
+    let unshield = if compact {
+        serde_json::Value::Null
+    } else {
+        rpc.call_raw("wallet.unshield", serde_json::json!([1.0]))
+            .await?
+    };
+    let unshield_id = unshield["txid"].as_str();
+    ensure!(
+        compact || unshield_id.is_some(),
+        "ordinary recovery needs a valid unshield"
+    );
+    let shield = rpc
+        .call_raw("wallet.shield", serde_json::json!([1.0]))
+        .await?;
+    let shield_id = shield["txid"].as_str().context("shield txid")?;
+    let original = mapper::map_template(&rpc.get_block_template(address).await?, 1)?;
+    if compact {
+        ensure!(
+            original
+                .mempool_txs
+                .iter()
+                .all(|tx| tx.data.get(..4) == Some(&[6, 0, 0, 0x40])),
+            "recovery fixture did not use compact transactions"
+        );
+    }
+    ensure!(
+        original.mempool_txs.len() == if compact { 1 } else { 2 },
+        "recovery fixture transaction count"
+    );
+    let input = original
+        .mempool_txs
+        .iter()
+        .find_map(|tx| tx.inputs.first())
+        .context("shield input")?;
+    let mut input_id = input.0;
+    input_id.reverse();
+    let proxy = FaultyProofProxy::spawn(rpc.clone(), hex::encode(input_id), input.1).await?;
+    let dir = tempfile::Builder::new()
+        .prefix("dinero-proof-recovery-")
+        .tempdir()?.keep();
+    eprintln!("proof recovery evidence: {}", dir.as_path().display());
+    let pool = PoolProcess::spawn(
+        format!("127.0.0.1:{pool_port}").parse()?,
+        &proxy.url,
+        &daemon.cookie_path,
+        address,
+        &dir.as_path().join("journal"),
+        &dir.as_path().join("key"),
+        dir.as_path().join("pool.log"),
+    )?;
+    pool.wait_ready().await?;
+    let mut miner = MinerConn::connect(pool.bind, payout_script(0xB6), 1)
+        .await
+        .with_context(|| format!("recovery shared handshake: {}", pool.tail_log()))?;
+    miner.find_and_submit_block().await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rpc
+        .call_raw("getblockcount", serde_json::json!([]))
+        .await?
+        .as_u64()
+        != Some(u64::from(funding_height + 2))
+    {
+        ensure!(
+            Instant::now() < deadline,
+            "proof recovery did not mine: {}",
+            pool.tail_log()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    ensure!(
+        proxy.failures.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "proof fault not exercised"
+    );
+    ensure!(
+        proxy
+            .exclusions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ids| ids == &serde_json::json!([shield_id])),
+        "pool did not request the bad transaction's exclusion"
+    );
+    let tip = rpc.get_best_block_hash().await?;
+    let block = rpc
+        .call_raw("getblock", serde_json::json!([tip, 1]))
+        .await?;
+    let txids = block["tx"].as_array().context("block txids")?;
+    ensure!(
+        txids.len() == if compact { 1 } else { 2 }
+            && unshield_id.map_or(true, |id| txids.contains(&serde_json::json!(id)))
+            && !txids.contains(&serde_json::json!(shield_id)),
+        "wrong recovery transaction set: {block}"
+    );
+    let mempool = rpc.call_raw("getrawmempool", serde_json::json!([])).await?;
+    ensure!(
+        mempool
+            .as_array()
+            .context("mempool")?
+            .contains(&serde_json::json!(shield_id)),
+        "excluded transaction was evicted: {mempool}"
+    );
+    // Template validation may temporarily hold the shielded-state lock while
+    // the pool keeps polling the retained transaction. Retry only that explicit
+    // busy response; connection timeouts and every other RPC error still fail.
+    let root_deadline = Instant::now() + Duration::from_secs(30);
+    let info = loop {
+        match rpc
+            .call_raw("daemon.shieldedroot", serde_json::json!([]))
+            .await
+        {
+            Ok(value) => break value,
+            Err(error)
+                if error.to_string().contains("shielded_state_busy")
+                    && Instant::now() < root_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
+    root.reverse();
+    ensure!(
+        mapper::state_commitment_root(&original.coinbase_full_hex)?
+            .as_ref()
+            .map(|r| r.as_slice())
+            != Some(root.as_slice()),
+        "recovery reused original DNRS"
+    );
+    eprintln!("pool recovered from injected proof failure: unshield={unshield_id:?}, retained shield {shield_id} in mempool; block {tip}");
     Ok(())
 }

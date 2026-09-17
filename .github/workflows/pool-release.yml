@@ -10,6 +10,12 @@ name: pool-release
 on:
   push:
     tags: ["pool-v*"]
+  workflow_dispatch:
+    inputs:
+      candidate_source:
+        description: 'Full reviewed commit SHA; builds artifacts without publishing a release'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,6 +33,8 @@ jobs:
             use_cross: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_source || github.ref }}
 
       # pool-v0.1.1 shipped a binary whose --version said 0.1.0, because the
       # crate version was never bumped with the tag. That makes a broken build
@@ -34,11 +42,20 @@ jobs:
       # miner pipeline has always had this guard; the pool pipeline did not.
       - name: Require release version identity
         shell: bash
+        env:
+          CANDIDATE_SOURCE: ${{ inputs.candidate_source }}
         run: |
-          VERSION="${GITHUB_REF_NAME#pool-v}"
           ACTUAL="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' crates/dinero-sv2-pool/Cargo.toml | head -1)"
-          echo "tag=$VERSION crate=$ACTUAL"
-          test "$ACTUAL" = "$VERSION"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [[ "$CANDIDATE_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+            test "$GITHUB_REF_TYPE" != tag
+            test "$(git rev-parse HEAD)" = "$CANDIDATE_SOURCE"
+            echo "candidate=$CANDIDATE_SOURCE crate=$ACTUAL"
+          else
+            VERSION="${GITHUB_REF_NAME#pool-v}"
+            echo "tag=$VERSION crate=$ACTUAL"
+            test "$ACTUAL" = "$VERSION"
+          fi
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
@@ -61,6 +78,50 @@ jobs:
           cp "target/${{ matrix.target }}/release/dinero-sv2-pool" \
              "dist/dinero-sv2-pool-${{ matrix.target }}"
 
+      - name: Candidate identity and checksums
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          target = os.environ['CANDIDATE_TARGET']
+          metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1']))
+          package = next(p for p in metadata['packages'] if p['name'] == 'dinero-sv2-pool')
+          manifest = {'repo': 'DineroLabs/dinero-sv2', 'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'version': package['version'], 'target': target, 'run_id': os.environ['GITHUB_RUN_ID']}
+          pathlib.Path(f'dist/candidate-{target}.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+          (cd dist && sha256sum "dinero-sv2-pool-$CANDIDATE_TARGET" "candidate-$CANDIDATE_TARGET.json" > "SHA256SUMS-$CANDIDATE_TARGET")
+
+      - name: Build candidate verification tools and run workspace tests
+        if: github.event_name == 'workflow_dispatch' && matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          # Workspace tests link the GPU miner's OpenCL loader even though
+          # the released pool itself has no OpenCL dependency.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ocl-icd-opencl-dev
+          cargo test --locked --workspace
+          cargo test --locked --release --target x86_64-unknown-linux-gnu -p dinero-sv2-pool --test shared_split_e2e --no-run --message-format=json > candidate-test-build.json
+          cargo build --locked --release --target x86_64-unknown-linux-gnu -p dinero-sv2-miner
+          mkdir -p candidate-test-tools
+          python3 - <<'PY'
+          import json, pathlib, shutil
+          artifacts = [json.loads(line) for line in pathlib.Path('candidate-test-build.json').read_text().splitlines() if line.startswith('{')]
+          tests = [a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact' and a.get('target', {}).get('name') == 'shared_split_e2e' and a.get('profile', {}).get('test') and a.get('executable')]
+          assert len(tests) == 1, tests
+          shutil.copy2(tests[0], 'candidate-test-tools/shared_split_e2e')
+          PY
+          cp target/x86_64-unknown-linux-gnu/release/dinero-sv2-miner candidate-test-tools/
+          cp dist/candidate-x86_64-unknown-linux-gnu.json candidate-test-tools/source.json
+          (cd candidate-test-tools && sha256sum shared_split_e2e dinero-sv2-miner source.json > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          name: pool-candidate-test-tools
+          path: candidate-test-tools/*
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: dinero-sv2-pool-${{ matrix.target }}
@@ -69,6 +130,7 @@ jobs:
 
   release:
     name: assemble SHA256SUMS + publish
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
     steps:

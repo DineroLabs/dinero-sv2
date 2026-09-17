@@ -870,6 +870,8 @@ async fn run_session(
     let mut pre_block_state: Option<UtreexoAccumulatorState> = None;
     let mut coinbase_ctx: Option<CoinbaseContext> = None;
     let mut pending_shared_template: Option<NewTemplateDinero> = None;
+    // Vardiff may update only the target, without replacing this job.
+    let mut current_shared_template: Option<NewTemplateDinero> = None;
     let mut shared_mode_confirmed = false;
     let mut blocks_found: u64 = 0;
     let mut seq: u32 = 0;
@@ -919,6 +921,7 @@ async fn run_session(
                         pre_block_state = None;
                         coinbase_ctx = None;
                         pending_shared_template = None;
+                        current_shared_template = None;
                     }
                     MSG_UTREEXO_STATE => {
                         if reward_mode == RewardModeChoice::Shared {
@@ -938,6 +941,7 @@ async fn run_session(
                         let (tmpl, height) = dinero_sv2_codec::decode_job_height(&frame.payload, height_enabled)?;
                         emitter.emit("job_height", &serde_json::json!({"height": height}));
                         if reward_mode == RewardModeChoice::Shared {
+                            current_shared_template = Some(tmpl.clone());
                             if shared_mode_confirmed {
                                 pending_shared_template = None;
                                 start_hashing_gpu_shared(
@@ -1050,10 +1054,22 @@ async fn run_session(
                             }),
                         );
                         share_target = st.max_target;
-                        // Force in-flight GPU dispatch thread to exit;
-                        // next NewMiningJob will respawn with the new
-                        // target captured into the closure.
                         generation.fetch_add(1, Ordering::SeqCst);
+                        if reward_mode == RewardModeChoice::Shared && shared_mode_confirmed {
+                            if let Some(tmpl) = current_shared_template.clone() {
+                                start_hashing_gpu_shared(
+                                    tmpl,
+                                    share_target,
+                                    gpu.clone(),
+                                    args.batch_size,
+                                    Arc::clone(&generation),
+                                    Arc::clone(&measured_mhs_x100),
+                                    Arc::clone(&sampler_state),
+                                    share_tx.clone(),
+                                    emitter,
+                                );
+                            }
+                        }
                     }
                     other => {
                         tracing::debug!("unhandled frame msg_type=0x{:02x}", other);
@@ -1113,7 +1129,31 @@ async fn run_session(
                 if found.meets_block_target {
                     blocks_found += 1;
                     if args.max_blocks > 0 && blocks_found >= args.max_blocks {
-                        break Ok(blocks_found);
+                        // Stop hashing, but keep the transport alive until the
+                        // pool acknowledges this exact final submission. Closing
+                        // first can make its ACK fail before it submits the block.
+                        generation.fetch_add(1, Ordering::SeqCst);
+                        let acknowledged = tokio::time::timeout(Duration::from_secs(30), async {
+                            while let Some(frame) = frame_rx.recv().await {
+                                if frame.msg_type == MSG_SUBMIT_SHARES_SUCCESS {
+                                    let ack = decode_submit_shares_success(&frame.payload)?;
+                                    if ack.channel_id == channel_id && ack.last_sequence_number >= seq {
+                                        return Ok(());
+                                    }
+                                } else if frame.msg_type == MSG_SUBMIT_SHARES_ERROR {
+                                    let error = decode_submit_shares_error(&frame.payload)?;
+                                    if error.channel_id == channel_id && error.sequence_number == seq {
+                                        anyhow::bail!("final share rejected: {}", String::from_utf8_lossy(&error.error_code));
+                                    }
+                                }
+                            }
+                            anyhow::bail!("pool closed before acknowledging final share")
+                        }).await;
+                        break match acknowledged {
+                            Ok(Ok(())) => Ok(blocks_found),
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Err(anyhow::anyhow!("timed out awaiting final share acknowledgement")),
+                        };
                     }
                 }
             }

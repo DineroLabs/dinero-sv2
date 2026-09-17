@@ -177,6 +177,24 @@ impl RpcClient {
         Self::without_embedded_error("getblocktemplate", value)
     }
 
+    /// Ask the daemon to rebuild every commitment for a reduced transaction set.
+    /// The caller verifies that exclusions were honored by older backends.
+    pub async fn get_block_template_excluding(
+        &self,
+        address: &str,
+        txids: &[String],
+    ) -> Result<Value> {
+        let value = self
+            .call(
+                "getblocktemplate",
+                serde_json::json!([{
+                    "address": address, "exclude_txids": txids,
+                }]),
+            )
+            .await?;
+        Self::without_embedded_error("getblocktemplate", value)
+    }
+
     /// Fetch the post-tip Utreexo forest state (forest roots + leaf
     /// count). This is the PRE-coinbase state for the next block —
     /// what JD miners need to locally recompute `utreexo_root` after
@@ -185,26 +203,23 @@ impl RpcClient {
         self.call("getutreexoroots", serde_json::json!([])).await
     }
 
-    /// Fetch Utreexo inclusion proofs for a batch of outpoints. The
-    /// daemon returns `(leaf_hash, position, num_leaves, siblings,
-    /// script_pubkey)` per outpoint — exactly what
-    /// `UtreexoAccumulatorState::apply_deletions` consumes after we
-    /// hex-decode the hashes and siblings.
-    ///
-    /// Caller passes a slice of `(txid_display_hex, vout)`. Errors out
-    /// if the daemon returns a non-success entry for ANY outpoint —
-    /// since a single missing input invalidates the whole post-mempool
-    /// utreexo state.
-    pub async fn get_utxo_proofs_batch(&self, outpoints: &[(String, u32)]) -> Result<Value> {
+    /// Fetch complete, flat inclusion proofs via getproofupdates (1-100
+    /// outpoints). Unlike getutxoproofs_batch, this endpoint includes the leaf
+    /// hash needed to verify each proof against the template forest. Entries
+    /// may fail individually; selection and exclusion are caller policy.
+    pub async fn get_utxo_proof_updates(&self, outpoints: &[(String, u32)]) -> Result<Value> {
+        anyhow::ensure!(
+            (1..=100).contains(&outpoints.len()),
+            "proof updates require 1-100 outpoints"
+        );
         let arr: Vec<Value> = outpoints
             .iter()
             .map(|(txid, vout)| serde_json::json!({"txid": txid, "vout": vout}))
             .collect();
-        self.call(
-            "getutxoproofs_batch",
-            serde_json::json!([{ "outpoints": arr }]),
-        )
-        .await
+        let value = self
+            .call("getproofupdates", serde_json::json!([{ "outpoints": arr }]))
+            .await?;
+        Self::without_embedded_error("getproofupdates", value)
     }
 
     /// Submit a serialized block (hex).

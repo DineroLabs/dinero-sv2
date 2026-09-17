@@ -15,6 +15,7 @@ pub mod fee;
 pub mod job_generation;
 pub mod journal;
 pub mod mapper;
+pub mod mempool;
 pub mod ops;
 pub mod payout;
 pub mod rpc;

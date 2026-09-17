@@ -23,10 +23,9 @@ pub struct PoolTemplate {
     /// Block target (32-byte big-endian u256) derived from
     /// `getblocktemplate.bits`.
     pub block_target: [u8; 32],
-    /// Pre-coinbase Utreexo forest state (post-tip, pre-next-block).
-    /// JD-aware miners apply their own coinbase's leaves to this to
-    /// derive the header's final `utreexo_root`. Populated from
-    /// `getutreexoroots` at template-emission time.
+    /// Forest after selected input deletions, before any block output is
+    /// added. Builders add coinbase outputs first, then surviving transaction
+    /// outputs. JD can use this state only for coinbase-only templates.
     pub utreexo_pre_block: Option<UtreexoAccumulatorState>,
     /// Block height (from `getblocktemplate.height`).
     pub height: u32,
@@ -47,17 +46,14 @@ pub struct PoolTemplate {
     /// Merkle path from the coinbase leaf to the header merkle root.
     /// Empty for coinbase-only blocks (what Phase 5's MVP requires).
     pub merkle_path: Vec<[u8; 32]>,
-    /// Coinbase txid in raw byte order (header merkle leaf for the
-    /// coinbase). Cached so the mempool-fallback path can rebuild a
-    /// coinbase-only `wire.merkle_root` without re-parsing.
+    /// Coinbase txid in raw byte order (header merkle leaf).
     pub coinbase_txid_raw: [u8; 32],
-    /// Mempool transactions to include after the coinbase, in GBT order.
-    /// Empty in the coinbase-only case. When populated, the pool fetches
-    /// inclusion proofs for each input via `getutxoproofs_batch` and
-    /// applies them to `utreexo_pre_block` to produce
-    /// `utreexo_pre_coinbase` — the state JD miners build their own
-    /// coinbase on top of.
+    /// Transactions in daemon-selected block order. Transparent inputs need
+    /// chain-tip proofs unless they spend an earlier transaction in this block.
     pub mempool_txs: Vec<MempoolTx>,
+    /// Chain-backed spent scripts returned with the selected input proofs.
+    /// DNRF includes these as well as all non-OP_RETURN block output scripts.
+    pub spent_input_scripts: Vec<Vec<u8>>,
 }
 
 /// One mempool tx: the daemon's serialized form + identity + the leaf
@@ -238,8 +234,8 @@ fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
 
 /// Translate a `getblocktemplate` JSON object into a [`PoolTemplate`].
 ///
-/// Phase 4 shares Phase 2.1 limits: rejects non-empty mempools; the
-/// merkle root is `reverse(coinbase.txid)` (empty-path case only).
+/// Preserve the daemon coinbase and transaction bytes; derive the merkle path
+/// and transparent input/output metadata for pool-owned shared jobs.
 pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
     let version = gbt.get("version").and_then(Value::as_u64).unwrap_or(1) as u32;
 
@@ -290,7 +286,7 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
     // contribute to the merkle root alongside the coinbase. Their
     // inputs become Utreexo deletions and their outputs become Utreexo
     // additions, applied in `serve_miner` after fetching deletion
-    // proofs via `getutxoproofs_batch`. Coinbase-only blocks collapse
+    // proofs via `getproofupdates`. Coinbase-only blocks collapse
     // through with an empty `mempool_txs` and unchanged behaviour.
     let mut mempool_txs: Vec<MempoolTx> = Vec::with_capacity(tx_list.len());
     let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(1 + tx_list.len());
@@ -372,6 +368,7 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
         merkle_path,
         coinbase_txid_raw,
         mempool_txs,
+        spent_input_scripts: Vec::new(),
     })
 }
 
@@ -458,7 +455,7 @@ fn parse_segwit_tx_inputs_outputs(bytes: &[u8]) -> Result<(ParsedInputs, ParsedO
         let (ss_len, n2) = read_compact_size(bytes, cur)?;
         cur += n2 + ss_len as usize;
         cur += 4; // sequence
-                  // dinerod's `getutxoproofs_batch` takes display-order txid, so
+                  // dinerod's `getproofupdates` takes display-order txid, so
                   // callers will reverse `prev_txid` before issuing the RPC. We
                   // store raw here for symmetry with the rest of the codebase
                   // ("raw is what consensus uses").
@@ -556,7 +553,7 @@ pub(crate) mod tests {
         pt
     }
 
-    fn fixture() -> Value {
+    pub(crate) fn fixture() -> Value {
         json!({
             "version": 1,
             "previousblockhash": "00000062e5750d87588e0e7f0ebf6a9e46dc9ad99ca3a187fdeffe43d32593fb",
