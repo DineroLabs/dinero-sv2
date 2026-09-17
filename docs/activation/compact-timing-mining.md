@@ -84,7 +84,8 @@ interpreting successful compilation or ignored tests as qualification.
 - Compact injected-proof recovery: passed; excluded shield remains in mempool,
   empty recovery block accepted with rebuilt DNRS. Only the explicit
   `shielded_state_busy` response gets bounded retry during the final root query;
-  timeout/other errors still fail, and the pool keeps running during the check.
+  timeout/other errors still fail. After recovery is observed, the test stops
+  its miner, pool and forwarding proxy before reading the accepted state.
 - Red runs reproduced the CPU stale-generation bug, GPU target-update stall,
   both workers' premature final-share close, daemon chainstate/mempool lock
   inversion, and missing DNRW in daemon `generatetoaddress` at 10,670. The paired
@@ -146,6 +147,24 @@ Workers came from candidate workflow 35227320641, source
 `5f3054367646d4abc667d501e01669ff24979e14`. Pool and daemon were local native
 builds; this is not downloaded-Linux-pool or final-release-artifact qualification.
 The daemon source was #769; Linux paired qualification remains a separate CI gate.
+
+### Recovery state-read lifecycle
+
+Linux run 35245425530 attempt 2 passed actual PoW-enforced compact CPU mining
+in 788.19s. The recovery pool then excluded the injected bad proof and mined an
+accepted replacement block, but its final state inspection exhausted the
+30-second `shielded_state_busy` retry. The fixture was still continuously
+rebuilding templates for the intentionally retained shield transaction while
+the read-only state RPC tried to acquire the same activation lock.
+
+The recovery fixture now stops its miner, pool and forwarding proxy after
+confirming recovery and the exclusion request. It then checks the persisted
+transaction set, retained mempool entry, real PoW and exact DNRS against the
+accepted state, additionally requiring the tip to remain unchanged during the
+state read. The same bounded busy-only retry handles an already-running daemon
+request finishing. No deadline increase, validation bypass or daemon behavior
+change is involved. RPC availability under sustained template load remains a
+separate qualification item; a quiescent state check does not establish it.
 
 ## Throughput finding
 

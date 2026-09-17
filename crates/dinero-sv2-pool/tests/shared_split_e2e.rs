@@ -2195,6 +2195,14 @@ async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()>
             .any(|ids| ids == &serde_json::json!([shield_id])),
         "pool did not request the bad transaction's exclusion"
     );
+    // Recovery is complete. Quiesce this fixture before inspecting the accepted
+    // state: its one-second polling otherwise keeps rebuilding templates for
+    // the deliberately retained shield and can starve the root RPC's try_lock.
+    // Dropping the proxy also cancels its in-flight forwarding tasks; the bounded
+    // busy retry below allows an already-running daemon request to finish.
+    drop(miner);
+    drop(pool);
+    drop(proxy);
     let tip = rpc.get_best_block_hash().await?;
     let block = rpc
         .call_raw("getblock", serde_json::json!([tip, 1]))
@@ -2214,9 +2222,9 @@ async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()>
             .contains(&serde_json::json!(shield_id)),
         "excluded transaction was evicted: {mempool}"
     );
-    // Template validation may temporarily hold the shielded-state lock while
-    // the pool keeps polling the retained transaction. Retry only that explicit
-    // busy response; connection timeouts and every other RPC error still fail.
+    // An already-running template validation can still hold the shielded-state
+    // lock. Retry only that explicit busy response; connection timeouts and
+    // every other RPC error still fail.
     let root_deadline = Instant::now() + Duration::from_secs(30);
     let info = loop {
         match rpc
@@ -2233,6 +2241,10 @@ async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()>
             Err(error) => return Err(error),
         }
     };
+    ensure!(
+        rpc.get_best_block_hash().await? == tip,
+        "recovery tip changed while reading the accepted shielded state"
+    );
     let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
     root.reverse();
     ensure!(
