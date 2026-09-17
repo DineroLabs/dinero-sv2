@@ -1,7 +1,8 @@
 # Compact proofs and 60-second mining preparation
 
 Qualification candidate, not a deployed release. Pair this source with daemon
-commit `a5652a6afa4838c842030bb6de6890633df8f06b` (Dinero v8 PR #769).
+commit `5d6309664771e7820abc8d01fef33cc15f6c9996` (Dinero v8 PR #770,
+based on merged #769).
 That daemon combines the compact format/vector/sanitizer stack with the dormant
 60-second ASERT and 0.5 DIN tail rules. Production activation remains disabled.
 
@@ -163,8 +164,31 @@ transaction set, retained mempool entry, real PoW and exact DNRS against the
 accepted state, additionally requiring the tip to remain unchanged during the
 state read. The same bounded busy-only retry handles an already-running daemon
 request finishing. No deadline increase, validation bypass or daemon behavior
-change is involved. RPC availability under sustained template load remains a
-separate qualification item; a quiescent state check does not establish it.
+change is involved. A quiescent state check does not establish RPC availability
+under sustained template load; the separate test below measures that workload.
+
+### State RPC under a running recovery pool
+
+`pow_enforced_compact_pool_state_rpc_load` keeps the miner connection, pool and
+fault proxy alive for 30 seconds after recovery. The excluded compact shield
+stays in the mempool and the pool must continue requesting exclusion rebuilds.
+The test samples `daemon.shieldedroot` every 100 ms and requires a successful
+read at least every five seconds. It counts explicit busy responses; other
+errors fail. The tip must stay fixed. After quiescing, every observed root must
+equal the final root and the accepted block's DNRS. All ordinary recovery
+checks remain in effect.
+
+On macOS ARM64 the original daemon's longest success gap was 20.688 seconds.
+Core #770's bounded cache of successful cryptographic checks reduced it to
+0.205 seconds (288 successes, one busy response). Disabling cache hits brought
+back a failing 16.283-second gap. Restoring them passed at 0.204 seconds (290
+successes, one busy response). These are local observations, not Linux results.
+
+The Linux workflow pins the exact #770 commit above, executes the ignored test
+explicitly, and uploads its log plus `state-rpc-load.json` in the recovery
+artifact directory. This adds about 50 seconds locally. It qualifies one pool
+with one repeatedly selected compact shield at a fixed tip; new proofs, cache
+churn, large mempools and active reorg load require separate measurements.
 
 ## Throughput finding
 

@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: DineroLabs/dinero-v8
-          ref: a5652a6afa4838c842030bb6de6890633df8f06b
+          ref: 5d6309664771e7820abc8d01fef33cc15f6c9996
           submodules: recursive
           path: core
       - uses: dtolnay/rust-toolchain@stable
@@ -65,6 +65,14 @@ jobs:
           set -o pipefail
           cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e pow_enforced_compact_cpu_worker -- --ignored --exact --nocapture 2>&1 | tee compact-pow-cpu.log
           cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e pow_enforced_compact_pool_proof_recovery -- --ignored --exact --nocapture 2>&1 | tee compact-pow-recovery.log
+      - name: Shielded state reads while recovery pool keeps rebuilding
+        working-directory: sv2
+        env:
+          DINEROD_BIN: ${{ github.workspace }}/core/build/dinerod
+          DINEROPOOL_BIN: ${{ github.workspace }}/sv2/target/release/dinero-sv2-pool
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e pow_enforced_compact_pool_state_rpc_load -- --ignored --exact --nocapture 2>&1 | tee compact-state-rpc-load.log
       - name: Record source and binary identity
         if: always()
         run: |
