@@ -181,8 +181,10 @@ impl RegtestDaemon {
             .arg("--connect=127.0.0.1:1")
             .args(extra)
             .stdin(Stdio::null())
-            .stdout(std::fs::File::create(datadir.join("stdout.log"))?)
-            .stderr(std::fs::File::create(datadir.join("stderr.log"))?)
+            // Keep startup logs outside the fresh datadir required by the
+            // PoW profile guard; never weaken that guard for the harness.
+            .stdout(std::fs::File::create(datadir.with_extension("stdout.log"))?)
+            .stderr(std::fs::File::create(datadir.with_extension("stderr.log"))?)
             .spawn()
             .context("spawning dinerod")?;
 
@@ -1389,25 +1391,39 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
 #[tokio::test]
 #[ignore = "requires DINEROD_BIN; mines an isolated regtest chain"]
 async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template() -> Result<()> {
-    run_shared_shielded_mining(false, None).await
+    run_shared_shielded_mining(false, None, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires compact+timing DINEROD_BIN; real pool and signed transactions"]
 async fn compact_timing_pool_mining() -> Result<()> {
-    run_shared_shielded_mining(true, None).await
+    run_shared_shielded_mining(true, None, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires compact+timing DINEROD_BIN and DINEROMINER_BIN"]
 async fn compact_timing_cpu_worker() -> Result<()> {
-    run_shared_shielded_mining(true, Some(false)).await
+    run_shared_shielded_mining(true, Some(false), false).await
 }
 
 #[tokio::test]
 #[ignore = "requires compact+timing DINEROD_BIN, DINEROGPUMINER_BIN and real GPU"]
 async fn compact_timing_gpu_worker() -> Result<()> {
-    run_shared_shielded_mining(true, Some(true)).await
+    run_shared_shielded_mining(true, Some(true), false).await
+}
+
+/// Same compact/DNRW/commitment scenario with real work checked by the daemon.
+/// This is an admission/compatibility test, not a cadence benchmark.
+#[tokio::test]
+#[ignore = "requires PoW-enforced compact DINEROD_BIN and DINEROMINER_BIN"]
+async fn pow_enforced_compact_cpu_worker() -> Result<()> {
+    run_shared_shielded_mining(true, Some(false), true).await
+}
+
+#[tokio::test]
+#[ignore = "requires PoW-enforced compact DINEROD_BIN, DINEROGPUMINER_BIN and real GPU"]
+async fn pow_enforced_compact_gpu_worker() -> Result<()> {
+    run_shared_shielded_mining(true, Some(true), true).await
 }
 
 struct ActualWorker {
@@ -1470,18 +1486,33 @@ impl Drop for ActualWorker {
     }
 }
 
-async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> Result<()> {
+async fn run_shared_shielded_mining(
+    compact: bool,
+    worker_gpu: Option<bool>,
+    enforce_pow: bool,
+) -> Result<()> {
+    ensure!(
+        !enforce_pow || compact,
+        "PoW scenario requires compact profile"
+    );
     // Compact cases cross the real DNRW threshold too: acceptance below it
     // cannot qualify the pool's witness commitment construction.
     let funding_height = if compact { 10_670 } else { 101 };
-    let timing_height = funding_height + 2;
-    let (rpc_port, pool_port) = match (compact, worker_gpu) {
+    // The fixed genesis is months in the past. Activate new arithmetic at
+    // height 1 for wall-clock setup; the core activation-boundary test covers
+    // the historical prefix. This easy-target fixture cannot measure cadence.
+    let timing_height = if enforce_pow { 1 } else { funding_height + 2 };
+    let (mut rpc_port, mut pool_port) = match (compact, worker_gpu) {
         (false, _) => (29991, 29992),
         (true, None) => (29881, 29882),
         (true, Some(false)) => (29883, 29884),
         (true, Some(true)) => (29885, 29886),
     };
-    let extra = if compact {
+    if enforce_pow {
+        rpc_port -= 100;
+        pool_port -= 100;
+    }
+    let mut extra = if compact {
         vec![
             "--consensus-shielded-epoch-reset-height=1".to_owned(),
             "--consensus-shielded-spend-auth-height=2".to_owned(),
@@ -1491,9 +1522,18 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
     } else {
         vec![]
     };
-    let seed = std::env::var("DINERO_MINING_FIXTURE")
-        .ok()
-        .filter(|_| compact);
+    if enforce_pow {
+        extra.push("--regtest-enforce-pow".to_owned());
+    }
+    // Never accidentally reuse ordinary-regtest history for PoW qualification.
+    // The daemon also binds this copied profile to all consensus parameters.
+    let seed = std::env::var(if enforce_pow {
+        "DINERO_POW_MINING_FIXTURE"
+    } else {
+        "DINERO_MINING_FIXTURE"
+    })
+    .ok()
+    .filter(|_| compact);
     let daemon = RegtestDaemon::spawn_fixture(rpc_port, 1, &extra, seed.as_deref().map(Path::new))?;
     daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
@@ -1501,6 +1541,19 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
         Auth::Cookie(daemon.cookie_path.display().to_string()),
         Duration::from_secs(60),
     )?;
+    if enforce_pow {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["regtest_pow_enforced"] == true,
+            "daemon did not enable PoW enforcement: {info}"
+        );
+    }
+    eprintln!(
+        "daemon evidence: {} (PoW enforced={enforce_pow})",
+        daemon._datadir.display()
+    );
     let address_value = if seed.is_some() {
         rpc.call_raw("wallet.getnewaddress", serde_json::json!([]))
             .await?["address"]
@@ -1546,8 +1599,8 @@ async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> 
             .call_raw("getconsensusinfo", serde_json::json!([]))
             .await?;
         ensure!(
-            info["target_spacing_seconds"] == 120,
-            "fixture must begin under old timing: {info}"
+            info["target_spacing_seconds"] == if enforce_pow { 60 } else { 120 },
+            "fixture timing profile mismatch: {info}"
         );
     }
     let shield = rpc
@@ -1779,6 +1832,25 @@ async fn mine_and_check_template(
     // not a historical transaction index. This also pins the exact block if
     // an actual worker has already advanced the tip again.
     let raw_bytes = hex::decode(raw.as_str().context("raw block bytes")?)?;
+    ensure!(raw_bytes.len() >= 128, "truncated mined header");
+    let bits = u32::from_le_bytes(raw_bytes[108..112].try_into()?);
+    ensure!(
+        bits == mapped.wire.difficulty,
+        "worker changed daemon ASERT target"
+    );
+    let hash = dinero_sv2_common::sha256d(&raw_bytes[..128]);
+    ensure!(
+        hash_meets_target(&hash, &compact_to_target(bits)),
+        "stored pool block has invalid proof of work"
+    );
+    std::fs::write(
+        evidence_dir.join("accepted-block.hex"),
+        raw.as_str().unwrap(),
+    )?;
+    std::fs::write(
+        evidence_dir.join("template.json"),
+        serde_json::to_vec_pretty(&gbt)?,
+    )?;
     for tx in &mapped.mempool_txs {
         ensure!(
             raw_bytes
@@ -1966,31 +2038,49 @@ impl FaultyProofProxy {
 #[tokio::test]
 #[ignore = "requires DINEROD_BIN with getblocktemplate exclude_txids support"]
 async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Result<()> {
-    run_pool_proof_recovery(false).await
+    run_pool_proof_recovery(false, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires compact+timing DINEROD_BIN; injected per-transaction proof failure"]
 async fn compact_timing_pool_proof_recovery() -> Result<()> {
-    run_pool_proof_recovery(true).await
+    run_pool_proof_recovery(true, false).await
 }
 
-async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
-    let (rpc_port, pool_port, funding_height) = if compact {
+#[tokio::test]
+#[ignore = "requires PoW-enforced compact DINEROD_BIN; injected proof failure"]
+async fn pow_enforced_compact_pool_proof_recovery() -> Result<()> {
+    run_pool_proof_recovery(true, true).await
+}
+
+async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()> {
+    ensure!(
+        !enforce_pow || compact,
+        "PoW recovery requires compact profile"
+    );
+    let (rpc_port, pool_port, funding_height) = if enforce_pow {
+        (29787, 29788, 123)
+    } else if compact {
         (29887, 29888, 123)
     } else {
         (29995, 29996, 101)
     };
-    let extra = if compact {
+    let mut extra = if compact {
         vec![
             "--consensus-shielded-epoch-reset-height=1".to_owned(),
             "--consensus-shielded-spend-auth-height=2".to_owned(),
             "--consensus-shielded-compact-height=124".to_owned(),
-            "--consensus-sixty-second-height=125".to_owned(),
+            format!(
+                "--consensus-sixty-second-height={}",
+                if enforce_pow { 1 } else { 125 }
+            ),
         ]
     } else {
         vec![]
     };
+    if enforce_pow {
+        extra.push("--regtest-enforce-pow".to_owned());
+    }
     let daemon = RegtestDaemon::spawn_with_args(rpc_port, 1, &extra)?;
     daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
@@ -1998,6 +2088,19 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
         Auth::Cookie(daemon.cookie_path.display().to_string()),
         Duration::from_secs(60),
     )?;
+    if enforce_pow {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["regtest_pow_enforced"] == true && info["target_spacing_seconds"] == 60,
+            "recovery daemon did not enable PoW/timing profile: {info}"
+        );
+    }
+    eprintln!(
+        "recovery daemon evidence: {} (PoW enforced={enforce_pow})",
+        daemon._datadir.display()
+    );
     let wallet = rpc
         .call_raw(
             "wallet.createhd",
@@ -2048,7 +2151,8 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
     let proxy = FaultyProofProxy::spawn(rpc.clone(), hex::encode(input_id), input.1).await?;
     let dir = tempfile::Builder::new()
         .prefix("dinero-proof-recovery-")
-        .tempdir()?.keep();
+        .tempdir()?
+        .keep();
     eprintln!("proof recovery evidence: {}", dir.as_path().display());
     let pool = PoolProcess::spawn(
         format!("127.0.0.1:{pool_port}").parse()?,
@@ -2091,6 +2195,14 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
             .any(|ids| ids == &serde_json::json!([shield_id])),
         "pool did not request the bad transaction's exclusion"
     );
+    // Recovery is complete. Quiesce this fixture before inspecting the accepted
+    // state: its one-second polling otherwise keeps rebuilding templates for
+    // the deliberately retained shield and can starve the root RPC's try_lock.
+    // Dropping the proxy also cancels its in-flight forwarding tasks; the bounded
+    // busy retry below allows an already-running daemon request to finish.
+    drop(miner);
+    drop(pool);
+    drop(proxy);
     let tip = rpc.get_best_block_hash().await?;
     let block = rpc
         .call_raw("getblock", serde_json::json!([tip, 1]))
@@ -2110,9 +2222,9 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
             .contains(&serde_json::json!(shield_id)),
         "excluded transaction was evicted: {mempool}"
     );
-    // Template validation may temporarily hold the shielded-state lock while
-    // the pool keeps polling the retained transaction. Retry only that explicit
-    // busy response; connection timeouts and every other RPC error still fail.
+    // An already-running template validation can still hold the shielded-state
+    // lock. Retry only that explicit busy response; connection timeouts and
+    // every other RPC error still fail.
     let root_deadline = Instant::now() + Duration::from_secs(30);
     let info = loop {
         match rpc
@@ -2129,6 +2241,10 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
             Err(error) => return Err(error),
         }
     };
+    ensure!(
+        rpc.get_best_block_hash().await? == tip,
+        "recovery tip changed while reading the accepted shielded state"
+    );
     let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
     root.reverse();
     ensure!(
@@ -2138,6 +2254,34 @@ async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
             != Some(root.as_slice()),
         "recovery reused original DNRS"
     );
+    let raw = rpc
+        .call_raw("getblock", serde_json::json!([tip, 0]))
+        .await?;
+    let raw = raw.as_str().context("raw recovery block")?;
+    let bytes = hex::decode(raw)?;
+    ensure!(bytes.len() >= 128, "truncated recovery header");
+    let bits = u32::from_le_bytes(bytes[108..112].try_into()?);
+    ensure!(
+        hash_meets_target(
+            &dinero_sv2_common::sha256d(&bytes[..128]),
+            &compact_to_target(bits)
+        ),
+        "recovery block has invalid proof of work"
+    );
+    let expected_dnrs = dinero_sv2_jd::coinbase::state_commitment_output(
+        root.try_into()
+            .map_err(|_| anyhow::anyhow!("shielded root length"))?,
+    )
+    .script_pubkey;
+    ensure!(
+        parse_block_coinbase_outputs(raw)?
+            .iter()
+            .filter(|(value, script)| *value == 0 && *script == expected_dnrs)
+            .count()
+            == 1,
+        "recovery block DNRS does not match the accepted shielded state"
+    );
+    std::fs::write(dir.join("accepted-block.hex"), raw)?;
     eprintln!("pool recovered from injected proof failure: unshield={unshield_id:?}, retained shield {shield_id} in mempool; block {tip}");
     Ok(())
 }
