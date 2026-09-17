@@ -2038,22 +2038,32 @@ impl FaultyProofProxy {
 #[tokio::test]
 #[ignore = "requires DINEROD_BIN with getblocktemplate exclude_txids support"]
 async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Result<()> {
-    run_pool_proof_recovery(false, false).await
+    run_pool_proof_recovery(false, false, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires compact+timing DINEROD_BIN; injected per-transaction proof failure"]
 async fn compact_timing_pool_proof_recovery() -> Result<()> {
-    run_pool_proof_recovery(true, false).await
+    run_pool_proof_recovery(true, false, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires PoW-enforced compact DINEROD_BIN; injected proof failure"]
 async fn pow_enforced_compact_pool_proof_recovery() -> Result<()> {
-    run_pool_proof_recovery(true, true).await
+    run_pool_proof_recovery(true, true, false).await
 }
 
-async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()> {
+#[tokio::test]
+#[ignore = "requires PoW-enforced compact DINEROD_BIN; measures RPC under live pool load"]
+async fn pow_enforced_compact_pool_state_rpc_load() -> Result<()> {
+    run_pool_proof_recovery(true, true, true).await
+}
+
+async fn run_pool_proof_recovery(
+    compact: bool,
+    enforce_pow: bool,
+    observe_load: bool,
+) -> Result<()> {
     ensure!(
         !enforce_pow || compact,
         "PoW recovery requires compact profile"
@@ -2195,6 +2205,68 @@ async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()>
             .any(|ids| ids == &serde_json::json!([shield_id])),
         "pool did not request the bad transaction's exclusion"
     );
+    // Observe the live workload separately from the recovery assertions below.
+    // Busy responses are measured, never treated as a successful state read.
+    let mut observed_roots = Vec::new();
+    let mut observed_max_gap = Duration::ZERO;
+    if observe_load {
+        let tip_before = rpc.get_best_block_hash().await?;
+        let start = Instant::now();
+        let mut last_success = start;
+        let mut busy_count = 0;
+        let mut max_gap = Duration::ZERO;
+        let mut max_latency = Duration::ZERO;
+        let exclusions_before = proxy.exclusions.lock().unwrap().len();
+        while start.elapsed() < Duration::from_secs(30) {
+            let request_start = Instant::now();
+            match rpc
+                .call_raw("daemon.shieldedroot", serde_json::json!([]))
+                .await
+            {
+                Ok(value) => {
+                    max_gap = max_gap.max(last_success.elapsed());
+                    last_success = Instant::now();
+                    observed_roots.push(
+                        value["shielded_root"]
+                            .as_str()
+                            .context("load probe shielded root")?
+                            .to_owned(),
+                    );
+                }
+                Err(error) if error.to_string().contains("shielded_state_busy") => {
+                    busy_count += 1;
+                }
+                Err(error) => return Err(error),
+            }
+            max_latency = max_latency.max(request_start.elapsed());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        max_gap = max_gap.max(last_success.elapsed());
+        observed_max_gap = max_gap;
+        let exclusions_after = proxy.exclusions.lock().unwrap().len();
+        let report = serde_json::json!({
+            "duration_ms": start.elapsed().as_millis(),
+            "successful_reads": observed_roots.len(),
+            "busy_responses": busy_count,
+            "max_success_gap_ms": max_gap.as_millis(),
+            "max_rpc_latency_ms": max_latency.as_millis(),
+            "exclusion_rebuilds": exclusions_after - exclusions_before,
+            "tip": tip_before,
+        });
+        eprintln!("live pool shielded-state RPC observation: {report}");
+        std::fs::write(
+            dir.join("state-rpc-load.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        ensure!(
+            rpc.get_best_block_hash().await? == tip_before,
+            "tip changed during live pool observation"
+        );
+        ensure!(
+            exclusions_after > exclusions_before,
+            "pool did not rebuild templates during observation"
+        );
+    }
     // Recovery is complete. Quiesce this fixture before inspecting the accepted
     // state: its one-second polling otherwise keeps rebuilding templates for
     // the deliberately retained shield and can starve the root RPC's try_lock.
@@ -2245,6 +2317,12 @@ async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()>
         rpc.get_best_block_hash().await? == tip,
         "recovery tip changed while reading the accepted shielded state"
     );
+    ensure!(
+        observed_roots
+            .iter()
+            .all(|root| Some(root.as_str()) == info["shielded_root"].as_str()),
+        "live pool state reads differed from the quiescent accepted state"
+    );
     let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
     root.reverse();
     ensure!(
@@ -2282,6 +2360,17 @@ async fn run_pool_proof_recovery(compact: bool, enforce_pow: bool) -> Result<()>
         "recovery block DNRS does not match the accepted shielded state"
     );
     std::fs::write(dir.join("accepted-block.hex"), raw)?;
+    ensure!(
+        !observe_load || !observed_roots.is_empty(),
+        "shielded-state RPC was unavailable for the entire 30-second live pool observation"
+    );
+    // Qualification budget for this fixed-tip, one-pool workload: at least one
+    // consistent state read every five seconds. Busy remains valid while a
+    // mutator owns the lock; no mutator runs during this observation.
+    ensure!(
+        !observe_load || observed_max_gap < Duration::from_secs(5),
+        "shielded-state RPC success gap exceeded five seconds: {observed_max_gap:?}"
+    );
     eprintln!("pool recovered from injected proof failure: unshield={unshield_id:?}, retained shield {shield_id} in mempool; block {tip}");
     Ok(())
 }
