@@ -720,6 +720,10 @@ async fn run_session(
                             }),
                         );
                         cancel.store(true, Ordering::SeqCst);
+                        // Hash workers and queued-share filtering use the
+                        // generation, not the legacy cancel flag. Invalidate
+                        // immediately even if the next job is delayed.
+                        generation.fetch_add(1, Ordering::SeqCst);
                         // New prev hash invalidates pre-block state until
                         // the pool re-sends it with the next job cycle.
                         pre_block_state = None;

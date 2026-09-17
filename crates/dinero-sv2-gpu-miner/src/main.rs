@@ -870,6 +870,8 @@ async fn run_session(
     let mut pre_block_state: Option<UtreexoAccumulatorState> = None;
     let mut coinbase_ctx: Option<CoinbaseContext> = None;
     let mut pending_shared_template: Option<NewTemplateDinero> = None;
+    // Vardiff may update only the target, without replacing this job.
+    let mut current_shared_template: Option<NewTemplateDinero> = None;
     let mut shared_mode_confirmed = false;
     let mut blocks_found: u64 = 0;
     let mut seq: u32 = 0;
@@ -919,6 +921,7 @@ async fn run_session(
                         pre_block_state = None;
                         coinbase_ctx = None;
                         pending_shared_template = None;
+                        current_shared_template = None;
                     }
                     MSG_UTREEXO_STATE => {
                         if reward_mode == RewardModeChoice::Shared {
@@ -938,6 +941,7 @@ async fn run_session(
                         let (tmpl, height) = dinero_sv2_codec::decode_job_height(&frame.payload, height_enabled)?;
                         emitter.emit("job_height", &serde_json::json!({"height": height}));
                         if reward_mode == RewardModeChoice::Shared {
+                            current_shared_template = Some(tmpl.clone());
                             if shared_mode_confirmed {
                                 pending_shared_template = None;
                                 start_hashing_gpu_shared(
@@ -1050,10 +1054,22 @@ async fn run_session(
                             }),
                         );
                         share_target = st.max_target;
-                        // Force in-flight GPU dispatch thread to exit;
-                        // next NewMiningJob will respawn with the new
-                        // target captured into the closure.
                         generation.fetch_add(1, Ordering::SeqCst);
+                        if reward_mode == RewardModeChoice::Shared && shared_mode_confirmed {
+                            if let Some(tmpl) = current_shared_template.clone() {
+                                start_hashing_gpu_shared(
+                                    tmpl,
+                                    share_target,
+                                    gpu.clone(),
+                                    args.batch_size,
+                                    Arc::clone(&generation),
+                                    Arc::clone(&measured_mhs_x100),
+                                    Arc::clone(&sampler_state),
+                                    share_tx.clone(),
+                                    emitter,
+                                );
+                            }
+                        }
                     }
                     other => {
                         tracing::debug!("unhandled frame msg_type=0x{:02x}", other);
