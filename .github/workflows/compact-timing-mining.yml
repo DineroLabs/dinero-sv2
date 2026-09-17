@@ -1,0 +1,75 @@
+name: Compact and 60-second mining
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mining:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sv2
+      - uses: actions/checkout@v4
+        with:
+          repository: DineroLabs/dinero-v8
+          ref: 8f6609e829d5d0895debf4db4cb4b07ebf459172
+          submodules: recursive
+          path: core
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config python3 perl jq libcurl4-openssl-dev libudev-dev libusb-1.0-0-dev ocl-icd-opencl-dev
+      - name: Build and test Rust workspace
+        working-directory: sv2
+        run: |
+          cargo test --locked --workspace
+          cargo build --locked --release -p dinero-sv2-pool -p dinero-sv2-miner
+      - name: CPU job interruption and target-only updates
+        working-directory: sv2
+        env:
+          DINEROMINER_BIN: ${{ github.workspace }}/sv2/target/release/dinero-sv2-miner
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p dinero-sv2-pool --test worker_job_lifecycle cpu_job_lifecycle -- --ignored --nocapture 2>&1 | tee worker-lifecycle.log
+      - name: Build combined daemon
+        working-directory: core
+        run: |
+          OPENSSL_VERSION=3.5.7 bash scripts/build-openssl-vendored.sh
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DDINERO_BUILD_QT=OFF -DENABLE_GRPC=OFF -DENABLE_GPU_MINING=OFF \
+            -DDINERO_ENABLE_COMPACT_REGTEST=ON
+          cmake --build build --target dinerod -j2
+      - name: Paired pool and actual CPU mining
+        working-directory: sv2
+        env:
+          DINEROD_BIN: ${{ github.workspace }}/core/build/dinerod
+          DINEROPOOL_BIN: ${{ github.workspace }}/sv2/target/release/dinero-sv2-pool
+          DINEROMINER_BIN: ${{ github.workspace }}/sv2/target/release/dinero-sv2-miner
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e compact_timing_pool_mining -- --ignored --nocapture 2>&1 | tee compact-pool.log
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e compact_timing_cpu_worker -- --ignored --nocapture 2>&1 | tee compact-cpu.log
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e compact_timing_pool_proof_recovery -- --ignored --nocapture 2>&1 | tee compact-recovery.log
+      - name: Record source and binary identity
+        if: always()
+        run: |
+          git -C core rev-parse HEAD > sv2/daemon-commit.txt
+          git -C sv2 rev-parse HEAD > sv2/mining-commit.txt
+          sha256sum core/build/dinerod sv2/target/release/dinero-sv2-pool sv2/target/release/dinero-sv2-miner > sv2/mining-sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compact-timing-mining-${{ github.sha }}
+          path: |
+            sv2/*-lifecycle.log
+            sv2/compact-*.log
+            sv2/*-commit.txt
+            sv2/mining-sha256.txt
+            /tmp/dinero-worker-lifecycle-*/
+            /tmp/dinero-compact-pool-*/
+            /tmp/dinero-sv2-shared-split-e2e-*/stdout.log
+            /tmp/dinero-sv2-shared-split-e2e-*/stderr.log

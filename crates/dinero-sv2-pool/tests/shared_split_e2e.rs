@@ -128,6 +128,10 @@ impl RegtestDaemon {
     }
 
     fn spawn_at_dnrs(port: u16, dnrs_height: u32) -> Result<Self> {
+        Self::spawn_with_args(port, dnrs_height, &[])
+    }
+
+    fn spawn_with_args(port: u16, dnrs_height: u32, extra: &[String]) -> Result<Self> {
         let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/src/dinero/build/dinerod")
@@ -160,9 +164,11 @@ impl RegtestDaemon {
             .arg(format!("--rpcport={port}"))
             .arg("--rpcbind=127.0.0.1")
             .arg("--listen=0")
+            .arg("--connect=127.0.0.1:1")
+            .args(extra)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(std::fs::File::create(datadir.join("stdout.log"))?)
+            .stderr(std::fs::File::create(datadir.join("stderr.log"))?)
             .spawn()
             .context("spawning dinerod")?;
 
@@ -1347,7 +1353,107 @@ async fn run_solo_miner(gpu: bool) -> Result<()> {
 #[tokio::test]
 #[ignore = "requires DINEROD_BIN; mines an isolated regtest chain"]
 async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template() -> Result<()> {
-    let daemon = RegtestDaemon::spawn_at_dnrs(29991, 1)?;
+    run_shared_shielded_mining(false, None).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN; real pool and signed transactions"]
+async fn compact_timing_pool_mining() -> Result<()> {
+    run_shared_shielded_mining(true, None).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN and DINEROMINER_BIN"]
+async fn compact_timing_cpu_worker() -> Result<()> {
+    run_shared_shielded_mining(true, Some(false)).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN, DINEROGPUMINER_BIN and real GPU"]
+async fn compact_timing_gpu_worker() -> Result<()> {
+    run_shared_shielded_mining(true, Some(true)).await
+}
+
+struct ActualWorker {
+    child: Child,
+}
+impl ActualWorker {
+    fn spawn(
+        gpu: bool,
+        pool: SocketAddr,
+        pubkey: &str,
+        script: &[u8],
+        logs: &Path,
+    ) -> Result<Self> {
+        let binary = std::env::var(if gpu {
+            "DINEROGPUMINER_BIN"
+        } else {
+            "DINEROMINER_BIN"
+        })
+        .context("set the actual worker binary path")?;
+        let mut cmd = Command::new(binary);
+        cmd.args([
+            "--pool",
+            &pool.to_string(),
+            "--reward-mode",
+            "shared",
+            "--no-save",
+            "--plain",
+        ])
+        .args(if gpu {
+            vec!["--batch-size", "4096"]
+        } else {
+            vec!["--threads", "1"]
+        })
+        .args([
+            "--server-pubkey",
+            pubkey,
+            "--payout-script-hex",
+            &hex::encode(script),
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(logs.join("worker-output.log"))?)
+        .stderr(std::fs::File::create(logs.join("worker.log"))?);
+        Ok(Self {
+            child: cmd.spawn()?,
+        })
+    }
+    fn stop(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        self.child.wait()?;
+        Ok(())
+    }
+}
+impl Drop for ActualWorker {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+async fn run_shared_shielded_mining(compact: bool, worker_gpu: Option<bool>) -> Result<()> {
+    // Compact cases cross the real DNRW threshold too: acceptance below it
+    // cannot qualify the pool's witness commitment construction.
+    let funding_height = if compact { 10_670 } else { 101 };
+    let timing_height = funding_height + 2;
+    let (rpc_port, pool_port) = match (compact, worker_gpu) {
+        (false, _) => (29991, 29992),
+        (true, None) => (29881, 29882),
+        (true, Some(false)) => (29883, 29884),
+        (true, Some(true)) => (29885, 29886),
+    };
+    let extra = if compact {
+        vec![
+            "--consensus-shielded-epoch-reset-height=1".to_owned(),
+            "--consensus-shielded-spend-auth-height=2".to_owned(),
+            format!("--consensus-shielded-compact-height={}", funding_height + 1),
+            format!("--consensus-sixty-second-height={timing_height}"),
+        ]
+    } else {
+        vec![]
+    };
+    let daemon = RegtestDaemon::spawn_with_args(rpc_port, 1, &extra)?;
     daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
         daemon.rpc_url.clone(),
@@ -1361,7 +1467,25 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
         )
         .await?;
     let address = wallet["first_address"].as_str().context("wallet address")?;
-    mine_blocks(&rpc, address, 101).await?;
+    // This fixture passes the real DNRW height. Keep its bulk setup-mining
+    // timeout separate from the wallet/pool RPC deadline: later 1000-block
+    // batches exceed 60 seconds on an ordinary loaded machine.
+    let mining_rpc = RpcClient::with_timeout(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+        Duration::from_secs(300),
+    )?;
+    let setup_time = mine_blocks(&mining_rpc, address, funding_height).await?;
+    eprintln!("funded compact={compact} worker={worker_gpu:?} at height {funding_height} in {setup_time:?}");
+    if compact {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["target_spacing_seconds"] == 120,
+            "fixture must begin under old timing: {info}"
+        );
+    }
     let shield = rpc
         .call_raw("wallet.shield", serde_json::json!([1.0]))
         .await?;
@@ -1395,6 +1519,14 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
         mapped.mempool_txs.iter().any(|tx| !tx.inputs.is_empty()),
         "missing transparent inputs"
     );
+    if compact {
+        for tx in &mapped.mempool_txs {
+            ensure!(
+                tx.data.get(..4) == Some(&[6, 0, 0, 0x40]),
+                "fixture did not produce compact wire bytes"
+            );
+        }
+    }
     let expected_dnrs = mapper::state_commitment_root(&mapped.coinbase_full_hex)?;
     let mut spent_scripts = Vec::new();
     for tx in &mapped.mempool_txs {
@@ -1408,28 +1540,45 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
             )?);
         }
     }
-    let dir = tempfile::tempdir()?;
+    let evidence_dir = tempfile::Builder::new()
+        .prefix("dinero-compact-pool-")
+        .tempdir()?
+        .keep();
+    eprintln!("pool evidence: {}", evidence_dir.display());
+    let key_path = evidence_dir.as_path().join("key");
+    let keys = dinero_sv2_transport::StaticKeys::load_or_generate(&key_path)?;
     let pool = PoolProcess::spawn(
-        "127.0.0.1:29992".parse()?,
+        format!("127.0.0.1:{pool_port}").parse()?,
         &daemon.rpc_url,
         &daemon.cookie_path,
         address,
-        &dir.path().join("journal"),
-        &dir.path().join("key"),
-        dir.path().join("pool.log"),
+        &evidence_dir.as_path().join("journal"),
+        &key_path,
+        evidence_dir.as_path().join("pool.log"),
     )?;
     pool.wait_ready().await?;
-    let mut miner = MinerConn::connect(pool.bind, payout_script(0xA5), 1)
-        .await
-        .with_context(|| format!("shared handshake: {}", pool.tail_log()))?;
-    miner.find_and_submit_block().await?;
+    let mut worker = if let Some(gpu) = worker_gpu {
+        Some(ActualWorker::spawn(
+            gpu,
+            pool.bind,
+            &keys.public_hex(),
+            &payout_script(0xA5),
+            evidence_dir.as_path(),
+        )?)
+    } else {
+        let mut miner = MinerConn::connect(pool.bind, payout_script(0xA5), 1)
+            .await
+            .with_context(|| format!("shared handshake: {}", pool.tail_log()))?;
+        miner.find_and_submit_block().await?;
+        None
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if rpc
             .call_raw("getblockcount", serde_json::json!([]))
             .await?
             .as_u64()
-            == Some(103)
+            .is_some_and(|h| h >= u64::from(timing_height))
         {
             break;
         }
@@ -1440,7 +1589,27 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let tip = rpc.get_best_block_hash().await?;
+    if let Some(worker) = worker.as_mut() {
+        worker.stop()?;
+    }
+    // Real workers may have advanced again before the RPC poll. Inspect the
+    // exact activation block, not whichever later tip happens to be current.
+    let tip_value = rpc
+        .call_raw("getblockhash", serde_json::json!([timing_height]))
+        .await?;
+    let tip = tip_value
+        .as_str()
+        .context("activation block hash")?
+        .to_owned();
+    if compact {
+        let info = rpc
+            .call_raw("getconsensusinfo", serde_json::json!([]))
+            .await?;
+        ensure!(
+            info["target_spacing_seconds"] == 60 && info["tail_emission_una"] == 50_000_000,
+            "timing activation not applied: {info}"
+        );
+    }
     let block = rpc
         .call_raw("getblock", serde_json::json!([tip, 1]))
         .await?;
@@ -1450,17 +1619,6 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
             && txids.contains(&serde_json::json!(second_id)),
         "pool dropped shielded transactions: {block}"
     );
-    // The daemon validates DNRS on acceptance; independently compare its
-    // current full state digest (the tip marker contains only the tree root).
-    let info = rpc
-        .call_raw("daemon.shieldedroot", serde_json::json!([]))
-        .await?;
-    let mut root = hex::decode(info["shielded_root"].as_str().context("shielded root")?)?;
-    root.reverse();
-    ensure!(
-        expected_dnrs.as_ref().map(|r| r.as_slice()) == Some(root.as_slice()),
-        "pool changed shielded state commitment"
-    );
     // Acceptance alone is insufficient: the daemon currently logs a DNRF
     // hash mismatch without rejecting. Check the stored coinbase commitment
     // against the full output-plus-spent-input filter independently.
@@ -1468,6 +1626,65 @@ async fn shared_pool_confirms_unshield_with_transparent_inputs_in_same_template(
         .call_raw("getblock", serde_json::json!([tip, 0]))
         .await?;
     let coinbase_outputs = parse_block_coinbase_outputs(raw.as_str().context("raw block")?)?;
+    // Inspect the persisted block directly: the wallet transaction lookup is
+    // not a historical transaction index. This also pins the exact block if
+    // an actual worker has already advanced the tip again.
+    let raw_bytes = hex::decode(raw.as_str().context("raw block bytes")?)?;
+    for tx in &mapped.mempool_txs {
+        ensure!(
+            raw_bytes
+                .windows(tx.data.len())
+                .filter(|part| *part == tx.data)
+                .count()
+                == 1,
+            "mined compact transaction bytes changed"
+        );
+    }
+    let dnrs_script = dinero_sv2_jd::coinbase::state_commitment_output(
+        expected_dnrs.context("expected daemon DNRS")?,
+    )
+    .script_pubkey;
+    ensure!(
+        coinbase_outputs
+            .iter()
+            .filter(|(value, script)| *value == 0 && *script == dnrs_script)
+            .count()
+            == 1,
+        "pool changed the exact mined shielded state commitment"
+    );
+    let paid: u64 = coinbase_outputs.iter().map(|(value, _)| *value).sum();
+    ensure!(
+        paid == mapped.coinbase_value_una,
+        "payout sum differs from subsidy plus selected fees"
+    );
+    if compact {
+        let fees: u64 = gbt["transactions"]
+            .as_array()
+            .context("GBT transactions")?
+            .iter()
+            .map(|tx| tx["fee"].as_u64().context("GBT transaction fee"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        ensure!(
+            paid == 10_000_000_000 + fees,
+            "60-second activation changed the 100 DIN reward or lost fees"
+        );
+        let wtxids: Vec<_> = mapped
+            .mempool_txs
+            .iter()
+            .map(|tx| dinero_sv2_common::sha256d(&tx.data))
+            .collect();
+        let witness_script = dinero_sv2_jd::witness_commitment::build_dnrw_script(
+            &dinero_sv2_jd::witness_commitment::witness_merkle_root(&wtxids),
+        );
+        ensure!(
+            coinbase_outputs
+                .iter()
+                .any(|(value, script)| *value == 0 && *script == witness_script),
+            "stored DNRW differs from exact compact transaction bytes"
+        );
+    }
     let scripts: Vec<&[u8]> = coinbase_outputs
         .iter()
         .chain(mapped.mempool_txs.iter().flat_map(|tx| tx.outputs.iter()))
@@ -1600,7 +1817,32 @@ impl FaultyProofProxy {
 #[tokio::test]
 #[ignore = "requires DINEROD_BIN with getblocktemplate exclude_txids support"]
 async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Result<()> {
-    let daemon = RegtestDaemon::spawn_at_dnrs(29995, 1)?;
+    run_pool_proof_recovery(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires compact+timing DINEROD_BIN; injected per-transaction proof failure"]
+async fn compact_timing_pool_proof_recovery() -> Result<()> {
+    run_pool_proof_recovery(true).await
+}
+
+async fn run_pool_proof_recovery(compact: bool) -> Result<()> {
+    let (rpc_port, pool_port, funding_height) = if compact {
+        (29887, 29888, 123)
+    } else {
+        (29995, 29996, 101)
+    };
+    let extra = if compact {
+        vec![
+            "--consensus-shielded-epoch-reset-height=1".to_owned(),
+            "--consensus-shielded-spend-auth-height=2".to_owned(),
+            "--consensus-shielded-compact-height=124".to_owned(),
+            "--consensus-sixty-second-height=125".to_owned(),
+        ]
+    } else {
+        vec![]
+    };
+    let daemon = RegtestDaemon::spawn_with_args(rpc_port, 1, &extra)?;
     daemon.wait_for_rpc().await?;
     let rpc = RpcClient::with_timeout(
         daemon.rpc_url.clone(),
@@ -1614,7 +1856,7 @@ async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Resul
         )
         .await?;
     let address = wallet["first_address"].as_str().context("wallet address")?;
-    mine_blocks(&rpc, address, 101).await?;
+    mine_blocks(&rpc, address, funding_height).await?;
     rpc.call_raw("wallet.shield", serde_json::json!([1.0]))
         .await?;
     mine_blocks(&rpc, address, 1).await?;
@@ -1627,6 +1869,15 @@ async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Resul
         .await?;
     let shield_id = shield["txid"].as_str().context("shield txid")?;
     let original = mapper::map_template(&rpc.get_block_template(address).await?, 1)?;
+    if compact {
+        ensure!(
+            original
+                .mempool_txs
+                .iter()
+                .all(|tx| tx.data.get(..4) == Some(&[6, 0, 0, 0x40])),
+            "recovery fixture did not use compact transactions"
+        );
+    }
     ensure!(
         original.mempool_txs.len() == 2,
         "fixture requires two transactions"
@@ -1641,7 +1892,7 @@ async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Resul
     let proxy = FaultyProofProxy::spawn(rpc.clone(), hex::encode(input_id), input.1).await?;
     let dir = tempfile::tempdir()?;
     let pool = PoolProcess::spawn(
-        "127.0.0.1:29996".parse()?,
+        format!("127.0.0.1:{pool_port}").parse()?,
         &proxy.url,
         &daemon.cookie_path,
         address,
@@ -1659,7 +1910,7 @@ async fn shared_pool_recovers_from_bad_proof_with_daemon_rebuilt_dnrs() -> Resul
         .call_raw("getblockcount", serde_json::json!([]))
         .await?
         .as_u64()
-        != Some(103)
+        != Some(u64::from(funding_height + 2))
     {
         ensure!(
             Instant::now() < deadline,
