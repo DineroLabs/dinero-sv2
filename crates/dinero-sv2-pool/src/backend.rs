@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 
@@ -69,9 +70,57 @@ struct SelectionState {
     epoch: u64,
 }
 
+/// Outcome of offering a found block to [`BackendPool::submit_found_block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockSubmission {
+    /// The block was sent to the backends; this is their verdict.
+    Submitted(SubmitBlockResult),
+    /// The block was not sent: another block on the same parent is already
+    /// in flight or already accepted, so this one could only be an orphan.
+    Skipped(&'static str),
+}
+
+/// How many recently won parents to remember. Only the current tip's parent
+/// matters in practice; a few more cover a burst of quick blocks.
+const ACCEPTED_PARENTS_KEPT: usize = 16;
+
+/// Parents with a block submission in flight, and parents a block of ours
+/// was already accepted on.
+#[derive(Default)]
+struct SubmitGate {
+    in_flight: HashSet<[u8; 32]>,
+    accepted: VecDeque<[u8; 32]>,
+}
+
+/// Holds a parent's in-flight slot; dropping it frees the slot even if the
+/// submitting task is cancelled mid-request.
+struct SubmitPermit<'a> {
+    gate: &'a Mutex<SubmitGate>,
+    parent: [u8; 32],
+}
+
+impl SubmitPermit<'_> {
+    fn record_accepted(&self) {
+        let mut gate = self.gate.lock().unwrap();
+        if !gate.accepted.contains(&self.parent) {
+            if gate.accepted.len() == ACCEPTED_PARENTS_KEPT {
+                gate.accepted.pop_front();
+            }
+            gate.accepted.push_back(self.parent);
+        }
+    }
+}
+
+impl Drop for SubmitPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.lock().unwrap().in_flight.remove(&self.parent);
+    }
+}
+
 pub struct BackendPool {
     clients: Vec<Arc<RpcClient>>,
     selection: Mutex<SelectionState>,
+    submit_gate: Mutex<SubmitGate>,
 }
 
 impl BackendPool {
@@ -85,6 +134,7 @@ impl BackendPool {
                 active_index: None,
                 epoch: 0,
             }),
+            submit_gate: Mutex::new(SubmitGate::default()),
         })
     }
 
@@ -159,6 +209,36 @@ impl BackendPool {
             },
             template,
         ))
+    }
+
+    /// Submit a block found by a miner, at most once per parent: while a
+    /// block on the same parent is in flight, or after one was accepted,
+    /// further candidates are skipped. A rejected or failed submission frees
+    /// the parent so the next candidate may try.
+    pub async fn submit_found_block(&self, block_hex: &str) -> Result<BlockSubmission> {
+        let parent = block_parent(block_hex)?;
+        let permit = {
+            let mut gate = self.submit_gate.lock().unwrap();
+            if gate.accepted.contains(&parent) {
+                return Ok(BlockSubmission::Skipped(
+                    "a block on this parent was already accepted",
+                ));
+            }
+            if !gate.in_flight.insert(parent) {
+                return Ok(BlockSubmission::Skipped(
+                    "a block on this parent is already being submitted",
+                ));
+            }
+            SubmitPermit {
+                gate: &self.submit_gate,
+                parent,
+            }
+        };
+        let result = self.submit_block(block_hex).await?;
+        if result == SubmitBlockResult::Accepted {
+            permit.record_accepted();
+        }
+        Ok(BlockSubmission::Submitted(result))
     }
 
     /// Submit to every configured backend concurrently. Any acceptance wins.
@@ -254,6 +334,17 @@ fn choose_best_candidate(
         }
     }
     best
+}
+
+/// The prev-block-hash field (header bytes 4..36) of a serialized block.
+fn block_parent(block_hex: &str) -> Result<[u8; 32]> {
+    let header = block_hex
+        .get(..72)
+        .ok_or_else(|| anyhow!("serialized block is shorter than its prev-hash field"))?;
+    let bytes = hex::decode(header)?;
+    let mut parent = [0u8; 32];
+    parent.copy_from_slice(&bytes[4..36]);
+    Ok(parent)
 }
 
 fn block_hash_candidates(block_hex: &str) -> Result<Vec<String>> {
