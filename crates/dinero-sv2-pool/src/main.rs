@@ -65,7 +65,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry};
-use crate::backend::BackendPool;
+use crate::backend::{BackendPool, BlockSubmission};
 use crate::bans::BanList;
 use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
@@ -2042,7 +2042,9 @@ async fn handle_share(
     if meets_block {
         let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
         let submitted = if let Some(origin) = immutable.and_then(|job| job.orchard.as_ref()) {
-            backends.submit_block(&origin.block_hex(&share)?).await
+            backends
+                .submit_found_block(&origin.block_hex(&share)?)
+                .await
         } else {
             try_submit_block(
                 &pt.wire,
@@ -2054,7 +2056,7 @@ async fn handle_share(
             .await
         };
         match submitted {
-            Ok(SubmitBlockResult::Accepted) => {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Accepted)) => {
                 info!(
                     template_id = pt.wire.template_id,
                     hash = %hex::encode(hash),
@@ -2071,13 +2073,16 @@ async fn handle_share(
                     outputs: Vec::new(),
                 });
             }
-            Ok(SubmitBlockResult::Rejected(reason)) => {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Rejected(reason))) => {
                 warn!(
                     reason,
                     hash = %hex::encode(hash),
                     "dinerod rejected our block"
                 );
                 ops::telemetry().record_block("rejected", hex::encode(hash), reason);
+            }
+            Ok(BlockSubmission::Skipped(why)) => {
+                debug!(why, hash = %hex::encode(hash), "block candidate not submitted");
             }
             Err(e) => {
                 warn!(error = %e, "submitblock RPC failed");
@@ -2095,9 +2100,9 @@ async fn try_submit_block(
     coinbase_full_hex: &str,
     mempool_tx_data: &[Vec<u8>],
     backends: &BackendPool,
-) -> Result<SubmitBlockResult> {
+) -> Result<BlockSubmission> {
     let block_hex = block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
-    backends.submit_block(&block_hex).await
+    backends.submit_found_block(&block_hex).await
 }
 
 // =====================================================================
@@ -2287,7 +2292,9 @@ async fn handle_shared_share(
 
     if meets_block {
         let submitted = if let Some(origin) = &st.orchard {
-            backends.submit_block(&origin.block_hex(&share)?).await
+            backends
+                .submit_found_block(&origin.block_hex(&share)?)
+                .await
         } else {
             try_submit_block(
                 &st.wire,
@@ -2299,7 +2306,7 @@ async fn handle_shared_share(
             .await
         };
         match submitted {
-            Ok(SubmitBlockResult::Accepted) => {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Accepted)) => {
                 info!(
                     template_id = st.wire.template_id,
                     hash = %hex::encode(hash),
@@ -2324,13 +2331,16 @@ async fn handle_shared_share(
                         .collect(),
                 });
             }
-            Ok(SubmitBlockResult::Rejected(reason)) => {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Rejected(reason))) => {
                 warn!(
                     reason,
                     hash = %hex::encode(hash),
                     "dinerod rejected our shared block"
                 );
                 ops::telemetry().record_block("rejected", hex::encode(hash), reason);
+            }
+            Ok(BlockSubmission::Skipped(why)) => {
+                debug!(why, hash = %hex::encode(hash), "block candidate not submitted");
             }
             Err(e) => {
                 warn!(error = %e, "submitblock RPC failed (shared)");
@@ -2615,8 +2625,8 @@ async fn handle_extended_share(
         );
         let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
         match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase, &mempool_data) {
-            Ok(block_hex) => match backends.submit_block(&block_hex).await {
-                Ok(SubmitBlockResult::Accepted) => {
+            Ok(block_hex) => match backends.submit_found_block(&block_hex).await {
+                Ok(BlockSubmission::Submitted(SubmitBlockResult::Accepted)) => {
                     info!("★ extended-share block ACCEPTED by dinerod");
                     ledger.credit_block(miner_key);
                     ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
@@ -2629,9 +2639,12 @@ async fn handle_extended_share(
                         outputs: Vec::new(),
                     });
                 }
-                Ok(SubmitBlockResult::Rejected(reason)) => {
+                Ok(BlockSubmission::Submitted(SubmitBlockResult::Rejected(reason))) => {
                     warn!(reason, "dinerod rejected our extended-share block");
                     ops::telemetry().record_block("rejected", hex::encode(hash), reason);
+                }
+                Ok(BlockSubmission::Skipped(why)) => {
+                    debug!(why, hash = %hex::encode(hash), "block candidate not submitted");
                 }
                 Err(e) => {
                     ops::telemetry().record_block("error", hex::encode(hash), e.to_string());
