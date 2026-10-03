@@ -1,4 +1,4 @@
-use dinero_sv2_pool::backend::BackendPool;
+use dinero_sv2_pool::backend::{BackendPool, BlockSubmission};
 use dinero_sv2_pool::rpc::{Auth, RpcClient, SubmitBlockResult};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,7 @@ struct FakeState {
     submitted_header_known: bool,
     submit_count: u64,
     submit_delay: Duration,
+    reject_submissions: bool,
 }
 
 async fn read_request(stream: &mut TcpStream) -> Value {
@@ -113,7 +114,12 @@ async fn spawn_backend(
                             state.submit_count += 1;
                         }
                         tokio::time::sleep(snapshot.submit_delay).await;
-                        write_response(&mut stream, Value::Null, Value::Null).await;
+                        let result = if snapshot.reject_submissions {
+                            json!("bad-prevblk")
+                        } else {
+                            Value::Null
+                        };
+                        write_response(&mut stream, result, Value::Null).await;
                     }
                     "getblock" => {
                         let requested_hash = request["params"][0].as_str().unwrap();
@@ -162,6 +168,7 @@ fn state(work: &str, hash: &str, ready: bool) -> FakeState {
         submitted_header_known: false,
         submit_count: 0,
         submit_delay: Duration::ZERO,
+        reject_submissions: false,
     }
 }
 
@@ -225,4 +232,114 @@ async fn accepted_block_is_fanned_out_to_every_backend() {
     );
     assert_eq!(first_state.lock().unwrap().submit_count, 1);
     assert_eq!(second_state.lock().unwrap().submit_count, 1);
+}
+
+/// A 128-byte header-only block whose prev-hash field (bytes 4..36) is
+/// filled with `parent` and whose last byte is `nonce`, so two blocks can
+/// share a parent and still differ.
+fn block_on(parent: u8, nonce: u8) -> String {
+    let mut bytes = [0u8; 128];
+    bytes[4..36].fill(parent);
+    bytes[127] = nonce;
+    hex::encode(bytes)
+}
+
+// The pool floods its node when every block-worthy share on one parent is
+// submitted: the first one wins, the rest can only be orphans or rejects.
+
+#[tokio::test]
+async fn candidates_on_an_already_accepted_parent_are_not_submitted() {
+    let (backend, client) = spawn_backend(state("100", "tip", true), Duration::from_secs(1)).await;
+    let pool = BackendPool::new(vec![client]).unwrap();
+
+    assert_eq!(
+        pool.submit_found_block(&block_on(1, 1)).await.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert!(matches!(
+        pool.submit_found_block(&block_on(1, 2)).await.unwrap(),
+        BlockSubmission::Skipped(_)
+    ));
+    assert_eq!(backend.lock().unwrap().submit_count, 1);
+
+    // A new parent is a new race: submitted normally.
+    assert_eq!(
+        pool.submit_found_block(&block_on(2, 1)).await.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert_eq!(backend.lock().unwrap().submit_count, 2);
+}
+
+#[tokio::test]
+async fn a_second_candidate_on_a_parent_already_in_flight_is_not_submitted() {
+    let mut slow = state("100", "tip", true);
+    slow.submit_delay = Duration::from_millis(300);
+    let (backend, client) = spawn_backend(slow, Duration::from_secs(2)).await;
+    let pool = BackendPool::new(vec![client]).unwrap();
+
+    let first_block = block_on(1, 1);
+    let second_block = block_on(1, 2);
+    let (first, second) = tokio::join!(pool.submit_found_block(&first_block), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pool.submit_found_block(&second_block).await
+    });
+    assert_eq!(
+        first.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert!(matches!(second.unwrap(), BlockSubmission::Skipped(_)));
+    assert_eq!(backend.lock().unwrap().submit_count, 1);
+}
+
+#[tokio::test]
+async fn a_submission_in_flight_does_not_hold_up_a_different_parent() {
+    let mut slow = state("100", "tip", true);
+    slow.submit_delay = Duration::from_millis(300);
+    let (backend, client) = spawn_backend(slow, Duration::from_secs(2)).await;
+    let pool = BackendPool::new(vec![client]).unwrap();
+
+    let old_parent = block_on(1, 1);
+    let new_parent = block_on(2, 1);
+    let (first, second) = tokio::join!(pool.submit_found_block(&old_parent), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pool.submit_found_block(&new_parent).await
+    });
+    assert_eq!(
+        first.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert_eq!(
+        second.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert_eq!(backend.lock().unwrap().submit_count, 2);
+}
+
+#[tokio::test]
+async fn a_rejected_candidate_lets_the_next_one_on_that_parent_try() {
+    let mut rejecting = state("100", "tip", true);
+    rejecting.reject_submissions = true;
+    let (backend, client) = spawn_backend(rejecting, Duration::from_secs(1)).await;
+    let pool = BackendPool::new(vec![client]).unwrap();
+
+    for nonce in 1..=2 {
+        assert_eq!(
+            pool.submit_found_block(&block_on(1, nonce)).await.unwrap(),
+            BlockSubmission::Submitted(SubmitBlockResult::Rejected("bad-prevblk".into()))
+        );
+    }
+    assert_eq!(backend.lock().unwrap().submit_count, 2);
+}
+
+#[tokio::test]
+async fn a_failed_submission_lets_the_next_one_on_that_parent_try() {
+    let mut lost = state("100", "tip", true);
+    lost.submit_delay = Duration::from_millis(200);
+    lost.record_submitted_block = false;
+    let (backend, client) = spawn_backend(lost, Duration::from_millis(50)).await;
+    let pool = BackendPool::new(vec![client]).unwrap();
+
+    assert!(pool.submit_found_block(&block_on(1, 1)).await.is_err());
+    assert!(pool.submit_found_block(&block_on(1, 2)).await.is_err());
+    assert_eq!(backend.lock().unwrap().submit_count, 2);
 }
