@@ -201,6 +201,20 @@ jobs:
           files-folder: ${{ github.workspace }}\dist
           files-folder-filter: exe
 
+      - name: Verify Windows Authenticode and timestamp
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: pwsh
+        run: |
+          $binaries = @(Get-ChildItem dist -Filter *.exe)
+          if ($binaries.Count -ne 1) { throw "Expected exactly one signed miner" }
+          foreach ($binary in $binaries) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $binary.FullName
+            if ($signature.Status -ne 'Valid') { throw "Invalid signature: $($signature.Status)" }
+            if ($signature.SignerCertificate.Subject -notmatch 'DineroLabs') { throw "Unexpected signer" }
+            if ($null -eq $signature.TimeStamperCertificate) { throw "Missing trusted timestamp" }
+            Write-Output "$($binary.Name): Valid, signer=$($signature.SignerCertificate.Subject), timestamp=$($signature.TimeStamperCertificate.Subject)"
+          }
+
       - uses: actions/setup-python@v5
         if: github.event_name == 'workflow_dispatch'
         with:
