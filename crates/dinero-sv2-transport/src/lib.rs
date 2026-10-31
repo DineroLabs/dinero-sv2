@@ -97,3 +97,6 @@ pub const MSG_SUBMIT_SHARES_STANDARD: u8 = 0x1A;
 pub const MSG_SUBMIT_SHARES_SUCCESS: u8 = 0x1C;
 /// Mining: `SubmitShares.Error` (pool → miner).
 pub const MSG_SUBMIT_SHARES_ERROR: u8 = 0x1D;
+
+/// Finalized solo payout, negotiated through FLAG_IMMUTABLE_SOLO.
+pub const MSG_IMMUTABLE_COINBASE: u8 = 0x25;

@@ -167,6 +167,18 @@ pub fn extract_fee_script(coinbase_full_hex: &str) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("no non-OP_RETURN output found in coinbase"))
 }
 
+/// Exact transparent coinbase outputs, including zero-value commitments.
+pub fn coinbase_outputs(coinbase_hex: &str) -> Result<Vec<dinero_sv2_jd::CoinbaseOutput>> {
+    Ok(parse_segwit_tx_inputs_outputs(&hex::decode(coinbase_hex)?)?
+        .1
+        .into_iter()
+        .map(|(value_una, script_pubkey)| dinero_sv2_jd::CoinbaseOutput {
+            value_una,
+            script_pubkey,
+        })
+        .collect())
+}
+
 /// Preserve the daemon's exact DNRS, rejecting malformed/duplicate candidates.
 /// Recomputing this root in the pool would require the full shielded state.
 pub fn state_commitment_root(coinbase_hex: &str) -> Result<Option<[u8; 32]>> {
@@ -204,7 +216,7 @@ pub fn valid_state_commitment_outputs<'a>(
 }
 
 /// Read a Bitcoin CompactSize varint at `off`. Returns `(value, bytes_consumed)`.
-fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
+pub(crate) fn read_compact_size(buf: &[u8], off: usize) -> Result<(u64, usize)> {
     if off >= buf.len() {
         bail!("compactsize out of range: off={off} len={}", buf.len());
     }

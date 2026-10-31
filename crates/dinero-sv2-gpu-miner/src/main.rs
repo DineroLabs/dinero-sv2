@@ -13,12 +13,14 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
+use dinero_miner_ux::config::FileConfig;
+use dinero_miner_ux::display::{Display, SessionStats};
 use dinero_sv2_codec::sv2::{decode_window_status, encode_set_reward_mode};
 use dinero_sv2_codec::{
-    decode_coinbase_context, decode_open_standard_mining_channel_success,
-    decode_set_new_prev_hash, decode_set_target,
-    decode_submit_shares_error, decode_submit_shares_success, encode_open_standard_mining_channel,
-    encode_setup_connection, encode_submit_shares, encode_submit_shares_extended,
+    decode_coinbase_context, decode_open_standard_mining_channel_success, decode_set_new_prev_hash,
+    decode_set_target, decode_submit_shares_error, decode_submit_shares_success,
+    encode_open_standard_mining_channel, encode_setup_connection, encode_submit_shares,
+    encode_submit_shares_extended,
 };
 use dinero_sv2_common::{
     nbits_to_target, CoinbaseContext, CoinbaseOutputWire, HeaderAssembly, NewTemplateDinero,
@@ -42,8 +44,6 @@ use dinero_sv2_transport::{
     MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD,
     MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE, MSG_WINDOW_STATUS,
 };
-use dinero_miner_ux::config::FileConfig;
-use dinero_miner_ux::display::{Display, SessionStats};
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -431,36 +431,37 @@ async fn async_main() -> Result<()> {
     // the script from it. A resolved address that fails validation is only
     // recoverable (warn + fall back to the prompt, or fail naming the
     // config path) when it came from the saved file, not from `--address`.
-    let (resolved_address, payout_script): (Option<String>, Vec<u8>) =
-        if let Some(hex_script) = args.payout_script_hex.as_deref() {
-            let script = hex::decode(hex_script).context("payout_script_hex must be hex")?;
-            (effective.address.clone(), script)
-        } else if let Some(addr) = effective.address.clone() {
-            match classify_resolved_address(args.address.as_deref(), &addr) {
-                AddressOutcome::Ready(script) => (Some(addr), script),
-                AddressOutcome::Fatal(err) => return Err(err),
-                AddressOutcome::Recoverable(err) => {
-                    if std::io::stdin().is_terminal() {
-                        eprintln!(
-                            "warning: saved address in {} is invalid ({err}) — ignoring it",
-                            config_path.display()
-                        );
-                        prompt_for_new_address(human)?
-                    } else {
-                        bail!(
+    let (resolved_address, payout_script): (Option<String>, Vec<u8>) = if let Some(hex_script) =
+        args.payout_script_hex.as_deref()
+    {
+        let script = hex::decode(hex_script).context("payout_script_hex must be hex")?;
+        (effective.address.clone(), script)
+    } else if let Some(addr) = effective.address.clone() {
+        match classify_resolved_address(args.address.as_deref(), &addr) {
+            AddressOutcome::Ready(script) => (Some(addr), script),
+            AddressOutcome::Fatal(err) => return Err(err),
+            AddressOutcome::Recoverable(err) => {
+                if std::io::stdin().is_terminal() {
+                    eprintln!(
+                        "warning: saved address in {} is invalid ({err}) — ignoring it",
+                        config_path.display()
+                    );
+                    prompt_for_new_address(human)?
+                } else {
+                    bail!(
                             "saved address in {} is invalid: {err} (pass --address/--payout-script-hex, or run interactively to replace it)",
                             config_path.display()
                         );
-                    }
                 }
             }
-        } else if std::io::stdin().is_terminal() {
-            prompt_for_new_address(human)?
-        } else {
-            bail!(
+        }
+    } else if std::io::stdin().is_terminal() {
+        prompt_for_new_address(human)?
+    } else {
+        bail!(
                 "no payout address: pass --address din1p… (or --payout-script-hex), or run interactively"
             );
-        };
+    };
 
     if payout_script.is_empty() {
         bail!("payout_script_hex decoded to empty script");
@@ -476,7 +477,8 @@ async fn async_main() -> Result<()> {
         );
     }
 
-    let reward_address = resolved_address.clone()
+    let reward_address = resolved_address
+        .clone()
         .unwrap_or_else(|| "custom payout script".to_string());
     if !args.no_save {
         save_config(&config_path, &file, &args, resolved_address);
@@ -734,7 +736,10 @@ fn save_config(
         to_save.reward_mode = Some(mode.as_str().to_string());
     }
     if let Err(err) = dinero_miner_ux::config::save(path, &to_save) {
-        eprintln!("warning: could not save config to {}: {err}", path.display());
+        eprintln!(
+            "warning: could not save config to {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -797,17 +802,23 @@ async fn run_session(
         protocol: PROTOCOL_MINING,
         min_version: PROTOCOL_VERSION,
         max_version: PROTOCOL_VERSION,
-        flags: dinero_sv2_codec::sv2::FLAG_POOL_VERSION | dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
+        flags: dinero_sv2_codec::sv2::FLAG_POOL_VERSION
+            | dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT
+            | dinero_sv2_codec::sv2::FLAG_IMMUTABLE_SOLO,
         user_agent: args.user_agent.as_bytes().to_vec(),
     };
     writer
         .write_frame(MSG_SETUP_CONNECTION, &encode_setup_connection(&setup)?)
         .await?;
-    let (pool_version, height_enabled) = expect_setup_success(&mut reader).await?;
-    emitter.emit("software_versions", &serde_json::json!({
-        "miner_version": env!("CARGO_PKG_VERSION"),
-        "pool_version": pool_version,
-    }));
+    let (pool_version, height_enabled, immutable_solo_enabled) =
+        expect_setup_success(&mut reader).await?;
+    emitter.emit(
+        "software_versions",
+        &serde_json::json!({
+            "miner_version": env!("CARGO_PKG_VERSION"),
+            "pool_version": pool_version,
+        }),
+    );
 
     // Use the rolling measured rate from the previous session for the
     // SV2 channel-open declaration; first connect (atomic still 0)
@@ -841,10 +852,14 @@ async fn run_session(
         }),
     );
 
-    if reward_mode == RewardModeChoice::Shared {
+    if reward_mode == RewardModeChoice::Shared || immutable_solo_enabled {
         let declaration = SetRewardMode {
             channel_id,
-            mode: 1,
+            mode: if reward_mode == RewardModeChoice::Shared {
+                1
+            } else {
+                0
+            },
             payout_script: payout_script.to_vec(),
         };
         writer
@@ -869,6 +884,8 @@ async fn run_session(
 
     let mut pre_block_state: Option<UtreexoAccumulatorState> = None;
     let mut coinbase_ctx: Option<CoinbaseContext> = None;
+    let mut immutable_coinbase: Option<dinero_sv2_common::ImmutableCoinbase> = None;
+    let mut immutable_solo_active = false;
     let mut pending_shared_template: Option<NewTemplateDinero> = None;
     // Vardiff may update only the target, without replacing this job.
     let mut current_shared_template: Option<NewTemplateDinero> = None;
@@ -920,6 +937,8 @@ async fn run_session(
                         generation.fetch_add(1, Ordering::SeqCst);
                         pre_block_state = None;
                         coinbase_ctx = None;
+                        immutable_coinbase = None;
+                        immutable_solo_active = false;
                         pending_shared_template = None;
                         current_shared_template = None;
                     }
@@ -936,6 +955,13 @@ async fn run_session(
                         }
                         let ctx = decode_coinbase_context(&frame.payload)?;
                         coinbase_ctx = Some(ctx);
+                    }
+                    dinero_sv2_transport::MSG_IMMUTABLE_COINBASE => {
+                        anyhow::ensure!(immutable_solo_enabled && reward_mode==RewardModeChoice::Solo,
+                            "Unnegotiated immutable solo context");
+                        let message=dinero_sv2_codec::sv2::decode_immutable_coinbase(&frame.payload)?;
+                        anyhow::ensure!(message.context.channel_id==channel_id,"foreign solo channel context");
+                        immutable_coinbase=Some(message);
                     }
                     MSG_NEW_MINING_JOB => {
                         let (tmpl, height) = dinero_sv2_codec::decode_job_height(&frame.payload, height_enabled)?;
@@ -960,6 +986,15 @@ async fn run_session(
                             }
                             continue;
                         }
+                        if let Some(proof)=immutable_coinbase.as_ref() {
+                            dinero_sv2_jd::immutable::verify_owned_job(proof,&tmpl,channel_id,height,payout_script)
+                                .map_err(|error|anyhow::anyhow!(error))?;
+                            immutable_solo_active=true;current_shared_template=Some(tmpl.clone());
+                            start_hashing_gpu_immutable_solo(tmpl,proof.context.coinbase_value_una,share_target,gpu.clone(),args.batch_size,
+                                Arc::clone(&generation),Arc::clone(&measured_mhs_x100),Arc::clone(&sampler_state),share_tx.clone(),emitter);
+                            continue;
+                        }
+                        immutable_solo_active=false;
                         let Some(state) = pre_block_state.clone() else {
                             tracing::warn!("NewMiningJob without UtreexoStateAnnouncement");
                             continue;
@@ -1055,7 +1090,12 @@ async fn run_session(
                         );
                         share_target = st.max_target;
                         generation.fetch_add(1, Ordering::SeqCst);
-                        if reward_mode == RewardModeChoice::Shared && shared_mode_confirmed {
+                        if immutable_solo_active {
+                            if let (Some(tmpl),Some(proof))=(current_shared_template.clone(),immutable_coinbase.as_ref()) {
+                                start_hashing_gpu_immutable_solo(tmpl,proof.context.coinbase_value_una,share_target,gpu.clone(),args.batch_size,
+                                    Arc::clone(&generation),Arc::clone(&measured_mhs_x100),Arc::clone(&sampler_state),share_tx.clone(),emitter);
+                            }
+                        } else if reward_mode == RewardModeChoice::Shared && shared_mode_confirmed {
                             if let Some(tmpl) = current_shared_template.clone() {
                                 start_hashing_gpu_shared(
                                     tmpl,
@@ -1082,7 +1122,7 @@ async fn run_session(
                 }
                 seq += 1;
                 let job_id = u32::try_from(found.template_id).unwrap_or(0);
-                if reward_mode == RewardModeChoice::Shared {
+                if reward_mode == RewardModeChoice::Shared || immutable_solo_active {
                     let share = SubmitSharesDinero {
                         channel_id,
                         sequence_number: seq,
@@ -1191,15 +1231,21 @@ async fn run_session(
 
 async fn expect_setup_success<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut NoiseReader<R>,
-) -> Result<(Option<String>, bool)> {
+) -> Result<(Option<String>, bool, bool)> {
     let f = reader
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("EOF after SetupConnection"))?;
     match f.msg_type {
         MSG_SETUP_CONNECTION_SUCCESS => {
-            let (response, version) = dinero_sv2_codec::sv2::decode_setup_success_with_pool_version(&f.payload)?;
-            Ok((version, response.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0))
+            let (response, version) =
+                dinero_sv2_codec::sv2::decode_setup_success_with_pool_version(&f.payload)?;
+            Ok((
+                version,
+                response.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
+                response.flags & dinero_sv2_codec::sv2::FLAG_IMMUTABLE_SOLO != 0
+                    && response.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
+            ))
         }
         MSG_SETUP_CONNECTION_ERROR => bail!(
             "SetupConnection.Error: {}",
@@ -1404,6 +1450,48 @@ fn start_hashing_gpu_shared(
             "share_target": hex::encode(share_target),
             "backend": gpu.name(),
             "reward_mode": "shared",
+        }),
+    );
+
+    start_hashing_gpu_template(
+        tmpl,
+        Vec::new(),
+        share_target,
+        gpu,
+        batch_size,
+        generation,
+        measured_mhs_x100,
+        sampler_state,
+        share_tx,
+        emitter.clone(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_hashing_gpu_immutable_solo(
+    tmpl: NewTemplateDinero,
+    coinbase_value_una: u64,
+    share_target: [u8; 32],
+    gpu: Arc<dyn GpuBackend>,
+    batch_size: u32,
+    generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
+    sampler_state: Arc<SamplerState>,
+    share_tx: mpsc::UnboundedSender<FoundShare>,
+    emitter: &Emitter,
+) {
+    emitter.emit(
+        "new_job",
+        &serde_json::json!({
+            "template_id": tmpl.template_id,
+            "utreexo_root": hex::encode(tmpl.utreexo_root),
+            "merkle_root": hex::encode(tmpl.merkle_root),
+            "difficulty_nbits": format!("0x{:08x}", tmpl.difficulty),
+            "block_target": hex::encode(nbits_to_target(tmpl.difficulty)),
+            "share_target": hex::encode(share_target),
+            "backend": gpu.name(),
+            "reward_mode": "solo",
+            "coinbase_value_una": coinbase_value_una,
         }),
     );
 
@@ -1657,37 +1745,64 @@ impl Emitter {
                     fx.clear_mining_job();
                     fx.set_software_versions(env!("CARGO_PKG_VERSION"), "disconnected");
                     fx.lifecycle(&lifecycle_line(event, data));
-                },
-                "software_versions" => fx.set_software_versions(env!("CARGO_PKG_VERSION"),
-                    data.get("pool_version").and_then(|v| v.as_str()).unwrap_or("not reported")),
+                }
+                "software_versions" => fx.set_software_versions(
+                    env!("CARGO_PKG_VERSION"),
+                    data.get("pool_version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("not reported"),
+                ),
                 "connected" => {
                     fx.set_software_versions(env!("CARGO_PKG_VERSION"), "pending");
                     fx.lifecycle(&lifecycle_line(event, data));
-                },
+                }
                 "gpu_ready" => {
                     if let Some(b) = data.get("backend").and_then(|v| v.as_str()) {
                         fx.set_backend(b);
                     }
                     fx.lifecycle(&lifecycle_line(event, data));
                 }
-                "hashrate" => { if let Some(mhs) = data.get("mhs").and_then(|v| v.as_f64()) { fx.on_hashrate(mhs); } }
-                "share_accepted" => fx.on_share_ok(data.get("accepted_count").and_then(|v| v.as_u64()).unwrap_or(1)),
+                "hashrate" => {
+                    if let Some(mhs) = data.get("mhs").and_then(|v| v.as_f64()) {
+                        fx.on_hashrate(mhs);
+                    }
+                }
+                "share_accepted" => fx.on_share_ok(
+                    data.get("accepted_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1),
+                ),
                 "share_rejected" => fx.on_share_rejected(),
-                "window_status" => { if let Some(bps) = data.get("window_bps").and_then(|v| v.as_u64()) { fx.on_window(bps); } }
+                "window_status" => {
+                    if let Some(bps) = data.get("window_bps").and_then(|v| v.as_u64()) {
+                        fx.on_window(bps);
+                    }
+                }
                 "job_height" => fx.set_mining_height(data.get("height").and_then(|v| v.as_u64())),
                 "new_job" => {
-                    if let Some(height) = data.get("height").and_then(|v| v.as_u64()) { fx.set_mining_height(Some(height)); }
+                    if let Some(height) = data.get("height").and_then(|v| v.as_u64()) {
+                        fx.set_mining_height(Some(height));
+                    }
                     // Solo templates carry the exact coinbase value for the DIN total.
-                    if let Some(una) = data.get("coinbase_value_una").and_then(|v| v.as_u64()) { fx.on_solo_job_value(una); }
+                    if let Some(una) = data.get("coinbase_value_una").and_then(|v| v.as_u64()) {
+                        fx.on_solo_job_value(una);
+                    }
                     // deliberately NOT surfaced as a lifecycle line — job churn would
                     // spam the permanent history; the feed itself shows the work.
                 }
-                "set_new_prev_hash" => fx.set_mining_parent_hash(
-                    data.get("prev_hash").and_then(|v| v.as_str()),
-                ),
+                "set_new_prev_hash" => {
+                    fx.set_mining_parent_hash(data.get("prev_hash").and_then(|v| v.as_str()))
+                }
                 "share_submitted" => {
-                    if data.get("meets_block_target").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        fx.on_block(data.get("hash").and_then(|v| v.as_str()).unwrap_or(""), &now_hms());
+                    if data
+                        .get("meets_block_target")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        fx.on_block(
+                            data.get("hash").and_then(|v| v.as_str()).unwrap_or(""),
+                            &now_hms(),
+                        );
                     }
                 }
                 _ => fx.lifecycle(&lifecycle_line(event, data)),

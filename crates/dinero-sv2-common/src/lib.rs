@@ -418,3 +418,15 @@ mod tests {
         assert_eq!(first_nonzero, 4);
     }
 }
+
+/// A finalized solo coinbase bound to a specific immutable mining job.
+/// The miner checks payout ownership and its merkle path before hashing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImmutableCoinbase {
+    /// Exact wire job generation.
+    pub template_id: u64,
+    /// Coinbase fragments, value, height and merkle path.
+    pub context: CoinbaseContext,
+    /// Full output list, including the daemon-generated commitments.
+    pub outputs: Vec<CoinbaseOutputWire>,
+}

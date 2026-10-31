@@ -171,7 +171,7 @@ impl RpcClient {
         let value = self
             .call(
                 "getblocktemplate",
-                serde_json::json!([{ "address": address }]),
+                serde_json::json!([{ "address": address, "capabilities":["orchard-immutable-jobs-v1"] }]),
             )
             .await?;
         Self::without_embedded_error("getblocktemplate", value)
