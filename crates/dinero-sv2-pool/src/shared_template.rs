@@ -22,6 +22,7 @@ use crate::mapper::PoolTemplate;
 /// final — the miner grinds nonce/timestamp/version only.
 #[derive(Debug)]
 pub struct SharedTemplate {
+    pub orchard: Option<crate::orchard::Origin>,
     /// Exact transaction bytes paired with this job, including across refreshes.
     pub mempool_tx_data: Vec<Vec<u8>>,
     pub height: u32,
@@ -189,6 +190,7 @@ pub fn build_shared_template(
     };
 
     Ok(SharedTemplate {
+        orchard: None,
         mempool_tx_data: pt.mempool_txs.iter().map(|tx| tx.data.clone()).collect(),
         height: pt.height,
         wire,

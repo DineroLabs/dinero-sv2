@@ -112,6 +112,7 @@ use tokio::net::TcpStream;
 // ---------------------------------------------------------------------------
 
 struct RegtestDaemon {
+    orchard: bool,
     child: Child,
     _datadir: PathBuf,
     rpc_url: String,
@@ -141,10 +142,27 @@ impl RegtestDaemon {
         extra: &[String],
         seed: Option<&Path>,
     ) -> Result<Self> {
-        let binary = std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            format!("{home}/src/dinero/build/dinerod")
-        });
+        Self::spawn_profile(port, dnrs_height, extra, seed, false)
+    }
+    fn spawn_orchard(port: u16) -> Result<Self> {
+        Self::spawn_profile(port, 26, &[], None, true)
+    }
+    fn spawn_profile(
+        port: u16,
+        dnrs_height: u32,
+        extra: &[String],
+        seed: Option<&Path>,
+        orchard: bool,
+    ) -> Result<Self> {
+        let binary = if orchard {
+            std::env::var("DINERO_ORCHARD_DAEMON_BIN")
+                .context("set DINERO_ORCHARD_DAEMON_BIN to the Core coupled-cycle fixture")?
+        } else {
+            std::env::var("DINEROD_BIN").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}/src/dinero/build/dinerod")
+            })
+        };
         if !Path::new(&binary).is_file() {
             bail!("dinerod binary not found at {binary}; set DINEROD_BIN");
         }
@@ -157,6 +175,17 @@ impl RegtestDaemon {
             "/tmp/dinero-sv2-shared-split-e2e-{port}-{}-{nanos}",
             std::process::id()
         ));
+        let datadir = if orchard {
+            std::fs::create_dir_all(&datadir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&datadir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            datadir.join("original")
+        } else {
+            datadir
+        };
         if datadir.exists() {
             std::fs::remove_dir_all(&datadir).ok();
         }
@@ -169,9 +198,17 @@ impl RegtestDaemon {
 
         let rpc_url = format!("http://127.0.0.1:{port}");
 
-        let child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        if orchard {
+            command
+                .env("DINERO_TEST_AUTOMATIC_STORAGE_UPGRADE", "1")
+                .arg("--lightning.oracles.enable=0")
+                .arg("--p2p.offline=1");
+        } else {
+            command.arg(format!("--consensus-state-commitment-height={dnrs_height}"));
+        }
+        let child = command
             .arg("--regtest")
-            .arg(format!("--consensus-state-commitment-height={dnrs_height}"))
             .arg(format!("--wallet-socket-port={}", port + 10))
             .arg(format!("--datadir={}", datadir.display()))
             .arg("--rpc")
@@ -180,9 +217,12 @@ impl RegtestDaemon {
             .arg("--listen=0")
             .arg("--connect=127.0.0.1:1")
             .args(extra)
-            .stdin(Stdio::null())
-            // Keep startup logs outside the fresh datadir required by the
-            // PoW profile guard; never weaken that guard for the harness.
+            .stdin(if orchard {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            // Keep startup logs outside every fresh guarded datadir.
             .stdout(std::fs::File::create(datadir.with_extension("stdout.log"))?)
             .stderr(std::fs::File::create(datadir.with_extension("stderr.log"))?)
             .spawn()
@@ -190,6 +230,7 @@ impl RegtestDaemon {
 
         let cookie_path = datadir.join(".cookie");
         Ok(Self {
+            orchard,
             child,
             _datadir: datadir,
             rpc_url,
@@ -201,6 +242,14 @@ impl RegtestDaemon {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut last_error = "cookie not available".to_owned();
         while Instant::now() < deadline {
+            if self.orchard
+                && !std::fs::read_to_string(self._datadir.with_extension("stdout.log"))
+                    .unwrap_or_default()
+                    .contains("READY Orchard wallet cycle JSON-RPC daemon")
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             // The cookie is written before the HTTP listener starts. Wait for
             // an actual RPC response so a fast test cannot race daemon startup.
             if self.cookie_path.exists() {
@@ -832,9 +881,23 @@ async fn run_shared_split_scenario(
     pool_port: u16,
     label: &str,
 ) -> Result<SharedSplitOutcome> {
+    run_shared_split_profile(setup_blocks, daemon_port, pool_port, label, false).await
+}
+async fn run_shared_split_profile(
+    setup_blocks: u32,
+    daemon_port: u16,
+    pool_port: u16,
+    label: &str,
+    orchard: bool,
+) -> Result<SharedSplitOutcome> {
     let started = Instant::now();
 
-    let daemon = RegtestDaemon::spawn(daemon_port).context("spawn regtest dinerod")?;
+    let daemon = if orchard {
+        RegtestDaemon::spawn_orchard(daemon_port)
+    } else {
+        RegtestDaemon::spawn(daemon_port)
+    }
+    .context("spawn regtest dinerod")?;
     daemon.wait_for_rpc().await.context("wait for RPC")?;
     let rpc = RpcClient::new(
         daemon.rpc_url.clone(),
@@ -865,9 +928,27 @@ async fn run_shared_split_scenario(
         .ok_or_else(|| anyhow::anyhow!("createhd did not return first_address: {create}"))?
         .to_string();
 
-    let mine_setup_elapsed = mine_blocks(&mining_rpc, &address, setup_blocks)
-        .await
-        .context("mining setup blocks")?;
+    let mine_setup_elapsed = if orchard {
+        let started = Instant::now();
+        let core = std::env::var("DINERO_ORCHARD_CORE_SOURCE")
+            .context("set DINERO_ORCHARD_CORE_SOURCE")?;
+        let status = Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/orchard_prefix.py"
+            ))
+            .arg(core)
+            .arg(&daemon.cookie_path)
+            .arg(&daemon.rpc_url)
+            .arg(&address)
+            .status()?;
+        anyhow::ensure!(status.success(), "coupled historical prefix failed");
+        started.elapsed()
+    } else {
+        mine_blocks(&mining_rpc, &address, setup_blocks)
+            .await
+            .context("mining setup blocks")?
+    };
     eprintln!(
         "{label}: mined {setup_blocks} setup blocks in {:.1}s",
         mine_setup_elapsed.as_secs_f64()
@@ -878,10 +959,21 @@ async fn run_shared_split_scenario(
     // itself. Since we never mine another block until our own shared
     // block lands, this template describes the identical next-block
     // reward and coinbase shape the pool will build against.
-    let gbt = rpc
+    let mut gbt = rpc
         .get_block_template(&address)
         .await
         .context("getblocktemplate (pre-pool snapshot)")?;
+    if orchard {
+        anyhow::ensure!(
+            gbt["profile"] == "orchard-v1",
+            "missing Orchard GBT contract"
+        );
+        let job = rpc
+            .call_raw("mining.getjob", serde_json::json!({"address":address}))
+            .await?;
+        gbt["coinbasevalue"] = job["coinbase_value_una"].clone();
+        gbt["coinbasetxn"] = serde_json::json!({"data":job["coinbase_hex"]});
+    }
     let expected_reward_una = gbt
         .get("coinbasevalue")
         .and_then(serde_json::Value::as_u64)
@@ -1123,22 +1215,32 @@ async fn run_shared_split_scenario(
     // The first pooled block crosses the DNRS boundary (setup height 25).
     // Compare to the independently fetched daemon template, then require the
     // actual pool submission to have connected under daemon enforcement.
-    let expected_root = dinero_sv2_pool::mapper::state_commitment_root(coinbase_hex)?;
-    assert!(
-        expected_root.is_some(),
-        "daemon template must contain DNRS at activation"
-    );
-    let expected = dinero_sv2_jd::coinbase::state_commitment_output(expected_root.unwrap());
-    assert_eq!(
-        outputs
+    if orchard {
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|(_, script)| script.len() == 39 && &script[2..7] == b"DNRS\x02")
+                .count(),
+            1
+        );
+    } else {
+        let expected_root = dinero_sv2_pool::mapper::state_commitment_root(coinbase_hex)?;
+        assert!(
+            expected_root.is_some(),
+            "daemon template must contain DNRS at activation"
+        );
+        let expected = dinero_sv2_jd::coinbase::state_commitment_output(expected_root.unwrap());
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|(_, s)| s.len() >= 6 && &s[2..6] == b"DNRS")
+                .count(),
+            1
+        );
+        assert!(outputs
             .iter()
-            .filter(|(_, s)| s.len() >= 6 && &s[2..6] == b"DNRS")
-            .count(),
-        1
-    );
-    assert!(outputs
-        .iter()
-        .any(|(v, s)| *v == 0 && *s == expected.script_pubkey));
+            .any(|(v, s)| *v == 0 && *s == expected.script_pubkey));
+    }
 
     // Every value output sums exactly to the block reward.
     let total: u64 = outputs.iter().map(|(v, _)| *v).sum();
@@ -1184,6 +1286,15 @@ async fn shared_block_coinbase_pays_window_contributors() -> Result<()> {
         u64::from(SETUP_BLOCKS) + 1,
         "found block is not the expected next height"
     );
+    Ok(())
+}
+
+/// Uses the real coupled activation/PoW fixture, never production parameters.
+#[tokio::test]
+#[ignore = "requires DINERO_ORCHARD_DAEMON_BIN and DINERO_ORCHARD_CORE_SOURCE"]
+async fn shared_pool_crosses_orchard_with_exact_contributor_payouts() -> Result<()> {
+    let outcome = run_shared_split_profile(101, 39_979, 39_980, "orchard_shared", true).await?;
+    assert_eq!(outcome.height, 102);
     Ok(())
 }
 

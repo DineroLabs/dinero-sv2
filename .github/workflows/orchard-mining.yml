@@ -1,0 +1,70 @@
+name: Orchard immutable mining
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  orchard:
+    name: Linux Orchard shared and actual CPU solo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sv2
+      - uses: actions/checkout@v4
+        with:
+          repository: DineroLabs/dinero-v8
+          ref: 8704cca85530d5790d9e55b0ad93c8243728093a
+          submodules: recursive
+          path: core
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config python3 perl libcurl4-openssl-dev libudev-dev libusb-1.0-0-dev ocl-icd-opencl-dev
+      - name: Rust workspace and pool/miner binaries
+        working-directory: sv2
+        run: |
+          cargo test --locked --workspace
+          cargo build --locked --release -p dinero-sv2-pool -p dinero-sv2-miner
+      - name: Build pinned Core with real Orchard and coupled activation fixture
+        working-directory: core
+        run: |
+          OPENSSL_VERSION=3.5.7 bash scripts/build-openssl-vendored.sh
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DDINERO_BUILD_QT=OFF -DENABLE_GRPC=OFF -DENABLE_GPU_MINING=OFF \
+            -DDINERO_BUILD_ORCHARD_BACKEND=ON -DBUILD_TESTING=ON
+          cmake --build build --target test_orchard_coupled_cycle_daemon test_assumeutxo_replay -j2
+          build/test_assumeutxo_replay --gtest_filter='OrchardMiningRpc.*:OrchardMiningTemplate.*'
+      - name: Exact shared payouts across Orchard activation
+        working-directory: sv2
+        env:
+          DINERO_ORCHARD_DAEMON_BIN: ${{ github.workspace }}/core/build/test_orchard_coupled_cycle_daemon
+          DINERO_ORCHARD_CORE_SOURCE: ${{ github.workspace }}/core
+          DINEROPOOL_BIN: ${{ github.workspace }}/sv2/target/release/dinero-sv2-pool
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p dinero-sv2-pool --test shared_split_e2e shared_pool_crosses_orchard_with_exact_contributor_payouts -- --exact --ignored --nocapture 2>&1 | tee orchard-shared.log
+      - name: Actual CPU solo ownership and unchanged PPLNS
+        working-directory: sv2
+        run: |
+          set -o pipefail
+          python3 -B crates/dinero-sv2-pool/tests/orchard_solo_e2e.py \
+            --core-source ../core --daemon ../core/build/test_orchard_coupled_cycle_daemon \
+            --pool target/release/dinero-sv2-pool --miner target/release/dinero-sv2-miner 2>&1 | tee orchard-solo.log
+      - name: Record exact sources and executable hashes
+        if: always()
+        run: |
+          git -C core rev-parse HEAD > sv2/orchard-core-commit.txt
+          git -C sv2 rev-parse HEAD > sv2/orchard-mining-commit.txt
+          sha256sum core/build/test_orchard_coupled_cycle_daemon sv2/target/release/dinero-sv2-pool sv2/target/release/dinero-sv2-miner > sv2/orchard-binary-sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orchard-mining-${{ github.sha }}
+          path: |
+            sv2/orchard-*.log
+            sv2/orchard-*.txt
+            /tmp/dinero-orchard-wallet-cycle-*/result.json

@@ -65,7 +65,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::accounting::{share_weight, Ledger, MinerKey, PplnsWindow, WindowEntry};
-use crate::backend::BackendPool;
+use crate::backend::{BackendPool, BlockSubmission};
 use crate::bans::BanList;
 use crate::dedup::ShareDedup;
 use crate::journal::WindowJournal;
@@ -81,6 +81,7 @@ use dinero_sv2_pool::{fee, payout};
 /// observes a `shared` template paired with a stale/mismatched `pt`
 /// (or vice versa) — see amendments for Task 6.
 struct TemplateBundle {
+    orchard: Option<dinero_sv2_pool::orchard::Origin>,
     pt: PoolTemplate,
     /// PPLNS split outputs for this refresh (value outputs only), from
     /// which each shared channel derives its OWN template with a
@@ -501,6 +502,7 @@ async fn main() -> Result<()> {
             let mut last_merkle_root: Option<[u8; 32]> = None;
             let mut last_backend_epoch: Option<u64> = None;
             let mut template_id: u64 = 0;
+            let mut job_available = false;
             loop {
                 heartbeat.beat(supervisor::Phase::Sleeping);
                 ticker.tick().await;
@@ -513,7 +515,9 @@ async fn main() -> Result<()> {
                 let (backend, gbt) = match backends.select_template(&payout).await {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(error = %e, "no mining-safe backend; miners retain their last job while failover retries");
+                        warn!(error = %e, "no mining-safe backend; share credit paused while failover retries");
+                        let _ = tx.send(None);
+                        job_available = false;
                         continue;
                     }
                 };
@@ -526,61 +530,98 @@ async fn main() -> Result<()> {
                     (Some(_), None) => true,
                     (None, _) => false,
                 };
-                if !tip_changed && !stale_same_tip && !backend_changed {
+                if job_available && !tip_changed && !stale_same_tip && !backend_changed {
                     continue;
+                }
+                if tip_changed || backend_changed {
+                    // Publish invalidation before an awaited template build.
+                    // Failed rebuilding cannot keep the old parent earning.
+                    let _ = tx.send(None);
+                    job_available = false;
                 }
                 // Past the early-out: from here we actually build and publish.
                 heartbeat.beat(supervisor::Phase::FetchingTemplate);
                 template_id = template_id.wrapping_add(1);
-                let mut pt = match mapper::map_template(&gbt, template_id) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(error = %e, "map_template failed");
-                        continue;
-                    }
-                };
-                match rpc.get_utreexo_roots().await {
-                    Ok(v) => match mapper::map_utreexo_roots(&v) {
-                        Ok(s) => {
-                            debug!(
-                                num_leaves = s.num_leaves,
-                                num_roots = s.forest_roots.len(),
-                                "utreexo pre-block state fetched"
-                            );
-                            pt.utreexo_pre_block = Some(s);
-                        }
-                        Err(e) => warn!(error = %e, "map_utreexo_roots failed"),
-                    },
-                    Err(e) => {
-                        warn!(error = %e, "getutreexoroots failed — JD miners won't be able to recompute utreexo_root");
-                    }
-                }
-
-                match mapper::state_commitment_root(&pt.coinbase_full_hex) {
-                    Ok(root) if root.is_some() || pt.height < state_commitment_height => {}
-                    other => {
-                        warn!(height = pt.height, result = ?other, "refusing template with missing or invalid DNRS; upgrade backend");
-                        continue;
-                    }
-                }
-
-                if !pt.mempool_txs.is_empty() {
-                    pt = match tokio::time::timeout(
-                        Duration::from_secs(45),
-                        dinero_sv2_pool::mempool::prepare_template(rpc.as_ref(), pt, &payout),
-                    )
-                    .await
+                let (pt, orchard) = if gbt["profile"] == "orchard-v1" {
+                    let job = match rpc
+                        .call_raw("mining.getjob", serde_json::json!({"address":payout}))
+                        .await
                     {
-                        Ok(Ok(pt)) => pt,
-                        result => {
-                            warn!(error = ?result, "could not build a consistent pool template");
+                        Ok(job) => job,
+                        Err(error) => {
+                            warn!(%error, "Orchard base job unavailable");
                             continue;
                         }
                     };
-                    if !matches!(rpc.get_best_block_hash().await, Ok(hash) if hash == tip) {
+                    if job["prev_hash"].as_str() != Some(tip.as_str())
+                        || job["height"].as_u64() != Some(backend.health.blocks + 1)
+                    {
                         continue;
                     }
-                }
+                    match dinero_sv2_pool::orchard::map_job(
+                        &job,
+                        template_id,
+                        rpc.clone(),
+                        payout.clone(),
+                    ) {
+                        Ok((pt, origin)) => (pt, Some(origin)),
+                        Err(error) => {
+                            warn!(%error, "Invalid Orchard base job");
+                            continue;
+                        }
+                    }
+                } else {
+                    let mut pt = match mapper::map_template(&gbt, template_id) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(error = %e, "map_template failed");
+                            continue;
+                        }
+                    };
+                    match rpc.get_utreexo_roots().await {
+                        Ok(v) => match mapper::map_utreexo_roots(&v) {
+                            Ok(s) => {
+                                debug!(
+                                    num_leaves = s.num_leaves,
+                                    num_roots = s.forest_roots.len(),
+                                    "utreexo pre-block state fetched"
+                                );
+                                pt.utreexo_pre_block = Some(s);
+                            }
+                            Err(e) => warn!(error = %e, "map_utreexo_roots failed"),
+                        },
+                        Err(e) => {
+                            warn!(error = %e, "getutreexoroots failed — JD miners won't be able to recompute utreexo_root");
+                        }
+                    }
+
+                    match mapper::state_commitment_root(&pt.coinbase_full_hex) {
+                        Ok(root) if root.is_some() || pt.height < state_commitment_height => {}
+                        other => {
+                            warn!(height = pt.height, result = ?other, "refusing template with missing or invalid DNRS; upgrade backend");
+                            continue;
+                        }
+                    }
+
+                    if !pt.mempool_txs.is_empty() {
+                        pt = match tokio::time::timeout(
+                            Duration::from_secs(45),
+                            dinero_sv2_pool::mempool::prepare_template(rpc.as_ref(), pt, &payout),
+                        )
+                        .await
+                        {
+                            Ok(Ok(pt)) => pt,
+                            result => {
+                                warn!(error = ?result, "could not build a consistent pool template");
+                                continue;
+                            }
+                        };
+                        if !matches!(rpc.get_best_block_hash().await, Ok(hash) if hash == tip) {
+                            continue;
+                        }
+                    }
+                    (pt, None)
+                };
                 let nbits_changed = last_nbits != Some(pt.wire.difficulty);
                 // Same-tip exclusion recovery can change the transaction set
                 // and coinbase without changing nbits. Reissue solo work when
@@ -645,12 +686,18 @@ async fn main() -> Result<()> {
                         // per-channel builds in `serve_miner` reuse these
                         // exact split outputs with the channel's own
                         // scriptSig extranonce.
-                        match shared_template::build_shared_template(
-                            &pt,
-                            split_outputs.clone(),
-                            None,
-                            utreexo_maturity_leaf_height,
-                        ) {
+                        let preflight = if orchard.is_some() {
+                            Ok(())
+                        } else {
+                            shared_template::build_shared_template(
+                                &pt,
+                                split_outputs.clone(),
+                                None,
+                                utreexo_maturity_leaf_height,
+                            )
+                            .map(|_| ())
+                        };
+                        match preflight {
                             Ok(_) => Some(split_outputs),
                             Err(e) => {
                                 warn!(error = %e, "build_shared_template failed — shared miners get no job this refresh");
@@ -672,6 +719,7 @@ async fn main() -> Result<()> {
                     hex::encode(pt.wire.prev_block_hash),
                 );
                 let _ = tx.send(Some(Arc::new(TemplateBundle {
+                    orchard,
                     pt: pt.clone(),
                     shared_split,
                     solo_changed,
@@ -684,6 +732,7 @@ async fn main() -> Result<()> {
                 last_nbits = Some(pt.wire.difficulty);
                 last_merkle_root = Some(pt.wire.merkle_root);
                 last_backend_epoch = Some(backend.epoch);
+                job_available = true;
             }
         })
     };
@@ -1096,7 +1145,9 @@ async fn serve_miner(
             &dinero_sv2_codec::sv2::encode_setup_success_with_pool_version(
                 &SetupConnectionSuccess {
                     used_version: PROTOCOL_VERSION,
-                    flags: setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT,
+                    flags: setup.flags
+                        & (dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT
+                            | dinero_sv2_codec::sv2::FLAG_IMMUTABLE_SOLO),
                 },
                 setup.flags,
                 env!("CARGO_PKG_VERSION"),
@@ -1199,6 +1250,9 @@ async fn serve_miner(
     // extranonce baked in), derived from the bundle at each push so
     // share validation always matches the header the miner is grinding.
     let mut current_shared: Option<Arc<SharedTemplate>> = None;
+    let mut current_solo: Option<Arc<SharedTemplate>> = None;
+    let mut solo_payout: Option<Vec<u8>> = None;
+    let immutable_solo = setup.flags & dinero_sv2_codec::sv2::FLAG_IMMUTABLE_SOLO != 0;
     let mut last_sequence_number: u32 = 0;
     // None = solo; Some(payout_script) = shared mode. Modern miners send
     // SetRewardMode immediately after channel-open success. Wait briefly
@@ -1226,7 +1280,14 @@ async fn serve_miner(
                         return Ok(());
                     }
                 }
-                Ok(_) => {
+                Ok(m) => {
+                    if immutable_solo
+                        && !m.payout_script.is_empty()
+                        && m.payout_script.len() <= 10_000
+                        && m.payout_script[0] != 0x6a
+                    {
+                        solo_payout = Some(m.payout_script);
+                    }
                     info!(channel_id, "miner explicitly opened in SOLO mode");
                 }
                 Err(e) => {
@@ -1264,7 +1325,7 @@ async fn serve_miner(
         match &reward_mode {
             Some(payout_script) => {
                 if let Some(st) =
-                    derive_channel_shared(&bundle, channel_id, utreexo_maturity_leaf_height)
+                    derive_channel_shared(&bundle, channel_id, utreexo_maturity_leaf_height).await
                 {
                     push_shared_job(
                         &mut session,
@@ -1279,13 +1340,25 @@ async fn serve_miner(
                 }
             }
             None => {
-                push_job(
-                    &mut session,
-                    channel_id,
-                    &bundle.pt,
-                    setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
-                )
-                .await?
+                if bundle.orchard.is_some() {
+                    current_solo = install_orchard_solo(
+                        &bundle,
+                        solo_payout.as_deref(),
+                        immutable_solo,
+                        channel_id,
+                        &mut session,
+                        setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
+                    )
+                    .await?;
+                } else {
+                    push_job(
+                        &mut session,
+                        channel_id,
+                        &bundle.pt,
+                        setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0,
+                    )
+                    .await?
+                }
             }
         }
         current = Some(bundle);
@@ -1335,8 +1408,16 @@ async fn serve_miner(
                             // the old merkle_root/mempool set), silently
                             // failing valid — even block-worthy — shares.
                             if bundle.solo_changed {
-                                push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
-                                current = Some(bundle);
+                                if bundle.orchard.is_some() {
+                                    if let Some(job) = install_orchard_solo(&bundle, solo_payout.as_deref(), immutable_solo,
+                                        channel_id, &mut session, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await? {
+                                        current_solo=Some(job);current=Some(bundle);
+                                    }
+                                } else {
+                                    current_solo=None;
+                                    push_job(&mut session, channel_id, &bundle.pt, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
+                                    current = Some(bundle);
+                                }
                             }
                         }
                         Some(payout_script) => {
@@ -1348,7 +1429,7 @@ async fn serve_miner(
                                 &bundle,
                                 channel_id,
                                 utreexo_maturity_leaf_height,
-                            ) {
+                            ).await {
                                 push_shared_job(&mut session, channel_id, &st, &window, payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                 current_shared = Some(st);
                                 // Keep the daemon-derived block target paired
@@ -1457,7 +1538,7 @@ async fn serve_miner(
                                             bundle,
                                             channel_id,
                                             utreexo_maturity_leaf_height,
-                                        ) {
+                                        ).await {
                                             push_shared_job(&mut session, channel_id, &st, &window, &m.payout_script, setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
                                             current_shared = Some(st);
                                         }
@@ -1466,7 +1547,16 @@ async fn serve_miner(
                                     send_share_error(&mut session, channel_id, 0, "bad-payout-script").await?;
                                 }
                             }
-                            Ok(_) => { reward_mode = None; } // explicit solo
+                            Ok(m) => {
+                                reward_mode = None;
+                                if immutable_solo && !m.payout_script.is_empty() && m.payout_script.len()<=10_000 && m.payout_script[0]!=0x6a {
+                                    solo_payout=Some(m.payout_script);
+                                }
+                                if let Some(bundle)=current.as_ref().filter(|b|b.orchard.is_some()) {
+                                    current_solo=install_orchard_solo(bundle,solo_payout.as_deref(),immutable_solo,
+                                        channel_id,&mut session,setup.flags & dinero_sv2_codec::sv2::FLAG_JOB_HEIGHT != 0).await?;
+                                }
+                            }
                             Err(e) => {
                                 warn!(error = %e, "bad SetRewardMode payload");
                                 send_share_error(&mut session, channel_id, 0, "bad-payload").await?;
@@ -1474,12 +1564,30 @@ async fn serve_miner(
                         }
                     }
                     MSG_SUBMIT_SHARES_STANDARD => {
+                        let usable = {
+                            let latest = rx.borrow();
+                            current.as_ref().zip(latest.as_ref()).is_some_and(|(installed, observed)|
+                                job_generation::is_current_context(installed.backend_epoch,
+                                    &installed.pt.wire.prev_block_hash, observed.backend_epoch,
+                                    &observed.pt.wire.prev_block_hash))
+                        };
+                        if !usable {
+                            let sequence=decode_submit_shares(&payload).map(|s|s.sequence_number).unwrap_or(last_sequence_number);
+                            ledger.reject(miner_key);
+                            send_share_error(&mut session,channel_id,sequence,"stale-share").await?;
+                            continue;
+                        }
                         match &reward_mode {
                             None => {
+                                if current.as_ref().is_some_and(|b|b.orchard.is_some()) && current_solo.is_none() {
+                                    send_share_error(&mut session,channel_id,last_sequence_number,"no-solo-template").await?;
+                                    continue;
+                                }
                                 handle_share(
                                     &mut session,
                                     &payload,
                                     current.as_ref().map(|b| &b.pt),
+                                    current_solo.as_deref(),
                                     share_target,
                                     channel_id,
                                     &mut last_sequence_number,
@@ -1515,6 +1623,20 @@ async fn serve_miner(
                         }
                     }
                     MSG_SUBMIT_SHARES_EXTENDED => {
+                        // Typed bodies are finalized by Core; historical JD must
+                        // never reconstruct or credit an Orchard job.
+                        let usable = {
+                            let latest=rx.borrow();
+                            current.as_ref().zip(latest.as_ref()).is_some_and(|(installed,observed)|
+                                installed.orchard.is_none() && observed.orchard.is_none() &&
+                                job_generation::is_current_context(installed.backend_epoch,
+                                    &installed.pt.wire.prev_block_hash,observed.backend_epoch,
+                                    &observed.pt.wire.prev_block_hash))
+                        };
+                        if !usable {
+                            send_share_error(&mut session,channel_id,last_sequence_number,"stale-share").await?;
+                            continue;
+                        }
                         handle_extended_share(
                             &mut session,
                             &payload,
@@ -1538,6 +1660,88 @@ async fn serve_miner(
     }
 }
 
+async fn install_orchard_solo(
+    bundle: &TemplateBundle,
+    payout: Option<&[u8]>,
+    capable: bool,
+    channel: u32,
+    session: &mut NoiseSession<TcpStream>,
+    height_enabled: bool,
+) -> Result<Option<Arc<SharedTemplate>>> {
+    if !capable || !height_enabled || payout.is_none() {
+        send_share_error(session, channel, 0, "solo-upgrade-required").await?;
+        anyhow::bail!("Orchard solo requires negotiated immutable payout support");
+    }
+    let Some(origin) = bundle.orchard.as_ref() else {
+        return Ok(None);
+    };
+    let outputs = vec![CoinbaseOutput {
+        value_una: bundle.pt.coinbase_value_una,
+        script_pubkey: payout.unwrap().to_vec(),
+    }];
+    let job =
+        match dinero_sv2_pool::orchard::derive_shared(origin, &bundle.pt, outputs, channel).await {
+            Ok(job) => Arc::new(job),
+            Err(error) => {
+                warn!(%error,channel,"Orchard solo job unavailable");
+                return Ok(None);
+            }
+        };
+    let sealed = job.orchard.as_ref().context("missing solo Orchard owner")?;
+    let (prefix, suffix, _) = mapper::split_coinbase_segwit(&job.coinbase_full_hex)?;
+    let context = CoinbaseContext {
+        channel_id: channel,
+        coinbase_prefix: prefix,
+        coinbase_suffix: suffix,
+        merkle_path: sealed.merkle_path.clone(),
+        height: job.height,
+        coinbase_value_una: bundle.pt.coinbase_value_una,
+        state_commitment_root: None,
+    };
+    let proof = dinero_sv2_common::ImmutableCoinbase {
+        template_id: job.wire.template_id,
+        context,
+        outputs: job
+            .outputs
+            .iter()
+            .map(|output| dinero_sv2_common::CoinbaseOutputWire {
+                value_una: output.value_una,
+                script_pubkey: output.script_pubkey.clone(),
+            })
+            .collect(),
+    };
+    dinero_sv2_jd::immutable::verify_owned_job(
+        &proof,
+        &job.wire,
+        channel,
+        Some(job.height),
+        payout.unwrap(),
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let prev = SetNewPrevHash {
+        channel_id: channel,
+        prev_hash: job.wire.prev_block_hash,
+        min_ntime: job.wire.timestamp,
+        nbits: job.wire.difficulty,
+    };
+    session
+        .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&prev))
+        .await?;
+    session
+        .write_frame(
+            dinero_sv2_transport::MSG_IMMUTABLE_COINBASE,
+            &dinero_sv2_codec::sv2::encode_immutable_coinbase(&proof)?,
+        )
+        .await?;
+    session
+        .write_frame(
+            MSG_NEW_MINING_JOB,
+            &dinero_sv2_codec::encode_job_height(&job.wire, Some(job.height)),
+        )
+        .await?;
+    Ok(Some(job))
+}
+
 /// Build THIS channel's shared template from the bundle's PPLNS split:
 /// same payout outputs, but with the channel id spliced into the
 /// coinbase scriptSig as an extranonce so the header (merkle_root +
@@ -1545,12 +1749,28 @@ async fn serve_miner(
 /// once per connection for the pool's lifetime, so no two live (or
 /// reconnected) channels ever share a header. Returns `None` (warned)
 /// when this refresh has no shared split or the build fails.
-fn derive_channel_shared(
+async fn derive_channel_shared(
     bundle: &TemplateBundle,
     channel_id: u32,
     utreexo_maturity_leaf_height: u32,
 ) -> Option<Arc<SharedTemplate>> {
     let split = bundle.shared_split.as_ref()?;
+    if let Some(origin) = &bundle.orchard {
+        return match dinero_sv2_pool::orchard::derive_shared(
+            origin,
+            &bundle.pt,
+            split.clone(),
+            channel_id,
+        )
+        .await
+        {
+            Ok(job) => Some(Arc::new(job)),
+            Err(error) => {
+                warn!(%error, channel_id, "Orchard channel job unavailable");
+                None
+            }
+        };
+    }
     match shared_template::build_shared_template(
         &bundle.pt,
         split.clone(),
@@ -1692,6 +1912,7 @@ async fn handle_share(
     session: &mut NoiseSession<TcpStream>,
     payload: &[u8],
     current: Option<&PoolTemplate>,
+    immutable: Option<&SharedTemplate>,
     share_target: [u8; 32],
     channel_id: u32,
     last_sequence_number: &mut u32,
@@ -1720,6 +1941,13 @@ async fn handle_share(
     };
     *last_sequence_number = share.sequence_number;
 
+    let derived = current.zip(immutable).map(|(base, job)| {
+        let mut template = base.clone();
+        template.wire = job.wire.clone();
+        template.coinbase_full_hex = job.coinbase_full_hex.clone();
+        template
+    });
+    let current = derived.as_ref().or(current);
     let Some(pt) = current else {
         warn!("share received before any template");
         ledger.reject(miner_key);
@@ -1741,6 +1969,20 @@ async fn handle_share(
         return Ok(());
     }
 
+    if immutable
+        .and_then(|job| job.orchard.as_ref())
+        .is_some_and(|origin| !origin.accepts_header(&pt.wire, &share))
+    {
+        ledger.reject(miner_key);
+        send_share_error(
+            session,
+            channel_id,
+            share.sequence_number,
+            "immutable-header-modified",
+        )
+        .await?;
+        return Ok(());
+    }
     let hash = HeaderAssembly::hash(&pt.wire, &share);
     let meets_share = hash_meets_target(&hash, &share_target);
     let meets_block = hash_meets_target(&hash, &pt.block_target);
@@ -1799,16 +2041,22 @@ async fn handle_share(
 
     if meets_block {
         let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
-        match try_submit_block(
-            &pt.wire,
-            &share,
-            &pt.coinbase_full_hex,
-            &mempool_data,
-            backends,
-        )
-        .await
-        {
-            Ok(SubmitBlockResult::Accepted) => {
+        let submitted = if let Some(origin) = immutable.and_then(|job| job.orchard.as_ref()) {
+            backends
+                .submit_found_block(&origin.block_hex(&share)?)
+                .await
+        } else {
+            try_submit_block(
+                &pt.wire,
+                &share,
+                &pt.coinbase_full_hex,
+                &mempool_data,
+                backends,
+            )
+            .await
+        };
+        match submitted {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Accepted)) => {
                 info!(
                     template_id = pt.wire.template_id,
                     hash = %hex::encode(hash),
@@ -1825,13 +2073,16 @@ async fn handle_share(
                     outputs: Vec::new(),
                 });
             }
-            Ok(SubmitBlockResult::Rejected(reason)) => {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Rejected(reason))) => {
                 warn!(
                     reason,
                     hash = %hex::encode(hash),
                     "dinerod rejected our block"
                 );
                 ops::telemetry().record_block("rejected", hex::encode(hash), reason);
+            }
+            Ok(BlockSubmission::Skipped(why)) => {
+                debug!(why, hash = %hex::encode(hash), "block candidate not submitted");
             }
             Err(e) => {
                 warn!(error = %e, "submitblock RPC failed");
@@ -1849,9 +2100,9 @@ async fn try_submit_block(
     coinbase_full_hex: &str,
     mempool_tx_data: &[Vec<u8>],
     backends: &BackendPool,
-) -> Result<SubmitBlockResult> {
+) -> Result<BlockSubmission> {
     let block_hex = block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
-    backends.submit_block(&block_hex).await
+    backends.submit_found_block(&block_hex).await
 }
 
 // =====================================================================
@@ -1945,6 +2196,21 @@ async fn handle_shared_share(
         return Ok(());
     }
 
+    if st
+        .orchard
+        .as_ref()
+        .is_some_and(|origin| !origin.accepts_header(&st.wire, &share))
+    {
+        ledger.reject(miner_key);
+        send_share_error(
+            session,
+            channel_id,
+            share.sequence_number,
+            "immutable-header-modified",
+        )
+        .await?;
+        return Ok(());
+    }
     let hash = HeaderAssembly::hash(&st.wire, &share);
     let meets_share = hash_meets_target(&hash, &share_target);
     // The shared template's nbits/difficulty is inherited verbatim from
@@ -2025,16 +2291,22 @@ async fn handle_shared_share(
         .await?;
 
     if meets_block {
-        match try_submit_block(
-            &st.wire,
-            &share,
-            &st.coinbase_full_hex,
-            &st.mempool_tx_data,
-            backends,
-        )
-        .await
-        {
-            Ok(SubmitBlockResult::Accepted) => {
+        let submitted = if let Some(origin) = &st.orchard {
+            backends
+                .submit_found_block(&origin.block_hex(&share)?)
+                .await
+        } else {
+            try_submit_block(
+                &st.wire,
+                &share,
+                &st.coinbase_full_hex,
+                &st.mempool_tx_data,
+                backends,
+            )
+            .await
+        };
+        match submitted {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Accepted)) => {
                 info!(
                     template_id = st.wire.template_id,
                     hash = %hex::encode(hash),
@@ -2059,13 +2331,16 @@ async fn handle_shared_share(
                         .collect(),
                 });
             }
-            Ok(SubmitBlockResult::Rejected(reason)) => {
+            Ok(BlockSubmission::Submitted(SubmitBlockResult::Rejected(reason))) => {
                 warn!(
                     reason,
                     hash = %hex::encode(hash),
                     "dinerod rejected our shared block"
                 );
                 ops::telemetry().record_block("rejected", hex::encode(hash), reason);
+            }
+            Ok(BlockSubmission::Skipped(why)) => {
+                debug!(why, hash = %hex::encode(hash), "block candidate not submitted");
             }
             Err(e) => {
                 warn!(error = %e, "submitblock RPC failed (shared)");
@@ -2350,8 +2625,8 @@ async fn handle_extended_share(
         );
         let mempool_data: Vec<Vec<u8>> = pt.mempool_txs.iter().map(|t| t.data.clone()).collect();
         match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase, &mempool_data) {
-            Ok(block_hex) => match backends.submit_block(&block_hex).await {
-                Ok(SubmitBlockResult::Accepted) => {
+            Ok(block_hex) => match backends.submit_found_block(&block_hex).await {
+                Ok(BlockSubmission::Submitted(SubmitBlockResult::Accepted)) => {
                     info!("★ extended-share block ACCEPTED by dinerod");
                     ledger.credit_block(miner_key);
                     ops::telemetry().record_block("accepted", hex::encode(hash), String::new());
@@ -2364,9 +2639,12 @@ async fn handle_extended_share(
                         outputs: Vec::new(),
                     });
                 }
-                Ok(SubmitBlockResult::Rejected(reason)) => {
+                Ok(BlockSubmission::Submitted(SubmitBlockResult::Rejected(reason))) => {
                     warn!(reason, "dinerod rejected our extended-share block");
                     ops::telemetry().record_block("rejected", hex::encode(hash), reason);
+                }
+                Ok(BlockSubmission::Skipped(why)) => {
+                    debug!(why, hash = %hex::encode(hash), "block candidate not submitted");
                 }
                 Err(e) => {
                     ops::telemetry().record_block("error", hex::encode(hash), e.to_string());
