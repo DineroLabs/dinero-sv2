@@ -210,7 +210,9 @@ jobs:
           foreach ($binary in $binaries) {
             $signature = Get-AuthenticodeSignature -LiteralPath $binary.FullName
             if ($signature.Status -ne 'Valid') { throw "Invalid signature: $($signature.Status)" }
-            if ($signature.SignerCertificate.Subject -notmatch 'DineroLabs') { throw "Unexpected signer" }
+            # The established Azure profile uses the owner's verified legal identity.
+            $publisher = $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($publisher -cne 'Mirsad Hajdarevic') { throw "Unexpected signer: $publisher" }
             if ($null -eq $signature.TimeStamperCertificate) { throw "Missing trusted timestamp" }
             Write-Output "$($binary.Name): Valid, signer=$($signature.SignerCertificate.Subject), timestamp=$($signature.TimeStamperCertificate.Subject)"
           }
