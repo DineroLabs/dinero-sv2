@@ -343,3 +343,29 @@ async fn a_failed_submission_lets_the_next_one_on_that_parent_try() {
     assert!(pool.submit_found_block(&block_on(1, 2)).await.is_err());
     assert_eq!(backend.lock().unwrap().submit_count, 2);
 }
+
+#[tokio::test]
+async fn a_parent_reselected_after_reorg_can_be_mined_again() {
+    let (backend, client) =
+        spawn_backend(state("100", &"01".repeat(32), true), Duration::from_secs(1)).await;
+    let pool = BackendPool::new(vec![client]).unwrap();
+    pool.select_template("fixture").await.unwrap();
+    assert_eq!(
+        pool.submit_found_block(&block_on(1, 1)).await.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert!(matches!(
+        pool.submit_found_block(&block_on(1, 2)).await.unwrap(),
+        BlockSubmission::Skipped(_)
+    ));
+    backend.lock().unwrap().best_hash = "02".repeat(32);
+    pool.select_template("fixture").await.unwrap();
+    // A normal chain selection, not a new pool process, returns to the parent.
+    backend.lock().unwrap().best_hash = "01".repeat(32);
+    pool.select_template("fixture").await.unwrap();
+    assert_eq!(
+        pool.submit_found_block(&block_on(1, 3)).await.unwrap(),
+        BlockSubmission::Submitted(SubmitBlockResult::Accepted)
+    );
+    assert_eq!(backend.lock().unwrap().submit_count, 2);
+}

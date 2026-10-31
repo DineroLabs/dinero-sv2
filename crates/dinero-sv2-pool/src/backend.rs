@@ -88,6 +88,7 @@ const ACCEPTED_PARENTS_KEPT: usize = 16;
 /// was already accepted on.
 #[derive(Default)]
 struct SubmitGate {
+    selected_parent: Option<[u8; 32]>,
     in_flight: HashSet<[u8; 32]>,
     accepted: VecDeque<[u8; 32]>,
 }
@@ -199,6 +200,21 @@ impl BackendPool {
             }
             (state.epoch, switched)
         };
+
+        // A parent which becomes selected again after a reorg starts a new
+        // mining race. Remembering an earlier win must not suppress it forever.
+        // Health hashes are display-order; header parents are raw-byte order.
+        if let Ok(mut parent) = hex::decode(&health.best_hash) {
+            if parent.len() == 32 {
+                parent.reverse();
+                let parent: [u8; 32] = parent.try_into().expect("checked parent length");
+                let mut gate = self.submit_gate.lock().expect("submission gate mutex");
+                if gate.selected_parent != Some(parent) {
+                    gate.accepted.retain(|accepted| *accepted != parent);
+                    gate.selected_parent = Some(parent);
+                }
+            }
+        }
 
         Ok((
             BackendLease {
