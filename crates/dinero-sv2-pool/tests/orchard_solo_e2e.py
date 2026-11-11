@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+from orchard_job_ready import wait_for_orchard_job
 
 
 def port():
@@ -93,7 +94,7 @@ def main():
         fee_address = node.rpc('wallet.getnewaddress', ['taproot', 'isolated pool fee'])['address']
         node.generate(101, fee_address)
         assert node.rpc('getblockcount') == 101
-        job = node.rpc('mining.getjob', {'address': fee_address})
+        job = wait_for_orchard_job(node.rpc, fee_address)
         assert job['height'] == 102 and job['profile'] == 'orchard-v1'
         reward = job['coinbase_value_una']
         pool_port = port()

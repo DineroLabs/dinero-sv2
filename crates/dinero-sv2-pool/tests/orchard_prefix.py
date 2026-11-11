@@ -3,7 +3,8 @@
 import sys, pathlib, json, urllib.request, urllib.error, base64, time
 core_source=pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0,str(core_source/"tests/integration"))
-from test_orchard_daemon_wallet_cycle import historical_template_block
+from test_orchard_daemon_wallet_cycle import historical_template_block, RpcError
+from orchard_job_ready import wait_for_orchard_job
 cookie_path,url,address=sys.argv[2:]
 auth=base64.b64encode(pathlib.Path(cookie_path).read_bytes().strip()).decode()
 next_rpc=0.0
@@ -14,7 +15,7 @@ def rpc(method,params):
  next_rpc=time.monotonic()+.04
  req=urllib.request.Request(url,json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode(),{"Authorization":"Basic "+auth,"Content-Type":"application/json"})
  with urllib.request.urlopen(req,timeout=20) as response:r=json.load(response)
- if r.get("error"):raise RuntimeError(r["error"])
+ if r.get("error"):raise RpcError(str(r["error"]),method=method,error=r["error"])
  return r.get("result")
 assert rpc("getblockcount",[])==0
 profile=rpc("getconsensusinfo",[])
@@ -31,6 +32,6 @@ for height in range(1,102):
  if height==1:anchor=rpc("getblockheader",[block_hash])
 print("PASS current Core coupled prefix: 101 ordinary PoW blocks",flush=True)
 
-job=rpc("mining.getjob",{"address":address})
+job=wait_for_orchard_job(rpc,address)
 assert job.get("height")==102 and len(job.get("header_hex",""))==256
 print("PASS current Core typed Orchard job available at 102 before pool submission",flush=True)
