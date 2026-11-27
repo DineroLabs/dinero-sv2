@@ -58,6 +58,9 @@ template; they do not independently report the pool node's current tip.
 If the job height stays fixed, compare it with the pool's `/api/stats`
 `network_height` and its accepted `/api/blocks` before treating a submitted
 candidate as a chain advance.
+The `--max-blocks` option and machine JSON `blocks_found` field retain their
+legacy names for compatibility; both count local block-target hits, not
+blocks accepted by the node.
 
 Running `dinero-miner` without `--address` remains supported and prompts for a
 reward address interactively.
