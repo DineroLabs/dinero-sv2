@@ -30,22 +30,11 @@ pub struct FxConfig {
     pub reward_address: String,
 }
 
-/// Block subsidy backing the "shared" reward-mode estimate.
-///
-/// Verified against dinero-v8 at implementation time:
-/// `include/consensus/subsidy.h:66`:
-/// `static constexpr uint64_t INITIAL_SUBSIDY = 100ULL * UNA_PER_DIN;   // 100 DIN per block`
-/// pinned by the compile-time check at line 153:
-/// `static_assert(INITIAL_SUBSIDY == 10000000000ULL, "Initial subsidy must be 100 DIN");`
-pub const SHARED_BLOCK_SUBSIDY_UNA: u64 = 100 * display::UNA_PER_DIN;
-
 struct Inner {
     window: FeedWindow,
     out: Box<dyn Write + Send>,
     cfg: FxConfig,
     last_sample: Option<CandidateSample>,
-    last_window_bps: Option<u64>,
-    last_solo_value_una: Option<u64>,
     tick_count: u64,
     alternate_screen: bool,
 }
@@ -91,8 +80,6 @@ impl FxScreen {
                 out,
                 cfg,
                 last_sample: None,
-                last_window_bps: None,
-                last_solo_value_una: None,
                 tick_count: 0,
                 alternate_screen: false,
             })),
@@ -240,39 +227,15 @@ impl FxScreen {
         Self::write_flush(&mut inner, &out);
     }
 
-    /// Latest PPLNS window share, from `window_status` events (basis points).
-    pub fn on_window(&self, bps: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.last_window_bps = Some(bps);
-        let width = inner.cfg.width;
-        let colors = inner.cfg.colors;
-        let out = inner.window.repaint(width, colors);
-        Self::write_flush(&mut inner, &out);
-    }
-
-    /// Latest solo-template coinbase value, from solo `new_job` events.
-    pub fn on_solo_job_value(&self, una: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.last_solo_value_una = Some(una);
-        let width = inner.cfg.width;
-        let colors = inner.cfg.colors;
-        let out = inner.window.repaint(width, colors);
-        Self::write_flush(&mut inner, &out);
-    }
-
-    /// Celebration (owner calls: bottom of screen, NO permanent banner).
-    /// Freeze feed; write "\n" + frame + "\x1b[K", then overwrite that
-    /// same line per frame with "\r" + frame + "\x1b[K" (sleep
-    /// frame_delay_ms between frames); erase region + frame line
-    /// (clear variant covering REGION_LINES + 1 lines); then
-    /// `record_block` on the window and repaint — the last-block panel
-    /// and the status DIN total are the only lasting trace.
-    pub fn on_block(&self, hash_hex: &str, local_time: &str) {
+    /// Flash a submitted block-target hit, then redraw the candidate panel.
+    /// The pool may still reject the
+    /// share or fail to get the block accepted by its daemon.
+    pub fn on_block_candidate(&self, hash_hex: &str, local_time: &str) {
         let mut inner = self.inner.lock().unwrap();
         let width = inner.cfg.width;
         let colors = inner.cfg.colors;
-        let block_no = inner.window.stats.blocks + 1;
-        let frames = celebration_frames(width, block_no, colors);
+        let candidate_no = inner.window.stats.candidates + 1;
+        let frames = celebration_frames(width, candidate_no, colors);
         let frame_delay = inner.cfg.frame_delay_ms;
 
         if let Some(first) = frames.first() {
@@ -298,21 +261,9 @@ impl FxScreen {
         let mut erase = String::from("\r\x1b[K\x1b[1A");
         erase.push_str(&inner.window.clear());
 
-        let reward_mode = inner.cfg.reward_mode.clone();
-        let value_una = if reward_mode == "solo" {
-            inner.last_solo_value_una.unwrap_or(0)
-        } else {
-            // PPLNS window share can't exceed 100%; clamp so a malformed
-            // pool `window_status` bps value can't overflow the multiply.
-            let bps = inner.last_window_bps.unwrap_or(10_000).min(10_000);
-            SHARED_BLOCK_SUBSIDY_UNA * bps / 10_000
-        };
-        let estimated = reward_mode != "solo";
-        inner
-            .window
-            .record_block(block_no, hash_hex, local_time, value_una, estimated);
-        if let Some(block) = inner.window.last_block.clone() {
-            inner.window.push_event(block);
+        inner.window.record_candidate(candidate_no, hash_hex, local_time);
+        if let Some(candidate) = inner.window.last_candidate.clone() {
+            inner.window.push_event(candidate);
         }
 
         let mut out = erase;
@@ -320,11 +271,8 @@ impl FxScreen {
         Self::write_flush(&mut inner, &out);
     }
 
-    /// clear region, v1 session_summary + FX's session DIN total (spec:
-    /// "the exit summary includes the same total" as the status line),
-    /// painted BOLD when colors are on. v1 `Display::session_summary`
-    /// itself is untouched — the DIN segment is appended here so the
-    /// --plain/v1 output stays byte-stable.
+    /// Clear the region and report local candidate submissions without
+    /// presenting them as confirmed chain credit.
     pub fn print_summary(&self) {
         let mut inner = self.inner.lock().unwrap();
         let mut out = inner.window.clear();
@@ -335,12 +283,7 @@ impl FxScreen {
             .map(|s| s.elapsed().as_secs())
             .unwrap_or(0);
         let colors = inner.cfg.colors;
-        let mut line = Display::session_summary(&inner.window.stats, elapsed);
-        if inner.window.stats.blocks > 0 {
-            let din_total = inner.window.session_din_una as f64 / display::UNA_PER_DIN as f64;
-            let din_prefix = if inner.window.din_estimated { "≈" } else { "" };
-            line.push_str(&format!(" | {}{:.2} DIN", din_prefix, din_total));
-        }
+        let line = Display::session_summary(&inner.window.stats, elapsed);
         if inner.alternate_screen {
             out.push_str("\x1b[?1049l");
             inner.alternate_screen = false;
@@ -481,18 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn block_flashes_then_updates_panel_no_permanent_banner() {
+    fn candidate_flashes_then_updates_panel_no_permanent_banner() {
         let (fx, buf) = screen_with_buffer(); // frame_delay_ms: 0, reward_mode "shared"
-        fx.on_window(4500); // 45% PPLNS window
-        fx.on_block("000000574714975b", "14:22:07");
+        fx.on_block_candidate("000000574714975b", "14:22:07");
         let plain = crate::theme::strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
-        assert!(plain.contains("B L O C K   F O U N D"), "flash frames played");
-        assert!(plain.contains("■ block #1") && plain.contains("14:22:07"), "panel updated");
-        assert!(plain.contains("≈45.00 DIN"), "shared estimate = 45% of 100 DIN subsidy");
+        assert!(plain.contains("B L O C K   C A N D I D A T E"), "flash frames played");
+        assert!(plain.contains("■ block candidate #1") && plain.contains("14:22:07"), "panel updated");
+        assert!(!plain.contains(" DIN"), "local candidate must not accrue a reward");
         assert!(!plain.contains("tries"), "no permanent v1 banner in FX mode");
         // flash precedes the panel repaint in the stream
-        let flash = plain.find("B L O C K   F O U N D").unwrap();
-        let panel = plain.find("■ block #1").unwrap();
+        let flash = plain.find("B L O C K   C A N D I D A T E").unwrap();
+        let panel = plain.find("■ block candidate #1").unwrap();
         assert!(flash < panel, "celebration at the bottom, then panel update");
     }
 
@@ -507,10 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn print_summary_carries_din_total_colored_bold() {
+    fn print_summary_reports_candidates_without_reward() {
         let (fx, buf) = screen_with_buffer();
-        fx.on_window(4500); // 45% PPLNS window
-        fx.on_block("000000574714975b", "14:22:07");
+        fx.on_block_candidate("000000574714975b", "14:22:07");
         buf.lock().unwrap().clear();
         fx.print_summary();
         let raw = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -521,18 +462,16 @@ mod tests {
             "colors:false — no BOLD/RESET SGR in summary"
         );
         let plain = crate::theme::strip_ansi(&raw);
-        assert!(
-            plain.contains("≈45.00 DIN"),
-            "exit summary carries the session DIN total: {plain:?}"
-        );
+        assert!(plain.contains("block candidates 1"), "exit summary counts local submissions: {plain:?}");
+        assert!(!plain.contains(" DIN"), "exit summary must not infer chain credit: {plain:?}");
     }
 
     #[test]
-    fn print_summary_omits_din_when_no_blocks() {
+    fn print_summary_omits_reward_when_no_candidates() {
         let (fx, buf) = screen_with_buffer();
         fx.print_summary();
         let plain = crate::theme::strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
-        assert!(!plain.contains("DIN"), "no blocks found -> no DIN total in summary: {plain:?}");
+        assert!(!plain.contains(" DIN"), "no DIN total in summary: {plain:?}");
     }
 
     #[test]
