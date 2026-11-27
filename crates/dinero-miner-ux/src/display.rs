@@ -10,10 +10,6 @@ pub const EVENT_HEIGHT: usize = 4;
 /// physical height, wrap upward, or erase the DINERO header.
 pub const REGION_LINES: usize = 1 + 5 + 1 + FEED_HEIGHT + 1 + 4 + 1 + EVENT_HEIGHT + 1;
 
-/// Verified from dinero-v8/src/consensus/consensus.hpp:
-/// `static constexpr int64_t COIN = 100'000'000;  // 1 DIN = 100,000,000 units (8 decimals)`
-pub const UNA_PER_DIN: u64 = 100_000_000;
-
 fn fit_plain(line: &str, width: usize) -> String {
     if line.chars().count() > width {
         let head: String = line.chars().take(width.saturating_sub(1)).collect();
@@ -269,8 +265,8 @@ pub fn header_story_line(
     }
 }
 
-/// Gold flash frames: █×n, ▓×n, █×n, ▒×n, then "■■■  B L O C K   F O U N D   #<no>  ■■■".
-pub fn celebration_frames(width: usize, block_no: u64, colors: bool) -> Vec<String> {
+/// Gold flash frames for a locally submitted block candidate.
+pub fn celebration_frames(width: usize, candidate_no: u64, colors: bool) -> Vec<String> {
     let mut frames = Vec::new();
 
     // Flash bar formula: "  " + ch.repeat(width.saturating_sub(24).min(56))
@@ -292,7 +288,7 @@ pub fn celebration_frames(width: usize, block_no: u64, colors: bool) -> Vec<Stri
     frames.push(crate::theme::paint(crate::theme::GOLD, &bar_light, colors));
 
     // Frame 5: Message
-    let message = format!("■■■  B L O C K   F O U N D   #{}  ■■■", block_no);
+    let message = format!("■■■  B L O C K   C A N D I D A T E   #{}  ■■■", candidate_no);
     frames.push(crate::theme::paint(crate::theme::GOLD, &message, colors));
 
     frames
@@ -303,7 +299,7 @@ pub struct SessionStats {
     pub hashrate_hs: f64,
     pub ok: u64,
     pub rej: u64,
-    pub blocks: u64,
+    pub candidates: u64,
     pub started: Option<Instant>,
 }
 
@@ -313,18 +309,18 @@ impl Display {
     /// The one self-overwriting line. Caller prints with `\r{}` + flush.
     pub fn status_line(s: &SessionStats) -> String {
         format!(
-            "⛏  {}  {} ok  {} rej  blocks {}",
+            "⛏  {}  {} ok  {} rej  block candidates {}",
             Self::fmt_hashrate(s.hashrate_hs),
             s.ok,
             s.rej,
-            s.blocks
+            s.candidates
         )
     }
 
-    /// Permanent block banner (spec format). `local_time` injected for tests.
-    pub fn block_banner(no: u64, hash: &str, nonce: &str, tries: u64, mode: &str, local_time: &str) -> String {
+    /// A local block-target hit is not a block accepted by the pool's daemon.
+    pub fn candidate_banner(no: u64, hash: &str, nonce: &str, tries: u64, mode: &str, local_time: &str) -> String {
         format!(
-            "\n■ block found  #{}  {}\n  hash   {}\n  nonce  {}\n  tries  {}\n  mode   {}\n",
+            "\n■ block candidate submitted  #{}  {}\n  hash   {}\n  nonce  {}\n  tries  {}\n  mode   {}\n  node result not confirmed by miner\n",
             no,
             local_time,
             hash,
@@ -337,11 +333,11 @@ impl Display {
     pub fn session_summary(s: &SessionStats, elapsed_secs: u64) -> String {
         let elapsed = Self::format_duration(elapsed_secs);
         format!(
-            "Session: {} elapsed | {} ok | {} rej | blocks {}",
+            "Session: {} elapsed | {} ok | {} rej | block candidates {}",
             elapsed,
             s.ok,
             s.rej,
-            s.blocks
+            s.candidates
         )
     }
 
@@ -397,9 +393,7 @@ pub struct FeedWindow {
     pub mining_parent_hash: Option<String>,
     pub stats: SessionStats,
     pub backend: Option<String>,
-    pub last_block: Option<String>,
-    pub session_din_una: u64,
-    pub din_estimated: bool,
+    pub last_candidate: Option<String>,
     pub pool: String,
     pub reward_mode: String,
     pub threads: usize,
@@ -430,9 +424,7 @@ impl FeedWindow {
             mining_parent_hash: None,
             stats: SessionStats::default(),
             backend: None,
-            last_block: None,
-            session_din_una: 0,
-            din_estimated: false,
+            last_candidate: None,
             pool,
             reward_mode,
             threads,
@@ -498,8 +490,6 @@ impl FeedWindow {
         let secure = if self.pinned { "NOISE NX PINNED" } else { "UNPINNED" };
         let last_share = self.last_share.map(|t| format!("{}s ago", t.elapsed().as_secs()))
             .unwrap_or_else(|| "waiting".to_string());
-        let din = self.session_din_una as f64 / UNA_PER_DIN as f64;
-        let prefix = if self.din_estimated || self.reward_mode == "shared" { "≈" } else { "" };
         let rows = [
             box_split(&format!(" ACCEPTED {:>6}  {ok_bar}", self.stats.ok),
                       &format!(" CONNECTION  ● {}", self.connection), width),
@@ -507,23 +497,17 @@ impl FeedWindow {
                       &format!(" SECURITY    {secure}"), width),
             box_split(&format!(" SUCCESS   {:>6.1}%", success),
                       &format!(" RECONNECTS  {}", self.reconnects), width),
-            box_split(&format!(" SESSION WORK  {prefix}{din:.2} DIN"),
+            box_split(&format!(" BLOCK CAND. {:>6}  unconfirmed", self.stats.candidates),
                       &format!(" LAST SHARE   {last_share}"), width),
         ];
         rows.map(|row| crate::theme::paint(crate::theme::BRIGHT_GREEN, &row, colors))
     }
 
-    pub fn record_block(&mut self, no: u64, hash: &str, local_time: &str, value_una: u64, estimated: bool) {
-        self.stats.blocks += 1;
-        self.session_din_una += value_una;
-        if estimated {
-            self.din_estimated = true;
-        }
-        let din = value_una as f64 / UNA_PER_DIN as f64;
-        let prefix = if estimated { "≈" } else { "" };
-        self.last_block = Some(format!(
-            "  ■ block #{} · {} · {}… · {}{:.2} DIN",
-            no, local_time, hash, prefix, din
+    pub fn record_candidate(&mut self, no: u64, hash: &str, local_time: &str) {
+        self.stats.candidates += 1;
+        self.last_candidate = Some(format!(
+            "  ■ block candidate #{} · {} · {}… · node result unconfirmed",
+            no, local_time, hash
         ));
     }
 
@@ -539,17 +523,10 @@ impl FeedWindow {
             "0s".to_string()
         };
 
-        // Build status line with DIN token only if blocks > 0
         let mut status = format!(
-            "  ⛏ {} │ {} ok │ {} rejected │ blocks {}",
-            hashrate_str, self.stats.ok, self.stats.rej, self.stats.blocks
+            "  ⛏ {} │ {} ok │ {} rejected │ block candidates {}",
+            hashrate_str, self.stats.ok, self.stats.rej, self.stats.candidates
         );
-
-        if self.stats.blocks > 0 {
-            let din_total = self.session_din_una as f64 / UNA_PER_DIN as f64;
-            let din_prefix = if self.din_estimated { "≈" } else { "" };
-            status.push_str(&format!(" │ {}{:.2} DIN", din_prefix, din_total));
-        }
 
         status.push_str(&format!(" │ {} │ up {}", sparkline_str, uptime_str));
 
@@ -592,7 +569,7 @@ impl FeedWindow {
         let uptime = self.stats.started.map(|s| Display::format_duration(s.elapsed().as_secs()))
             .unwrap_or_else(|| "0s".to_string());
         let channel = self.channel.map(|v| format!("#{v}")).unwrap_or_else(|| "--".to_string());
-        let parent_label = " PARENT HASH  ";
+        let parent_label = " JOB PARENT  ";
         let parent_width = width.saturating_sub(3) / 2;
         let parent_hash_width = parent_width.saturating_sub(parent_label.chars().count());
         let parent_hash = self
@@ -606,7 +583,7 @@ impl FeedWindow {
                       &format!(" WORKER  {worker} · {} threads", self.threads), width),
             box_split(&format!(" CHAN  {channel}"), &format!(" UPTIME  {uptime}"), width),
             box_split(&format!("{parent_label}{parent_hash}"),
-                      &format!(" MINING HEIGHT  {}", self.mining_height.map(|h| h.to_string()).unwrap_or_else(|| "unavailable".into())), width),
+                      &format!(" JOB HEIGHT  {}", self.mining_height.map(|h| h.to_string()).unwrap_or_else(|| "unavailable".into())), width),
         ] {
             output.push_str(&theme_line(&row, colors));
             output.push_str("\x1b[K\n");
@@ -712,18 +689,18 @@ mod tests {
             hashrate_hs: 2_090_000.0,
             ok: 14,
             rej: 1,
-            blocks: 2,
+            candidates: 2,
             started: None,
         };
         let l = Display::status_line(&s);
-        assert!(l.contains("2.09 MH/s") && l.contains("14 ok") && l.contains("1 rej") && l.contains("blocks 2"));
+        assert!(l.contains("2.09 MH/s") && l.contains("14 ok") && l.contains("1 rej") && l.contains("block candidates 2"));
         assert!(!l.contains('\n'), "single line, caller uses \\r");
     }
 
     #[test]
-    fn block_banner_format() {
-        let b = Display::block_banner(1, "000000574714975b", "0x014b216a", 21_700_970, "shared", "14:22:07");
-        let want = "\n■ block found  #1  14:22:07\n  hash   000000574714975b\n  nonce  0x014b216a\n  tries  21,700,970\n  mode   shared\n";
+    fn candidate_banner_format() {
+        let b = Display::candidate_banner(1, "000000574714975b", "0x014b216a", 21_700_970, "shared", "14:22:07");
+        let want = "\n■ block candidate submitted  #1  14:22:07\n  hash   000000574714975b\n  nonce  0x014b216a\n  tries  21,700,970\n  mode   shared\n  node result not confirmed by miner\n";
         assert_eq!(b, want);
     }
 
@@ -733,11 +710,11 @@ mod tests {
             hashrate_hs: 0.0,
             ok: 30,
             rej: 2,
-            blocks: 1,
+            candidates: 1,
             started: None,
         };
         let l = Display::session_summary(&s, 352);
-        assert!(l.contains("5m52s") && l.contains("30") && l.contains("blocks 1"));
+        assert!(l.contains("5m52s") && l.contains("30") && l.contains("block candidates 1"));
     }
 
     #[test]
@@ -757,8 +734,8 @@ mod tests {
             let frame = window.repaint(width, false);
             let lines = frame.lines().collect::<Vec<_>>();
             let uptime = lines.iter().position(|l| l.contains("UPTIME")).unwrap();
-            assert!(lines[uptime + 1].contains("MINING HEIGHT"));
-            assert!(lines[uptime + 1].contains("PARENT HASH"));
+            assert!(lines[uptime + 1].contains("JOB HEIGHT"));
+            assert!(lines[uptime + 1].contains("JOB PARENT"));
             assert!(lines[uptime + 1].contains("00000"));
             assert!(lines[uptime + 1].contains("7f2a237b"));
             if width >= 80 { assert!(lines[uptime + 1].contains("111000")); }
@@ -768,7 +745,7 @@ mod tests {
                 ));
             }
             window.mining_height = None;
-            assert!(window.repaint(120, false).contains("MINING HEIGHT  unavailable"));
+            assert!(window.repaint(120, false).contains("JOB HEIGHT  unavailable"));
         }
     }
 
@@ -857,7 +834,7 @@ mod tests {
         let f = celebration_frames(80, 3, false);
         assert_eq!(f.len(), 5);
         assert!(f[0].trim_start().chars().all(|c| c == '█'));
-        assert!(f[4].contains("B L O C K   F O U N D") && f[4].contains("#3"));
+        assert!(f[4].contains("B L O C K   C A N D I D A T E") && f[4].contains("#3"));
         let colored = celebration_frames(80, 1, true);
         assert!(colored[0].contains("\x1b[1;33m"));
     }
@@ -922,7 +899,7 @@ mod tests {
         assert_eq!(worker_platform("freebsd", "riscv64"), "freebsd-riscv64");
     }
     #[test]
-    fn status_line_fx_wording_and_din_total() {
+    fn status_line_fx_wording_and_candidate_count() {
         let mut w = FeedWindow::new();
         w.stats.ok = 14; w.stats.rej = 2;
         w.record_rate(4.19);
@@ -931,7 +908,8 @@ mod tests {
         assert!(s.contains("2 rejected"), "spec: never 'rej'");
         assert!(!s.contains(" rej "), "abbreviation banned");
         assert!(s.contains('│') && s.contains('▁'));
-        assert!(!s.contains("DIN"), "no DIN token before the first block");
+        assert!(s.contains("block candidates 0"));
+        assert!(!s.contains(" DIN"), "no DIN reward inferred from local work");
         w.backend = Some("metal".into());
         let with_backend = crate::theme::strip_ansi(&w.status_line_fx(200, false));
         assert!(with_backend.contains("· metal"));
@@ -959,20 +937,19 @@ mod tests {
         assert!(s.ends_with('…'), "truncated status line must carry an ellipsis: {s:?}");
     }
     #[test]
-    fn last_block_panel_and_session_din() {
+    fn last_candidate_panel_never_claims_reward() {
         let mut w = FeedWindow::new();
-        // solo: exact value (no ≈). 100 DIN = 100 × UNA_PER_DIN.
-        w.record_block(1, "000000574714975b", "14:22:07", 100 * UNA_PER_DIN, false);
+        w.record_candidate(1, "000000574714975b", "14:22:07");
         let s = crate::theme::strip_ansi(&w.status_line_fx(200, false));
-        assert!(s.contains("blocks 1") && s.contains("100.00 DIN") && !s.contains('≈'));
-        let panel = crate::theme::strip_ansi(w.last_block.as_deref().unwrap());
-        assert!(panel.contains("■ block #1") && panel.contains("14:22:07"));
+        assert!(s.contains("block candidates 1") && !s.contains(" DIN"));
+        let panel = crate::theme::strip_ansi(w.last_candidate.as_deref().unwrap());
+        assert!(panel.contains("■ block candidate #1") && panel.contains("14:22:07"));
+        assert!(panel.contains("unconfirmed"));
         assert!(panel.contains("000000574714975b…"), "hash must have trailing ellipsis");
-        // shared: estimated 45% of 100 DIN → total flips to ≈
-        w.record_block(2, "0000003a861a070d", "15:01:44", 45 * UNA_PER_DIN, true);
+        w.record_candidate(2, "0000003a861a070d", "15:01:44");
         let s2 = crate::theme::strip_ansi(&w.status_line_fx(200, false));
-        assert!(s2.contains("blocks 2") && s2.contains("≈145.00 DIN"));
-        assert!(crate::theme::strip_ansi(w.last_block.as_deref().unwrap()).contains("0000003a861a070d…"), "hash must have trailing ellipsis");
+        assert!(s2.contains("block candidates 2") && !s2.contains(" DIN"));
+        assert!(crate::theme::strip_ansi(w.last_candidate.as_deref().unwrap()).contains("0000003a861a070d…"), "hash must have trailing ellipsis");
     }
     #[test]
     fn repaint_region_lines_all_fit_within_width() {
@@ -989,7 +966,7 @@ mod tests {
         w.record_rate(4.19);
         let real_hash = "0000005144829cc92581498e5f3d139cb0eddd556df74ee41cea3aea74e6e200";
         assert_eq!(real_hash.len(), 64, "sanity: this is a real block-hash length");
-        w.record_block(1, real_hash, "05:38:41", 100 * UNA_PER_DIN, false);
+        w.record_candidate(1, real_hash, "05:38:41");
         let width = 80;
         let out = w.repaint(width, false);
         for line in out.split('\n') {

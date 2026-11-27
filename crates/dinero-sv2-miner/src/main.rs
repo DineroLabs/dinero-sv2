@@ -1548,19 +1548,11 @@ impl Emitter {
                         .unwrap_or(1),
                 ),
                 "share_rejected" => fx.on_share_rejected(),
-                "window_status" => {
-                    if let Some(bps) = data.get("window_bps").and_then(|v| v.as_u64()) {
-                        fx.on_window(bps);
-                    }
-                }
+                "window_status" => {}
                 "job_height" => fx.set_mining_height(data.get("height").and_then(|v| v.as_u64())),
                 "new_job" => {
                     if let Some(height) = data.get("height").and_then(|v| v.as_u64()) {
                         fx.set_mining_height(Some(height));
-                    }
-                    // Solo templates carry the exact coinbase value for the DIN total.
-                    if let Some(una) = data.get("coinbase_value_una").and_then(|v| v.as_u64()) {
-                        fx.on_solo_job_value(una);
                     }
                     // deliberately NOT surfaced as a lifecycle line — job churn would
                     // spam the permanent history; the feed itself shows the work.
@@ -1574,7 +1566,7 @@ impl Emitter {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                     {
-                        fx.on_block(
+                        fx.on_block_candidate(
                             data.get("hash").and_then(|v| v.as_str()).unwrap_or(""),
                             &now_hms(),
                         );
@@ -1762,7 +1754,7 @@ fn emit_human(state: &Arc<Mutex<HumanState>>, event: &str, data: &serde_json::Va
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if meets_block {
-                st.stats.blocks += 1;
+                st.stats.candidates += 1;
                 st.clear_status(&mut stdout);
                 let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("");
                 let nonce = data.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
@@ -1771,8 +1763,14 @@ fn emit_human(state: &Arc<Mutex<HumanState>>, event: &str, data: &serde_json::Va
                     .get("reward_mode")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let banner =
-                    Display::block_banner(st.stats.blocks, hash, nonce, tries, mode, &now_hms());
+                let banner = Display::candidate_banner(
+                    st.stats.candidates,
+                    hash,
+                    nonce,
+                    tries,
+                    mode,
+                    &now_hms(),
+                );
                 print!("{banner}");
                 let _ = stdout.flush();
             }
@@ -1785,7 +1783,7 @@ fn emit_human(state: &Arc<Mutex<HumanState>>, event: &str, data: &serde_json::Va
 }
 
 /// Generic one-line rendering for events that aren't the status line or
-/// the block banner (connection lifecycle, job/window/share-error
+/// the candidate banner (connection lifecycle, job/window/share-error
 /// notices, startup, session end, ...).
 fn lifecycle_line(event: &str, data: &serde_json::Value) -> String {
     let parts: Vec<String> = match data {

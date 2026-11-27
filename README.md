@@ -46,8 +46,21 @@ more or less CPU usage. The miner validates and saves the address, connects to
 - a pinned Dinero header and complete reward address;
 - the Noise NX security, channel, worker, target, and uptime state;
 - 31 rolling rows of real nonces and complete 256-bit candidate hashes;
-- accepted/rejected share telemetry, session work, and reconnect health; and
+- accepted/rejected share telemetry, unconfirmed block-candidate count, and reconnect health; and
 - a timestamped network feed. `Ctrl-C` restores the original shell screen.
+
+A **candidate** is a local hash that met the block target and was sent to the
+pool. It is not a confirmed block or wallet balance. An accepted share only
+means the pool accepted that share. Check the pool's `/api/blocks` for blocks
+accepted by its node, and the wallet for spendable rewards after maturity.
+The displayed **job height** and **job parent** come from the latest mining
+template; they do not independently report the pool node's current tip.
+If the job height stays fixed, compare it with the pool's `/api/stats`
+`network_height` and its accepted `/api/blocks` before treating a submitted
+candidate as a chain advance.
+The `--max-blocks` option and machine JSON `blocks_found` field retain their
+legacy names for compatibility; both count local block-target hits, not
+blocks accepted by the node.
 
 Running `dinero-miner` without `--address` remains supported and prompts for a
 reward address interactively.
